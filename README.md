@@ -20,6 +20,7 @@ Phase 2 introduced the local IPC transport layer plus SDK and CLI wrappers aroun
 - `docs/test-plan.md`
 - `docs/phase4-live-inference-ctospec.md`
 - `docs/phase5-large-model-orchestration.md`
+- `docs/phase6-ram-target-benchmarking.md`
 
 ## Phase 2 Runtime
 
@@ -102,6 +103,22 @@ What it does not change:
 Operator guide and exact commands:
 
 - `docs/phase5-large-model-orchestration.md`
+
+## Phase 6 RAM-Target Benchmarking
+
+Phase 6 adds a benchmark/autotune sweep for high-RAM operation goals (for example 90 GB host RAM target).
+
+What it adds:
+
+- compression-aware candidate runtime option profiles,
+- measured RAM and throughput scoring,
+- and JSON + Markdown reports for reproducible comparisons.
+
+Quick command:
+
+```powershell
+python scripts/ram_target_benchmark.py --model qwen2.5:14b --target-ram-gb 90 --runtime-profile vram_constrained --iterations 2 --cooldown-seconds 2 --max-tokens 128 --ipc-timeout-seconds 900
+```
 
 ## Historical Inputs
 
