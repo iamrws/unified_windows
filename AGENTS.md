@@ -73,6 +73,7 @@ This file captures durable session context so future agents can continue work wi
 - User prefers multi-agent orchestration framing for large phases (manager/orchestrator model, parallelized work, continued progress until closure).
 - User expects periodic status updates and forward momentum without unnecessary pauses.
 - User is comfortable with ambitious exploration, but final output must be concrete, test-backed, and implemented.
+- User requires GitHub to be updated on every completed implementation cycle for this repository.
 
 ## Practical Continuation Rules for Future Agents
 - Treat `plan.md` and `problems.md` as contractual gates.
@@ -80,3 +81,4 @@ This file captures durable session context so future agents can continue work wi
 - Do not make local simulator behavior the silent default path for production-like CLI usage.
 - Keep security behavior explicit and typed-error-based at boundaries.
 - Before declaring completion, run full tests and ensure docs and report stay synchronized with code.
+- Before declaring completion, commit all relevant changes and push them to GitHub (`origin/main`) unless the user explicitly says not to push.
