@@ -29,6 +29,7 @@ DEFAULT_RUNTIME_BACKEND = "ollama"
 DEFAULT_PROMPT = "Explain in one paragraph why 128 GB of system RAM helps local LLM inference."
 DEFAULT_STEP_NAME = "prompt_smoke"
 DEFAULT_SERVICE_RUNSTEP_MODE = "simulation"
+DEFAULT_IPC_TIMEOUT_SECONDS = float(os.environ.get("ASTRAWEAVE_SMOKE_IPC_TIMEOUT_SECONDS", "120"))
 
 
 def _utc_now_iso() -> str:
@@ -83,6 +84,7 @@ def run_live_inference_smoke(
     temperature: float = 0.2,
     max_tokens: int = 128,
     service_runstep_mode: str = DEFAULT_SERVICE_RUNSTEP_MODE,
+    ipc_timeout_seconds: float = DEFAULT_IPC_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     if runtime_backend == "ollama":
         # Service-side Ollama runtime reads this env var while loading backend adapters.
@@ -110,7 +112,11 @@ def run_live_inference_smoke(
     server.start()
     try:
         endpoint = _service_endpoint_uri(server.endpoint)
-        with AstraWeaveIpcClient(endpoint=endpoint, default_caller=caller) as client:
+        with AstraWeaveIpcClient(
+            endpoint=endpoint,
+            default_caller=caller,
+            timeout=ipc_timeout_seconds,
+        ) as client:
             session_id = client.CreateSession()
             client.LoadModel(session_id, model_name, runtime_backend=runtime_backend)
             run_step_result = client.RunStep(
@@ -210,6 +216,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SERVICE_RUNSTEP_MODE,
         help="RunStep mode used when the smoke script exercises AstraWeave orchestration.",
     )
+    parser.add_argument(
+        "--ipc-timeout-seconds",
+        type=float,
+        default=DEFAULT_IPC_TIMEOUT_SECONDS,
+        help="IPC timeout used for service calls in this smoke script.",
+    )
     return parser
 
 
@@ -225,6 +237,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             service_runstep_mode=args.service_runstep_mode,
+            ipc_timeout_seconds=args.ipc_timeout_seconds,
         )
         _write_json({"ok": True, "result": _json_safe(result)})
         return 0
