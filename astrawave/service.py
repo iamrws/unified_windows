@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from inspect import Parameter, signature
 import os
 from threading import RLock
 from time import time_ns
-from typing import Any, Callable, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 from uuid import uuid4
 
 try:
@@ -23,6 +24,7 @@ from .inference_runtime import (
     create_inference_runtime,
     resolve_backend_and_model_name,
 )
+from .runtime_tuning import merge_backend_options, resolve_runtime_tuning
 from .security import CallerIdentity, SecurityGuard, SecurityPolicy, resolve_current_user_sid
 from .telemetry import (
     FallbackEvent as TelemetryFallbackEvent,
@@ -197,6 +199,8 @@ class AstraWeaveService:
         model_name: str,
         *,
         runtime_backend: str | None = None,
+        runtime_profile: str | None = None,
+        backend_options: Mapping[str, Any] | None = None,
         caller_identity: CallerIdentity | None = None,
     ) -> None:
         """Attach a model to a session and transition it toward READY."""
@@ -207,16 +211,31 @@ class AstraWeaveService:
             model_name,
             runtime_backend=runtime_backend,
         )
+        tuning = resolve_runtime_tuning(
+            resolved_model_name,
+            runtime_profile=runtime_profile,
+            backend_options=backend_options,
+        )
         runtime = self._inference_runtime_factory(backend_name)
-        binding = runtime.load_model(resolved_model_name)
+        binding = self._call_runtime_method(
+            runtime,
+            "load_model",
+            resolved_model_name,
+            runtime_profile=tuning.profile_name,
+            backend_options=tuning.backend_options,
+        )
         with session.lock:
             session.model_name = model_name
             session.inference_backend = binding.backend
             session.resolved_model_name = binding.resolved_model_name
-            session.inference_metadata = {
-                "requested_model_name": binding.requested_model_name,
-                **dict(binding.metadata),
-            }
+            session.inference_metadata = self._build_inference_metadata(
+                binding.metadata,
+                requested_model_name=binding.requested_model_name,
+                runtime_profile=tuning.profile_name,
+                model_size_billion=tuning.model_size_billion,
+                model_size_label=tuning.model_size_label,
+                backend_options=tuning.backend_options,
+            )
             session.state = SessionState.MODEL_LOADED
             session.state = SessionState.READY
 
@@ -309,6 +328,7 @@ class AstraWeaveService:
         max_tokens: int | None = None,
         temperature: float | None = None,
         system_prompt: str | None = None,
+        backend_options: Mapping[str, Any] | None = None,
         caller_identity: CallerIdentity | None = None,
     ) -> dict[str, object]:
         """Execute one inference step with single-flight protection per session."""
@@ -342,6 +362,10 @@ class AstraWeaveService:
                 elif isinstance(hardware_result, dict):
                     hardware_result.setdefault("fallback_to_simulation", True)
             if prompt is not None:
+                effective_backend_options = self._resolve_effective_backend_options(
+                    session=session,
+                    backend_options=backend_options,
+                )
                 inference_result = self._execute_inference_runstep(
                     session=session,
                     step_name=step_name,
@@ -349,6 +373,7 @@ class AstraWeaveService:
                     max_tokens=max_tokens,
                     temperature=temperature,
                     system_prompt=system_prompt,
+                    backend_options=effective_backend_options,
                 )
 
             with session.lock:
@@ -972,6 +997,7 @@ class AstraWeaveService:
         max_tokens: int | None,
         temperature: float | None,
         system_prompt: str | None,
+        backend_options: Mapping[str, Any] | None,
     ) -> dict[str, object]:
         if not isinstance(prompt, str) or not prompt.strip():
             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "prompt must be a non-empty string when provided")
@@ -984,13 +1010,16 @@ class AstraWeaveService:
 
         runtime = self._inference_runtime_factory(session.inference_backend)
         try:
-            result = runtime.generate(
+            result = self._call_runtime_method(
+                runtime,
+                "generate",
                 session.resolved_model_name,
                 prompt=prompt,
                 step_name=step_name,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 system_prompt=system_prompt,
+                backend_options=backend_options,
             )
         except ApiError as exc:
             return {
@@ -1106,6 +1135,51 @@ class AstraWeaveService:
             )
         except AttributeError:
             return False
+
+    @staticmethod
+    def _call_runtime_method(runtime: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        method = getattr(runtime, method_name)
+        try:
+            params = signature(method).parameters
+        except (TypeError, ValueError):
+            return method(*args, **kwargs)
+
+        if any(param.kind == Parameter.VAR_KEYWORD for param in params.values()):
+            return method(*args, **kwargs)
+
+        filtered_kwargs = {key: value for key, value in kwargs.items() if key in params}
+        return method(*args, **filtered_kwargs)
+
+    @staticmethod
+    def _build_inference_metadata(
+        binding_metadata: Any,
+        *,
+        requested_model_name: str,
+        runtime_profile: str,
+        model_size_billion: float | None,
+        model_size_label: str | None,
+        backend_options: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        metadata = dict(binding_metadata) if isinstance(binding_metadata, Mapping) else {}
+        metadata["requested_model_name"] = requested_model_name
+        metadata["runtime_profile"] = runtime_profile
+        metadata["backend_options"] = dict(backend_options)
+        if model_size_billion is not None:
+            metadata["model_size_billion"] = model_size_billion
+        if model_size_label is not None:
+            metadata["model_size_label"] = model_size_label
+        return metadata
+
+    @staticmethod
+    def _resolve_effective_backend_options(
+        *,
+        session: _Session,
+        backend_options: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        stored_options = session.inference_metadata.get("backend_options")
+        if not isinstance(stored_options, Mapping):
+            stored_options = {}
+        return merge_backend_options(stored_options, backend_options)
 
 
 __all__ = ["AstraWeaveService"]

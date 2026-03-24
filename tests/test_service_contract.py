@@ -303,6 +303,106 @@ class AstraWeaveServiceLifecycleTests(unittest.TestCase):
         self.assertEqual(session.resolved_model_name, "qwen2.5:7b")
         self.assertEqual(result["inference_result"]["backend"], "ollama")
 
+    def test_large_model_load_applies_vram_constrained_profile_and_merges_prompt_options(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class FakeOllamaRuntime:
+            backend_name = "ollama"
+
+            def load_model(
+                self,
+                model_name: str,
+                *,
+                runtime_profile: str | None = None,
+                backend_options: dict[str, object] | None = None,
+            ):
+                calls.append(
+                    {
+                        "phase": "load_model",
+                        "model_name": model_name,
+                        "runtime_profile": runtime_profile,
+                        "backend_options": backend_options,
+                    }
+                )
+                from astrawave.inference_runtime import InferenceModelBinding
+
+                return InferenceModelBinding(
+                    backend="ollama",
+                    requested_model_name=model_name,
+                    resolved_model_name=model_name,
+                    metadata={"transport": "fake-http"},
+                )
+
+            def generate(
+                self,
+                model_name: str,
+                *,
+                prompt: str,
+                step_name: str,
+                max_tokens: int | None = None,
+                temperature: float | None = None,
+                system_prompt: str | None = None,
+                backend_options: dict[str, object] | None = None,
+            ) -> dict[str, object]:
+                calls.append(
+                    {
+                        "phase": "generate",
+                        "model_name": model_name,
+                        "prompt": prompt,
+                        "step_name": step_name,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                        "system_prompt": system_prompt,
+                        "backend_options": backend_options,
+                    }
+                )
+                return {
+                    "ok": True,
+                    "backend": "ollama",
+                    "model_name": model_name,
+                    "output_text": "large model response",
+                    "finish_reason": "stop",
+                }
+
+        def runtime_factory(backend_name: str):
+            if backend_name == "ollama":
+                return FakeOllamaRuntime()
+            raise AssertionError(f"unexpected backend requested: {backend_name}")
+
+        service = AstraWeaveService(
+            runstep_mode="simulation",
+            inference_runtime_factory=runtime_factory,
+        )
+        session_id = service.CreateSession()
+        service.LoadModel(session_id, "ollama:qwen2.5:14b")
+
+        session = service._get_session(session_id)
+        self.assertEqual(session.inference_metadata["runtime_profile"], "vram_constrained")
+        self.assertEqual(session.inference_metadata["model_size_billion"], 14.0)
+        self.assertTrue(session.inference_metadata["backend_options"]["low_vram"])
+
+        self.assertEqual(calls[0]["phase"], "load_model")
+        self.assertEqual(calls[0]["runtime_profile"], "vram_constrained")
+        self.assertTrue(calls[0]["backend_options"]["low_vram"])
+        self.assertEqual(calls[0]["backend_options"]["num_ctx"], 2048)
+
+        result = service.RunStep(
+            session_id,
+            step_name="decode",
+            prompt="Write one short line.",
+            max_tokens=24,
+            backend_options={"num_ctx": 3072, "repeat_penalty": 1.05},
+        )
+
+        self.assertEqual(result["inference_result"]["backend"], "ollama")
+        self.assertEqual(calls[1]["phase"], "generate")
+        self.assertEqual(calls[1]["model_name"], "qwen2.5:14b")
+        self.assertEqual(calls[1]["max_tokens"], 24)
+        self.assertEqual(calls[1]["backend_options"]["num_ctx"], 3072)
+        self.assertEqual(calls[1]["backend_options"]["num_batch"], 24)
+        self.assertTrue(calls[1]["backend_options"]["low_vram"])
+        self.assertAlmostEqual(calls[1]["backend_options"]["repeat_penalty"], 1.05)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Mapping, Protocol
 from urllib import error, request
 
 from .errors import ApiError, ApiErrorCode
+from .runtime_tuning import merge_backend_options, resolve_runtime_tuning
 
 DEFAULT_OLLAMA_BASE_URL = os.environ.get("ASTRAWEAVE_OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 DEFAULT_OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("ASTRAWEAVE_OLLAMA_TIMEOUT_SECONDS", "120"))
@@ -31,7 +32,13 @@ class InferenceRuntime(Protocol):
 
     backend_name: str
 
-    def load_model(self, model_name: str) -> InferenceModelBinding:
+    def load_model(
+        self,
+        model_name: str,
+        *,
+        runtime_profile: str | None = None,
+        backend_options: Mapping[str, Any] | None = None,
+    ) -> InferenceModelBinding:
         """Prepare or bind a model name for later generation."""
 
     def generate(
@@ -43,6 +50,7 @@ class InferenceRuntime(Protocol):
         max_tokens: int | None = None,
         temperature: float | None = None,
         system_prompt: str | None = None,
+        backend_options: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Generate output for one step."""
 
@@ -52,7 +60,18 @@ class SimulationInferenceRuntime:
 
     backend_name = "simulation"
 
-    def load_model(self, model_name: str) -> InferenceModelBinding:
+    def load_model(
+        self,
+        model_name: str,
+        *,
+        runtime_profile: str | None = None,
+        backend_options: Mapping[str, Any] | None = None,
+    ) -> InferenceModelBinding:
+        tuning = resolve_runtime_tuning(
+            model_name,
+            runtime_profile=runtime_profile,
+            backend_options=backend_options,
+        )
         return InferenceModelBinding(
             backend=self.backend_name,
             requested_model_name=model_name,
@@ -60,6 +79,10 @@ class SimulationInferenceRuntime:
             metadata={
                 "supports_prompt_generation": True,
                 "transport": "in-process",
+                "runtime_profile": tuning.profile_name,
+                "model_size_billion": tuning.model_size_billion,
+                "model_size_label": tuning.model_size_label,
+                "backend_options": tuning.backend_options,
             },
         )
 
@@ -72,6 +95,7 @@ class SimulationInferenceRuntime:
         max_tokens: int | None = None,
         temperature: float | None = None,
         system_prompt: str | None = None,
+        backend_options: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         del system_prompt
         output_text = (
@@ -109,7 +133,18 @@ class OllamaInferenceRuntime:
         self._timeout_seconds = timeout_seconds
         self._transport = transport or _post_json
 
-    def load_model(self, model_name: str) -> InferenceModelBinding:
+    def load_model(
+        self,
+        model_name: str,
+        *,
+        runtime_profile: str | None = None,
+        backend_options: Mapping[str, Any] | None = None,
+    ) -> InferenceModelBinding:
+        tuning = resolve_runtime_tuning(
+            model_name,
+            runtime_profile=runtime_profile,
+            backend_options=backend_options,
+        )
         return InferenceModelBinding(
             backend=self.backend_name,
             requested_model_name=model_name,
@@ -118,6 +153,10 @@ class OllamaInferenceRuntime:
                 "base_url": self._base_url,
                 "supports_prompt_generation": True,
                 "transport": "http",
+                "runtime_profile": tuning.profile_name,
+                "model_size_billion": tuning.model_size_billion,
+                "model_size_label": tuning.model_size_label,
+                "backend_options": tuning.backend_options,
             },
         )
 
@@ -130,6 +169,7 @@ class OllamaInferenceRuntime:
         max_tokens: int | None = None,
         temperature: float | None = None,
         system_prompt: str | None = None,
+        backend_options: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": model_name,
@@ -138,7 +178,7 @@ class OllamaInferenceRuntime:
         }
         if system_prompt:
             payload["system"] = system_prompt
-        options: dict[str, Any] = {}
+        options = merge_backend_options(backend_options)
         if max_tokens is not None:
             options["num_predict"] = max_tokens
         if temperature is not None:
