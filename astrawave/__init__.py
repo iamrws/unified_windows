@@ -1,6 +1,7 @@
 """AstraWeave package surface."""
 
 from .errors import ApiError, ApiErrorCode
+from .cuda_runtime import run_cuda_transfer
 from .hardware_probe import collect_hardware_probe
 from .types import (
     MemoryTier,
@@ -36,6 +37,7 @@ __all__ = [
     "AstraWeaveSDK",
     "FallbackEvent",
     "collect_hardware_probe",
+    "run_cuda_transfer",
     "MemoryTier",
     "PolicyProfile",
     "PressureSnapshot",

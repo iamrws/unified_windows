@@ -1,7 +1,7 @@
 # RC Workload Report
 
 - Run id: `2026-03-24`
-- Generated at: `2026-03-24T14:25:18.845255+00:00`
+- Generated at: `2026-03-24T19:28:29.550668+00:00`
 - Verdict: `pass`
 - W-7B summary: `C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\reports\runlogs\summary_rc_w7b_chat_2026-03-24.json`
 - W-13B summary: `C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\reports\runlogs\summary_rc_w13b_chat_2026-03-24.json`

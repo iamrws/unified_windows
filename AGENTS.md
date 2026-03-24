@@ -19,6 +19,8 @@ This file captures durable session context so future agents can continue work wi
 - Core runtime modules are present in `astrawave/` (service, fallback, security, telemetry, IPC server/client/protocol, SDK, CLI, service host).
 - IPC contract is now centralized in `astrawave/ipc_protocol.py` as canonical wire schema and validation logic.
 - `astrawave/ipc_server.py` keeps compatibility wrappers (`Ipc*` envelope names), but dispatch and validation now rely on canonical protocol behavior.
+- Real CUDA transfer primitives now live in `astrawave/cuda_runtime.py` and are reused by `scripts/cuda_transfer_poc.py`.
+- Service `RunStep` now supports feature-flagged hardware mode (`ASTRAWEAVE_RUNSTEP_MODE=hardware` or `ASTRAWEAVE_ENABLE_HARDWARE_RUNSTEP=1`) and returns `run_mode` plus `hardware_result`.
 
 ## Security and Trust-Boundary Decisions
 - IPC requires explicit caller identity by default at server boundary.
@@ -35,7 +37,7 @@ This file captures durable session context so future agents can continue work wi
 
 ## Testing and Validation Pattern
 - Execution pattern used: targeted contract and e2e tests first, then full-suite run.
-- Current validated state: `python -m unittest discover -s tests -v` passes with 56/56 tests (`reports/runlogs/unittest_rc_2026-03-24.txt`).
+- Current validated state: `python -m unittest discover -s tests -v` passes with 62/62 tests (`reports/runlogs/unittest_rc_2026-03-24.txt`).
 - New and expanded tests cover:
 - explicit caller enforcement,
 - per-connection caller-binding rejection,
@@ -47,6 +49,8 @@ This file captures durable session context so future agents can continue work wi
 - typed JSON error behavior on malformed endpoints,
 - capability-matrix profile mapping (`P-A` through `P-D`),
 - service single-flight `RunStep` conflict rejection.
+- hardware-mode `RunStep` executor invocation and degraded-on-runtime-failure behavior,
+- release-gate split reporting (`simulation_ready` vs `hardware_ready`).
 - Soak evidence (March 23-24, 2026):
 - `reports/runlogs/summary_2026-03-23_235145.json` (`200/200` pass, `run_step_p95_ms=194.063`),
 - `reports/runlogs/summary_2026-03-23_235729.json` (`1000/1000` pass, `run_step_p95_ms=191.373`),
@@ -56,17 +60,20 @@ This file captures durable session context so future agents can continue work wi
 - Automation harnesses:
 - `scripts/soak_test.ps1` (unit-test + soak + GPU logging + JSON summary artifacts),
 - `scripts/run_operations_drills.py` (ops drills and evidence report),
+- `scripts/run_hardware_gate.py` (service-triggered hardware-mode RunStep + NVML delta gate),
 - `scripts/generate_compliance_artifacts.py` (SBOM/attribution/checksum/signing artifacts),
 - `scripts/generate_release_gate_report.py` (threat + matrix + workload + final readiness synthesis).
-- Consolidated gate verdict artifact: `reports/release_gate/release_gate_readiness_2026-03-24.json` (`pass`).
+- Hardware gate artifact: `reports/release_gate/hardware_gate_2026-03-24.json` (`pass`).
+- Consolidated gate verdict artifact: `reports/release_gate/release_gate_readiness_2026-03-24.json` (`hardware_ready` with split track status).
 
 ## Documentation Alignment Decisions
 - `README.md`, `docs/api-contract.md`, `docs/security-architecture.md`, `docs/threat-model.md`, and `reports/phase3_audit_report.md` were updated to match implemented behavior.
-- `problems.md` readiness checklist is now fully closed with linked March 24, 2026 evidence artifacts.
-- Audit report now reflects release-gate-complete status for current v1 RC baseline.
+- `README.md` now explicitly documents hardware probe boundary, CUDA transfer PoC, hardware gate script, and split readiness tracks.
+- `problems.md` now contains reopened hardware gates (`P0-HW-11`, `P1-HW-12`, `P1-HW-13`) and linked March 24, 2026 hardware evidence artifacts.
 
 ## Known Residual Risk
 - Full OS-native caller attestation at transport boundary is still a future hardening step; current control set reduces spoofing risk but does not fully replace native peer-identity verification.
+- Hardware mode currently executes a transfer proof path, but full model-aware tensor orchestration policies are still maturing.
 
 ## Collaboration Preferences from This Session
 - User preference is aggressive execution over partial analysis: "fix everything then continue until finished."

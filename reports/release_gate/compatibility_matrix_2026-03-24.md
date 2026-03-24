@@ -1,7 +1,7 @@
 # Compatibility Matrix Evidence
 
 - Run id: `2026-03-24`
-- Generated at: `2026-03-24T14:25:18.844583+00:00`
+- Generated at: `2026-03-24T19:28:29.550011+00:00`
 - Verdict: `pass`
 
 | Profile | Test | Result |

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import unittest
+from unittest.mock import patch
 
 from astrawave import AstraWeaveService
 from astrawave.errors import ApiError, ApiErrorCode
@@ -75,6 +77,67 @@ class AstraWeaveServiceLifecycleTests(unittest.TestCase):
         finally:
             with session.lock:
                 session.active_run = False
+
+    def test_run_step_hardware_mode_invokes_executor_and_returns_hardware_payload(self) -> None:
+        calls: list[dict[str, int]] = []
+
+        def fake_executor(*, size_bytes: int, device_index: int, hold_ms: int) -> dict[str, object]:
+            calls.append(
+                {
+                    "size_bytes": size_bytes,
+                    "device_index": device_index,
+                    "hold_ms": hold_ms,
+                }
+            )
+            return {
+                "ok": True,
+                "nvml_observation": {
+                    "observed": True,
+                    "observed_delta_bytes": 4096,
+                },
+            }
+
+        service = AstraWeaveService(runstep_mode="hardware", hardware_executor=fake_executor)
+        session_id = service.CreateSession()
+        service.LoadModel(session_id, "demo-model")
+        service.RegisterTensor(session_id, "kv", 1024)
+
+        result = service.RunStep(session_id, step_name="decode")
+        self.assertEqual(result["run_mode"], "hardware")
+        self.assertIsInstance(result["hardware_result"], dict)
+        self.assertTrue(result["hardware_result"]["ok"])
+        self.assertEqual(len(calls), 1)
+        self.assertGreaterEqual(calls[0]["size_bytes"], 1024)
+
+    def test_run_step_hardware_mode_marks_session_degraded_on_runtime_failure(self) -> None:
+        def failing_executor(*, size_bytes: int, device_index: int, hold_ms: int) -> dict[str, object]:
+            return {
+                "ok": False,
+                "error": {"code": "CUDA_POC_DRIVER_MISSING", "message": "nvcuda.dll was not found"},
+            }
+
+        service = AstraWeaveService(runstep_mode="hardware", hardware_executor=failing_executor)
+        session_id = service.CreateSession()
+        service.LoadModel(session_id, "demo-model")
+        service.RegisterTensor(session_id, "kv", 2048)
+
+        result = service.RunStep(session_id, step_name="decode")
+        self.assertEqual(result["run_mode"], "hardware")
+        self.assertIsInstance(result["hardware_result"], dict)
+        self.assertFalse(result["hardware_result"]["ok"])
+        self.assertEqual(result["state"].value, "DEGRADED")
+
+    def test_env_flag_can_enable_hardware_mode_without_constructor_override(self) -> None:
+        def fake_executor(*, size_bytes: int, device_index: int, hold_ms: int) -> dict[str, object]:
+            return {"ok": True}
+
+        with patch.dict(os.environ, {"ASTRAWEAVE_ENABLE_HARDWARE_RUNSTEP": "1"}, clear=False):
+            service = AstraWeaveService(hardware_executor=fake_executor)
+            session_id = service.CreateSession()
+            service.LoadModel(session_id, "demo-model")
+            service.RegisterTensor(session_id, "kv", 4096)
+            result = service.RunStep(session_id, step_name="decode")
+            self.assertEqual(result["run_mode"], "hardware")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,10 @@
 # Release Gate Readiness
 
 - Run id: `2026-03-24`
-- Generated at: `2026-03-24T14:25:18.846100+00:00`
-- Overall verdict: `pass`
+- Generated at: `2026-03-24T19:28:29.551536+00:00`
+- Overall verdict: `hardware_ready`
+- Simulation-ready: `pass`
+- Hardware-ready: `pass`
 
 | Gate | Result | Evidence |
 | --- | --- | --- |
@@ -16,3 +18,6 @@
 | `P1-08` | `pass` | `C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\reports\release_gate\operations_drill_2026-03-24.json` |
 | `P2-09` | `pass` | `C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\reports\release_gate\compatibility_matrix_2026-03-24.json` |
 | `P2-10` | `pass` | `C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\reports\release_artifacts\compliance_manifest_2026-03-24.json` |
+| `P0-HW-11` | `pass` | `C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\reports\release_gate\hardware_gate_2026-03-24.json` |
+| `P1-HW-12` | `pass` | `C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\reports\release_gate\hardware_gate_2026-03-24.json` |
+| `P1-HW-13` | `pass` | `Release report now distinguishes simulation-ready and hardware-ready tracks.` |

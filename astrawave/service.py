@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from threading import RLock
 from time import time_ns
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 from uuid import uuid4
+
+try:
+    from .cuda_runtime import DEFAULT_DEVICE_INDEX, DEFAULT_TRANSFER_BYTES, run_cuda_transfer as _run_cuda_transfer
+except Exception:  # pragma: no cover - optional runtime path
+    DEFAULT_DEVICE_INDEX = 0
+    DEFAULT_TRANSFER_BYTES = 1_048_576
+    _run_cuda_transfer = None
 
 from .errors import ApiError, ApiErrorCode
 from .fallback import FallbackController, FallbackState, FallbackStep
@@ -34,6 +42,15 @@ from .types import (
 
 HIGH_PRESSURE_THRESHOLD = 0.75
 DEFAULT_SERVICE_OWNER_SID = "S-1-5-21-AstraWeave-Owner"
+DEFAULT_RUNSTEP_MODE = "simulation"
+RUNSTEP_MODE_ENV = "ASTRAWEAVE_RUNSTEP_MODE"
+RUNSTEP_MODE_ENABLE_ENV = "ASTRAWEAVE_ENABLE_HARDWARE_RUNSTEP"
+HARDWARE_TRANSFER_BYTES_ENV = "ASTRAWEAVE_HARDWARE_TRANSFER_BYTES"
+HARDWARE_DEVICE_INDEX_ENV = "ASTRAWEAVE_HARDWARE_DEVICE_INDEX"
+HARDWARE_HOLD_MS_ENV = "ASTRAWEAVE_HARDWARE_HOLD_MS"
+DEFAULT_HARDWARE_HOLD_MS = 75
+
+HardwareExecutor = Callable[..., dict[str, Any]]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -100,6 +117,8 @@ class AstraWeaveService:
         security_guard: SecurityGuard | None = None,
         telemetry_pipeline: TelemetryPipeline | None = None,
         fallback_controller: FallbackController | None = None,
+        runstep_mode: str | None = None,
+        hardware_executor: HardwareExecutor | None = None,
     ) -> None:
         self._security = security_guard or SecurityGuard(
             SecurityPolicy(service_owner_sid=DEFAULT_SERVICE_OWNER_SID)
@@ -112,6 +131,8 @@ class AstraWeaveService:
         self._sessions: Dict[str, _Session] = {}
         self._closed_sessions: Dict[str, _Session] = {}
         self._lock = RLock()
+        self._runstep_mode_override = runstep_mode
+        self._hardware_executor = hardware_executor or _run_cuda_transfer
 
     @property
     def telemetry(self) -> TelemetryPipeline:
@@ -281,17 +302,28 @@ class AstraWeaveService:
             now_ms = self._now_ms()
             pressure_level = self._compute_pressure_level(session)
             fallback_result: dict[str, object] | None = None
+            run_mode = self._resolve_runstep_mode()
+            hardware_result: dict[str, object] | None = None
 
             if pressure_level >= HIGH_PRESSURE_THRESHOLD or session.fallback_stability_mode:
                 fallback_result = self._advance_fallback(session=session, caller=caller, now_ms=now_ms)
+            if run_mode == "hardware":
+                hardware_result = self._execute_hardware_runstep(session=session, step_name=step_name)
 
             with session.lock:
                 if session.state != SessionState.FAILED:
-                    session.state = SessionState.DEGRADED if (
-                        session.fallback_stability_mode
-                        or session.fallback_current_step is not None
-                        or pressure_level >= HIGH_PRESSURE_THRESHOLD
-                    ) else SessionState.READY
+                    if (
+                        run_mode == "hardware"
+                        and isinstance(hardware_result, dict)
+                        and not bool(hardware_result.get("ok"))
+                    ):
+                        session.state = SessionState.DEGRADED
+                    else:
+                        session.state = SessionState.DEGRADED if (
+                            session.fallback_stability_mode
+                            or session.fallback_current_step is not None
+                            or pressure_level >= HIGH_PRESSURE_THRESHOLD
+                        ) else SessionState.READY
 
                 correlation_id = f"{session.session_id}:{step_name}:{new_correlation_id('run')}"
                 return {
@@ -305,6 +337,8 @@ class AstraWeaveService:
                     if session.fallback_current_step is not None
                     else None,
                     "fallback_result": fallback_result,
+                    "run_mode": run_mode,
+                    "hardware_result": hardware_result,
                 }
         finally:
             with session.lock:
@@ -786,6 +820,76 @@ class AstraWeaveService:
         """Return a deterministic latency estimate for telemetry."""
 
         return max(0.1, size_bytes / 100_000_000.0)
+
+    def _resolve_runstep_mode(self) -> str:
+        override = self._runstep_mode_override
+        if isinstance(override, str) and override.strip():
+            mode = override.strip().lower()
+        else:
+            mode = os.environ.get(RUNSTEP_MODE_ENV, DEFAULT_RUNSTEP_MODE).strip().lower()
+            if self._env_flag_enabled(RUNSTEP_MODE_ENABLE_ENV):
+                mode = "hardware"
+        if mode in {"hardware", "cuda", "cuda_transfer_poc"}:
+            return "hardware"
+        return "simulation"
+
+    def _execute_hardware_runstep(self, *, session: _Session, step_name: str) -> dict[str, object]:
+        if self._hardware_executor is None:
+            raise ApiError(ApiErrorCode.INTERNAL, "hardware runstep mode is enabled but CUDA runtime is unavailable")
+
+        size_bytes = self._resolve_hardware_transfer_bytes(session)
+        device_index = self._env_int(HARDWARE_DEVICE_INDEX_ENV, default=DEFAULT_DEVICE_INDEX, minimum=0)
+        hold_ms = self._env_int(HARDWARE_HOLD_MS_ENV, default=DEFAULT_HARDWARE_HOLD_MS, minimum=0)
+
+        try:
+            result = self._hardware_executor(
+                size_bytes=size_bytes,
+                device_index=device_index,
+                hold_ms=hold_ms,
+            )
+        except TypeError:
+            result = self._hardware_executor(size_bytes=size_bytes, device_index=device_index)
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            raise ApiError(ApiErrorCode.INTERNAL, "hardware runstep execution failed unexpectedly") from exc
+
+        if not isinstance(result, dict):
+            raise ApiError(ApiErrorCode.INTERNAL, "hardware runstep must return a JSON object")
+
+        merged = dict(result)
+        merged["service_context"] = {
+            "session_id": session.session_id,
+            "step_name": step_name,
+            "requested_transfer_bytes": size_bytes,
+            "device_index": device_index,
+            "hold_ms": hold_ms,
+        }
+        return merged
+
+    def _resolve_hardware_transfer_bytes(self, session: _Session) -> int:
+        configured = self._env_int(HARDWARE_TRANSFER_BYTES_ENV, default=0, minimum=0)
+        if configured > 0:
+            return configured
+        if session.tensors:
+            return max(DEFAULT_TRANSFER_BYTES, max(item.size_bytes for item in session.tensors.values()))
+        return DEFAULT_TRANSFER_BYTES
+
+    @staticmethod
+    def _env_flag_enabled(name: str) -> bool:
+        value = os.environ.get(name, "").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _env_int(name: str, *, default: int, minimum: int = 0) -> int:
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            value = int(raw.strip())
+        except ValueError:
+            return default
+        if value < minimum:
+            return default
+        return value
 
     def _compute_pressure_level(self, session: _Session) -> float:
         if session.vram_budget_bytes <= 0:

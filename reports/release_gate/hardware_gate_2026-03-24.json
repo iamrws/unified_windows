@@ -1,0 +1,236 @@
+{
+  "artifacts": {
+    "after_probe": {
+      "effective": {
+        "device_count": 1,
+        "devices": [
+          {
+            "driver_version": "595.71",
+            "index": 0,
+            "memory_free_bytes": 6348873728,
+            "memory_total_bytes": 8589934592,
+            "memory_used_bytes": 2241060864,
+            "name": "NVIDIA GeForce RTX 2080",
+            "source": "nvml+nvidia-smi"
+          }
+        ],
+        "driver_version": "595.71",
+        "has_nvidia_gpu": true,
+        "source": "nvml"
+      },
+      "nvidia_smi": {
+        "available": true,
+        "command": [
+          "nvidia-smi",
+          "--query-gpu=index,name,memory.total,memory.used,memory.free,driver_version",
+          "--format=csv,noheader,nounits"
+        ],
+        "devices": [
+          {
+            "driver_version": "595.71",
+            "index": 0,
+            "memory_free_bytes": 6349127680,
+            "memory_total_bytes": 8589934592,
+            "memory_used_bytes": 2026897408,
+            "name": "NVIDIA GeForce RTX 2080"
+          }
+        ],
+        "driver_version": "595.71",
+        "error": null,
+        "exit_code": 0,
+        "status": "ok",
+        "stderr": null,
+        "stdout": "0, NVIDIA GeForce RTX 2080, 8192, 1933, 6055, 595.71"
+      },
+      "nvml": {
+        "available": true,
+        "devices": [
+          {
+            "index": 0,
+            "memory_free_bytes": 6348873728,
+            "memory_total_bytes": 8589934592,
+            "memory_used_bytes": 2241060864,
+            "name": "NVIDIA GeForce RTX 2080"
+          }
+        ],
+        "driver_version": "595.71",
+        "error": null,
+        "initialized": true,
+        "library": "nvml.dll",
+        "status": "ok"
+      },
+      "timestamp_ms": 1774380458375,
+      "warnings": []
+    },
+    "before_probe": {
+      "effective": {
+        "device_count": 1,
+        "devices": [
+          {
+            "driver_version": "595.71",
+            "index": 0,
+            "memory_free_bytes": 6310273024,
+            "memory_total_bytes": 8589934592,
+            "memory_used_bytes": 2279661568,
+            "name": "NVIDIA GeForce RTX 2080",
+            "source": "nvml+nvidia-smi"
+          }
+        ],
+        "driver_version": "595.71",
+        "has_nvidia_gpu": true,
+        "source": "nvml"
+      },
+      "nvidia_smi": {
+        "available": true,
+        "command": [
+          "nvidia-smi",
+          "--query-gpu=index,name,memory.total,memory.used,memory.free,driver_version",
+          "--format=csv,noheader,nounits"
+        ],
+        "devices": [
+          {
+            "driver_version": "595.71",
+            "index": 0,
+            "memory_free_bytes": 6310330368,
+            "memory_total_bytes": 8589934592,
+            "memory_used_bytes": 2065694720,
+            "name": "NVIDIA GeForce RTX 2080"
+          }
+        ],
+        "driver_version": "595.71",
+        "error": null,
+        "exit_code": 0,
+        "status": "ok",
+        "stderr": null,
+        "stdout": "0, NVIDIA GeForce RTX 2080, 8192, 1970, 6018, 595.71"
+      },
+      "nvml": {
+        "available": true,
+        "devices": [
+          {
+            "index": 0,
+            "memory_free_bytes": 6310273024,
+            "memory_total_bytes": 8589934592,
+            "memory_used_bytes": 2279661568,
+            "name": "NVIDIA GeForce RTX 2080"
+          }
+        ],
+        "driver_version": "595.71",
+        "error": null,
+        "initialized": true,
+        "library": "nvml.dll",
+        "status": "ok"
+      },
+      "timestamp_ms": 1774380443787,
+      "warnings": []
+    }
+  },
+  "config": {
+    "device_index": 0,
+    "hold_ms": 300,
+    "transfer_bytes": 67108864
+  },
+  "gate_checks": {
+    "service_hardware_mode_active": {
+      "note": "run_mode=hardware",
+      "passed": true
+    },
+    "service_hardware_transfer_ok": {
+      "note": "hardware_result.ok=True",
+      "passed": true
+    },
+    "service_triggered_nvml_delta_observed": {
+      "note": "observed_delta_bytes=172556288",
+      "passed": true
+    }
+  },
+  "generated_at": "2026-03-24T19:27:38.459147+00:00",
+  "probe_snapshot": {
+    "after_minus_before_bytes": -38600704,
+    "after_used_bytes": 2241060864,
+    "before_used_bytes": 2279661568
+  },
+  "run_id": "2026-03-24",
+  "runtime_result": {
+    "correlation_id": "7c806411-ef14-4557-8a12-6509c44559bc:hardware_gate:run-90400d45-8d93-4816-8e90-c59ff1a57481",
+    "fallback_result": null,
+    "fallback_step": null,
+    "hardware_result": {
+      "cuda_symbols": {
+        "ctx_create": "cuCtxCreate_v2",
+        "ctx_destroy": "cuCtxDestroy_v2",
+        "mem_alloc": "cuMemAlloc_v2",
+        "mem_free": "cuMemFree_v2",
+        "memcpy_d2h": "cuMemcpyDtoH_v2",
+        "memcpy_h2d": "cuMemcpyHtoD_v2"
+      },
+      "device_index": 0,
+      "error": null,
+      "nvml_observation": {
+        "after_alloc": {
+          "device_index": 0,
+          "error": null,
+          "source": "nvml",
+          "timestamp_ms": 1774380458040,
+          "used_bytes": 2414010368
+        },
+        "after_copy": {
+          "device_index": 0,
+          "error": null,
+          "source": "nvml",
+          "timestamp_ms": 1774380458126,
+          "used_bytes": 2414010368
+        },
+        "after_free": {
+          "device_index": 0,
+          "error": null,
+          "source": "nvml",
+          "timestamp_ms": 1774380458240,
+          "used_bytes": 2241060864
+        },
+        "before": {
+          "device_index": 0,
+          "error": null,
+          "source": "nvml",
+          "timestamp_ms": 1774380457359,
+          "used_bytes": 2241454080
+        },
+        "device_index": 0,
+        "observed": true,
+        "observed_delta_bytes": 172556288,
+        "peak_used_bytes": 2414010368,
+        "source": "nvml"
+      },
+      "ok": true,
+      "service_context": {
+        "device_index": 0,
+        "hold_ms": 300,
+        "requested_transfer_bytes": 67108864,
+        "session_id": "7c806411-ef14-4557-8a12-6509c44559bc",
+        "step_name": "hardware_gate"
+      },
+      "size_bytes": 67108864,
+      "throughput": {
+        "round_trip_gib_per_sec": 10.394491750931346
+      },
+      "timestamp_ms": 1774380458375,
+      "timings_ms": {
+        "copy_d2h_ms": 6.4788,
+        "copy_h2d_ms": 5.5468,
+        "total_ms": 1016.1867
+      },
+      "verification": {
+        "dst_crc32": "f43b1a25",
+        "matched": true,
+        "src_crc32": "f43b1a25"
+      }
+    },
+    "policy_profile": "stability",
+    "pressure_level": 0.0,
+    "run_mode": "hardware",
+    "session_id": "7c806411-ef14-4557-8a12-6509c44559bc",
+    "state": "READY",
+    "step_name": "hardware_gate"
+  },
+  "verdict": "pass"
+}

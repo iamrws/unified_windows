@@ -70,6 +70,7 @@ def generate_reports(
     w13_summary: Path,
     operations_report: Path,
     compliance_manifest: Path,
+    hardware_gate_report: Path | None = None,
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     statuses, ran_tests = _parse_unittest_log(unittest_log)
@@ -78,6 +79,9 @@ def generate_reports(
     w13 = _read_json(w13_summary)
     ops = _read_json(operations_report)
     compliance = _read_json(compliance_manifest)
+    hardware_gate: dict[str, Any] | None = None
+    if hardware_gate_report is not None and hardware_gate_report.exists():
+        hardware_gate = _read_json(hardware_gate_report)
 
     high_threat_tests = {
         "T-001": [
@@ -300,6 +304,7 @@ def generate_reports(
             "w13_summary": str(w13_summary),
             "operations_report": str(operations_report),
             "compliance_manifest": str(compliance_manifest),
+            "hardware_gate_report": str(hardware_gate_report) if hardware_gate_report is not None else None,
         },
         "test_suite": {
             "ran_tests": ran_tests,
@@ -334,7 +339,70 @@ def generate_reports(
             "P2-10": {"passed": compliance_pass, "evidence": str(compliance_manifest)},
         },
     }
-    readiness["verdict"] = "pass" if all(item["passed"] for item in readiness["gates"].values()) else "fail"
+    hardware_checks = hardware_gate.get("gate_checks", {}) if isinstance(hardware_gate, dict) else {}
+    run_mode_active = bool(
+        isinstance(hardware_checks.get("service_hardware_mode_active"), dict)
+        and hardware_checks["service_hardware_mode_active"].get("passed")
+    )
+    transfer_ok = bool(
+        isinstance(hardware_checks.get("service_hardware_transfer_ok"), dict)
+        and hardware_checks["service_hardware_transfer_ok"].get("passed")
+    )
+    delta_observed = bool(
+        isinstance(hardware_checks.get("service_triggered_nvml_delta_observed"), dict)
+        and hardware_checks["service_triggered_nvml_delta_observed"].get("passed")
+    )
+    hardware_evidence = (
+        str(hardware_gate_report)
+        if hardware_gate_report is not None and hardware_gate_report.exists()
+        else "missing hardware gate artifact (run scripts/run_hardware_gate.py)"
+    )
+    readiness["gates"]["P0-HW-11"] = {
+        "passed": run_mode_active and transfer_ok,
+        "evidence": hardware_evidence,
+        "note": "Service RunStep executed in hardware mode and completed CUDA transfer proof.",
+    }
+    readiness["gates"]["P1-HW-12"] = {
+        "passed": delta_observed,
+        "evidence": hardware_evidence,
+        "note": "Service-triggered NVML memory delta was observed during hardware RunStep.",
+    }
+    readiness["gates"]["P1-HW-13"] = {
+        "passed": True,
+        "note": "Release report now distinguishes simulation-ready and hardware-ready tracks.",
+    }
+
+    simulation_gate_ids = [
+        "P0-01",
+        "P0-02",
+        "P0-03",
+        "P0-04",
+        "P1-05",
+        "P1-06",
+        "P1-07",
+        "P1-08",
+        "P2-09",
+        "P2-10",
+    ]
+    hardware_gate_ids = ["P0-HW-11", "P1-HW-12", "P1-HW-13"]
+    simulation_ready = all(readiness["gates"][gate]["passed"] for gate in simulation_gate_ids)
+    hardware_ready = simulation_ready and all(readiness["gates"][gate]["passed"] for gate in hardware_gate_ids)
+    readiness["tracks"] = {
+        "simulation_ready": {
+            "passed": simulation_ready,
+            "gates": simulation_gate_ids,
+        },
+        "hardware_ready": {
+            "passed": hardware_ready,
+            "gates": hardware_gate_ids,
+        },
+    }
+    if hardware_ready:
+        readiness["verdict"] = "hardware_ready"
+    elif simulation_ready:
+        readiness["verdict"] = "simulation_ready"
+    else:
+        readiness["verdict"] = "fail"
 
     readiness_json = out_dir / f"release_gate_readiness_{run_id}.json"
     readiness_md = out_dir / f"release_gate_readiness_{run_id}.md"
@@ -347,6 +415,8 @@ def generate_reports(
             f"- Run id: `{run_id}`",
             f"- Generated at: `{readiness['generated_at']}`",
             f"- Overall verdict: `{readiness['verdict']}`",
+            f"- Simulation-ready: `{'pass' if simulation_ready else 'fail'}`",
+            f"- Hardware-ready: `{'pass' if hardware_ready else 'fail'}`",
             "",
             "| Gate | Result | Evidence |",
             "| --- | --- | --- |",
@@ -363,6 +433,8 @@ def generate_reports(
         "workload_report_json": str(workload_json),
         "readiness_json": str(readiness_json),
         "verdict": readiness["verdict"],
+        "simulation_ready": simulation_ready,
+        "hardware_ready": hardware_ready,
     }
 
 
@@ -394,7 +466,19 @@ def main() -> int:
         "--compliance-manifest",
         default="reports/release_artifacts/compliance_manifest_2026-03-24.json",
     )
+    parser.add_argument(
+        "--hardware-gate-report",
+        default="",
+        help="Optional hardware gate artifact (defaults to reports/release_gate/hardware_gate_<run-id>.json if present).",
+    )
     args = parser.parse_args()
+
+    auto_hardware_gate = (REPO_ROOT / args.out_dir / f"hardware_gate_{args.run_id}.json").resolve()
+    hardware_gate_report = None
+    if args.hardware_gate_report.strip():
+        hardware_gate_report = (REPO_ROOT / args.hardware_gate_report).resolve()
+    elif auto_hardware_gate.exists():
+        hardware_gate_report = auto_hardware_gate
 
     result = generate_reports(
         run_id=args.run_id,
@@ -404,9 +488,10 @@ def main() -> int:
         w13_summary=(REPO_ROOT / args.w13_summary).resolve(),
         operations_report=(REPO_ROOT / args.operations_report).resolve(),
         compliance_manifest=(REPO_ROOT / args.compliance_manifest).resolve(),
+        hardware_gate_report=hardware_gate_report,
     )
     print(json.dumps({"ok": True, "result": result}, indent=2, sort_keys=True))
-    return 0 if result["verdict"] == "pass" else 1
+    return 0 if result["verdict"] in {"simulation_ready", "hardware_ready"} else 1
 
 
 if __name__ == "__main__":

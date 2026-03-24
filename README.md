@@ -39,6 +39,7 @@ The new `hardware-probe` CLI command is the first place where AstraWeave reads r
 There is also a real transfer proof script:
 
 - `scripts/cuda_transfer_poc.py` uses the CUDA Driver API (`nvcuda.dll`) through `ctypes` to perform a real host->device->host byte copy and verify integrity.
+- `scripts/run_hardware_gate.py` triggers hardware-mode `RunStep` in `AstraWeaveService` and checks for service-triggered NVML memory delta evidence.
 
 The service orchestration layer remains a prototype boundary for now:
 
@@ -100,6 +101,8 @@ python -m astrawave.cli --backend local create-session
 python -m astrawave.cli hardware-probe
 # Real CUDA transfer PoC (host->device->host round-trip):
 python scripts/cuda_transfer_poc.py --bytes 1048576 --pretty
+# Service-path hardware gate (RunStep hardware mode + NVML delta check):
+python scripts/run_hardware_gate.py --run-id 2026-03-24
 ```
 
 ## Release-Gate Automation
@@ -122,4 +125,11 @@ python scripts/generate_compliance_artifacts.py --run-id 2026-03-24
 
 # 5) Consolidated gate readiness report
 python scripts/generate_release_gate_report.py --run-id 2026-03-24
+# Optional explicit hardware gate path:
+python scripts/generate_release_gate_report.py --run-id 2026-03-24 --hardware-gate-report reports/release_gate/hardware_gate_2026-03-24.json
 ```
+
+The consolidated readiness report now publishes split status:
+
+- `simulation_ready`: contract/governance/reliability track status.
+- `hardware_ready`: adds hardware execution gates (`P0-HW-11`, `P1-HW-12`, `P1-HW-13`).

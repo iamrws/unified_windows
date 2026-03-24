@@ -1,6 +1,7 @@
 {
   "evidence_sources": {
     "compliance_manifest": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\release_artifacts\\compliance_manifest_2026-03-24.json",
+    "hardware_gate_report": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\release_gate\\hardware_gate_2026-03-24.json",
     "operations_report": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\release_gate\\operations_drill_2026-03-24.json",
     "unittest_log": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\runlogs\\unittest_rc_2026-03-24.txt",
     "w13_summary": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\runlogs\\summary_rc_w13b_chat_2026-03-24.json",
@@ -24,6 +25,11 @@
       "note": "Lifecycle/error-taxonomy/single-flight conformance is validated by service + IPC contract tests.",
       "passed": true
     },
+    "P0-HW-11": {
+      "evidence": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\release_gate\\hardware_gate_2026-03-24.json",
+      "note": "Service RunStep executed in hardware mode and completed CUDA transfer proof.",
+      "passed": true
+    },
     "P1-05": {
       "note": "Primary workload runs passed; secondary/degraded/unsupported branches validated via capability tests.",
       "passed": true
@@ -40,6 +46,15 @@
       "evidence": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\release_gate\\operations_drill_2026-03-24.json",
       "passed": true
     },
+    "P1-HW-12": {
+      "evidence": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\release_gate\\hardware_gate_2026-03-24.json",
+      "note": "Service-triggered NVML memory delta was observed during hardware RunStep.",
+      "passed": true
+    },
+    "P1-HW-13": {
+      "note": "Release report now distinguishes simulation-ready and hardware-ready tracks.",
+      "passed": true
+    },
     "P2-09": {
       "evidence": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\release_gate\\compatibility_matrix_2026-03-24.json",
       "passed": true
@@ -49,11 +64,36 @@
       "passed": true
     }
   },
-  "generated_at": "2026-03-24T14:25:18.846100+00:00",
+  "generated_at": "2026-03-24T19:28:29.551536+00:00",
   "run_id": "2026-03-24",
   "test_suite": {
-    "ran_tests": 56,
+    "ran_tests": 62,
     "status": "pass"
   },
-  "verdict": "pass"
+  "tracks": {
+    "hardware_ready": {
+      "gates": [
+        "P0-HW-11",
+        "P1-HW-12",
+        "P1-HW-13"
+      ],
+      "passed": true
+    },
+    "simulation_ready": {
+      "gates": [
+        "P0-01",
+        "P0-02",
+        "P0-03",
+        "P0-04",
+        "P1-05",
+        "P1-06",
+        "P1-07",
+        "P1-08",
+        "P2-09",
+        "P2-10"
+      ],
+      "passed": true
+    }
+  },
+  "verdict": "hardware_ready"
 }
