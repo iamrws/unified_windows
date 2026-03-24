@@ -11,8 +11,8 @@ flowchart TD
 ## Findings
 | ID | Severity | Confidence | Location | Description | Remediation | Effort |
 | --- | --- | --- | --- | --- | --- | --- |
-| `AUD-004` | `HIGH` | `[HIGH]` | `astrawave\service.py:144`; `service.py:520`; `service.py:562` | Closed sessions are retained forever in `_closed_sessions`. Probe: `500` create/close cycles produced `500` retained entries (`audit-report/raw/phaseC_closed_sessions_growth_probe.txt`). | Replace full-session retention with capped tombstones (TTL/LRU). Add configurable hard cap and purge strategy. | `M` |
-| `AUD-005` | `HIGH` | `[HIGH]` | `astrawave\telemetry.py:416`; `telemetry.py:483`; `telemetry.py:514`; `telemetry.py:524` | Telemetry records grow indefinitely during normal operation. `record_event` only appends; retention cleanup is only called during export bundle construction. Probe recorded `10,000` events and retained all `10,000` (`audit-report/raw/phaseC_telemetry_growth_probe.txt`). | Perform periodic cleanup in `record_event` or via background scheduler; enforce max in-memory record count. | `M` |
+| `AUD-004` | `HIGH` | `[HIGH]` | `astrawave/service.py:144`; `service.py:520`; `service.py:562` | Closed sessions are retained forever in `_closed_sessions`. Probe: `500` create/close cycles produced `500` retained entries (`audit-report/raw/phaseC_closed_sessions_growth_probe.txt`). | Replace full-session retention with capped tombstones (TTL/LRU). Add configurable hard cap and purge strategy. | `M` |
+| `AUD-005` | `HIGH` | `[HIGH]` | `astrawave/telemetry.py:416`; `telemetry.py:483`; `telemetry.py:514`; `telemetry.py:524` | Telemetry records grow indefinitely during normal operation. `record_event` only appends; retention cleanup is only called during export bundle construction. Probe recorded `10,000` events and retained all `10,000` (`audit-report/raw/phaseC_telemetry_growth_probe.txt`). | Perform periodic cleanup in `record_event` or via background scheduler; enforce max in-memory record count. | `M` |
 
 ## Quantified Impact
 | ID | Measurement | Value |
