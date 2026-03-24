@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import unittest
 from unittest.mock import patch
@@ -161,6 +162,146 @@ class AstraWeaveServiceLifecycleTests(unittest.TestCase):
         self.assertFalse(result["hardware_result"]["ok"])
         self.assertTrue(result["hardware_result"]["fallback_to_simulation"])
         self.assertEqual(result["state"].value, "DEGRADED")
+
+    def test_run_step_with_prompt_uses_simulation_inference_without_telemetry_leakage(self) -> None:
+        self.service.LoadModel(self.session_id, "demo-model")
+        result = self.service.RunStep(
+            self.session_id,
+            step_name="decode",
+            prompt="Tell me a secret about penguins.",
+            max_tokens=32,
+            temperature=0.1,
+        )
+
+        self.assertIn("inference_result", result)
+        inference = result["inference_result"]
+        self.assertTrue(inference["ok"])
+        self.assertEqual(inference["backend"], "simulation")
+        self.assertEqual(inference["model_name"], "demo-model")
+        self.assertIn("output_text", inference)
+        telemetry_blob = json.dumps([record.to_dict() for record in self.service.telemetry.records], sort_keys=True)
+        self.assertNotIn("Tell me a secret about penguins.", telemetry_blob)
+
+    def test_load_model_with_ollama_prefix_routes_to_injected_runtime(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class FakeOllamaRuntime:
+            backend_name = "ollama"
+
+            def load_model(self, model_name: str):
+                calls.append({"phase": "load_model", "model_name": model_name})
+                from astrawave.inference_runtime import InferenceModelBinding
+
+                return InferenceModelBinding(
+                    backend="ollama",
+                    requested_model_name=model_name,
+                    resolved_model_name=model_name,
+                    metadata={"transport": "fake-http"},
+                )
+
+            def generate(
+                self,
+                model_name: str,
+                *,
+                prompt: str,
+                step_name: str,
+                max_tokens: int | None = None,
+                temperature: float | None = None,
+                system_prompt: str | None = None,
+            ) -> dict[str, object]:
+                calls.append(
+                    {
+                        "phase": "generate",
+                        "model_name": model_name,
+                        "prompt": prompt,
+                        "step_name": step_name,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                        "system_prompt": system_prompt,
+                    }
+                )
+                return {
+                    "ok": True,
+                    "backend": "ollama",
+                    "model_name": model_name,
+                    "output_text": "hello from ollama",
+                    "finish_reason": "stop",
+                }
+
+        def runtime_factory(backend_name: str):
+            if backend_name == "ollama":
+                return FakeOllamaRuntime()
+            raise AssertionError(f"unexpected backend requested: {backend_name}")
+
+        service = AstraWeaveService(
+            runstep_mode="simulation",
+            inference_runtime_factory=runtime_factory,
+        )
+        session_id = service.CreateSession()
+        service.LoadModel(session_id, "ollama:qwen2.5:7b")
+        result = service.RunStep(
+            session_id,
+            step_name="decode",
+            prompt="Write one short line.",
+            max_tokens=24,
+            temperature=0.3,
+        )
+
+        session = service._get_session(session_id)
+        self.assertEqual(session.inference_backend, "ollama")
+        self.assertEqual(session.resolved_model_name, "qwen2.5:7b")
+        self.assertEqual(calls[0], {"phase": "load_model", "model_name": "qwen2.5:7b"})
+        self.assertEqual(calls[1]["phase"], "generate")
+        self.assertEqual(calls[1]["model_name"], "qwen2.5:7b")
+        self.assertEqual(calls[1]["step_name"], "decode")
+        self.assertEqual(result["inference_result"]["backend"], "ollama")
+        self.assertEqual(result["inference_result"]["output_text"], "hello from ollama")
+
+    def test_load_model_runtime_backend_override_routes_without_prefix(self) -> None:
+        class FakeOllamaRuntime:
+            backend_name = "ollama"
+
+            def load_model(self, model_name: str):
+                from astrawave.inference_runtime import InferenceModelBinding
+
+                return InferenceModelBinding(
+                    backend="ollama",
+                    requested_model_name=model_name,
+                    resolved_model_name=model_name,
+                    metadata={},
+                )
+
+            def generate(
+                self,
+                model_name: str,
+                *,
+                prompt: str,
+                step_name: str,
+                max_tokens: int | None = None,
+                temperature: float | None = None,
+                system_prompt: str | None = None,
+            ) -> dict[str, object]:
+                return {
+                    "ok": True,
+                    "backend": "ollama",
+                    "model_name": model_name,
+                    "output_text": f"mock:{prompt}",
+                }
+
+        def runtime_factory(backend_name: str):
+            if backend_name == "ollama":
+                return FakeOllamaRuntime()
+            raise AssertionError(f"unexpected backend requested: {backend_name}")
+
+        service = AstraWeaveService(runstep_mode="simulation", inference_runtime_factory=runtime_factory)
+        session_id = service.CreateSession()
+        service.LoadModel(session_id, "qwen2.5:7b", runtime_backend="ollama")
+        result = service.RunStep(session_id, step_name="decode", prompt="hello")
+
+        session = service._get_session(session_id)
+        self.assertEqual(session.inference_backend, "ollama")
+        self.assertEqual(session.resolved_model_name, "qwen2.5:7b")
+        self.assertEqual(result["inference_result"]["backend"], "ollama")
 
 
 if __name__ == "__main__":

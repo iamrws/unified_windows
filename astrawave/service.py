@@ -18,6 +18,11 @@ except Exception:  # pragma: no cover - optional runtime path
 
 from .errors import ApiError, ApiErrorCode
 from .fallback import FallbackController, FallbackState, FallbackStep
+from .inference_runtime import (
+    InferenceRuntime,
+    create_inference_runtime,
+    resolve_backend_and_model_name,
+)
 from .security import CallerIdentity, SecurityGuard, SecurityPolicy, resolve_current_user_sid
 from .telemetry import (
     FallbackEvent as TelemetryFallbackEvent,
@@ -51,6 +56,7 @@ HARDWARE_HOLD_MS_ENV = "ASTRAWEAVE_HARDWARE_HOLD_MS"
 DEFAULT_HARDWARE_HOLD_MS = 75
 
 HardwareExecutor = Callable[..., dict[str, Any]]
+InferenceRuntimeFactory = Callable[[str], InferenceRuntime]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -80,6 +86,9 @@ class _Session:
     owner_identity: CallerIdentity
     state: SessionState = SessionState.SESSION_CREATED
     model_name: Optional[str] = None
+    inference_backend: str = "simulation"
+    resolved_model_name: Optional[str] = None
+    inference_metadata: dict[str, Any] = field(default_factory=dict)
     policy_profile: PolicyProfile = PolicyProfile.STABILITY
     tensors: Dict[str, _TensorRecord] = field(default_factory=dict)
     active_run: bool = False
@@ -119,6 +128,7 @@ class AstraWeaveService:
         fallback_controller: FallbackController | None = None,
         runstep_mode: str | None = None,
         hardware_executor: HardwareExecutor | None = None,
+        inference_runtime_factory: InferenceRuntimeFactory | None = None,
     ) -> None:
         self._security = security_guard or SecurityGuard(
             SecurityPolicy(service_owner_sid=DEFAULT_SERVICE_OWNER_SID)
@@ -133,6 +143,7 @@ class AstraWeaveService:
         self._lock = RLock()
         self._runstep_mode_override = runstep_mode
         self._hardware_executor = hardware_executor or _run_cuda_transfer
+        self._inference_runtime_factory = inference_runtime_factory or create_inference_runtime
 
     @property
     def telemetry(self) -> TelemetryPipeline:
@@ -185,16 +196,27 @@ class AstraWeaveService:
         session_id: str,
         model_name: str,
         *,
+        runtime_backend: str | None = None,
         caller_identity: CallerIdentity | None = None,
     ) -> None:
         """Attach a model to a session and transition it toward READY."""
 
         session, _caller = self._get_authorized_session(session_id, caller_identity, "LoadModel")
         self._require_state(session, {SessionState.SESSION_CREATED}, "LoadModel")
-        if not model_name:
-            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "model_name must not be empty")
+        backend_name, resolved_model_name = resolve_backend_and_model_name(
+            model_name,
+            runtime_backend=runtime_backend,
+        )
+        runtime = self._inference_runtime_factory(backend_name)
+        binding = runtime.load_model(resolved_model_name)
         with session.lock:
             session.model_name = model_name
+            session.inference_backend = binding.backend
+            session.resolved_model_name = binding.resolved_model_name
+            session.inference_metadata = {
+                "requested_model_name": binding.requested_model_name,
+                **dict(binding.metadata),
+            }
             session.state = SessionState.MODEL_LOADED
             session.state = SessionState.READY
 
@@ -283,6 +305,10 @@ class AstraWeaveService:
         session_id: str,
         step_name: str = "run",
         *,
+        prompt: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        system_prompt: str | None = None,
         caller_identity: CallerIdentity | None = None,
     ) -> dict[str, object]:
         """Execute one inference step with single-flight protection per session."""
@@ -305,6 +331,7 @@ class AstraWeaveService:
             requested_run_mode = self._resolve_runstep_mode()
             run_mode = "simulation"
             hardware_result: dict[str, object] | None = None
+            inference_result: dict[str, object] | None = None
 
             if pressure_level >= HIGH_PRESSURE_THRESHOLD or session.fallback_stability_mode:
                 fallback_result = self._advance_fallback(session=session, caller=caller, now_ms=now_ms)
@@ -314,6 +341,15 @@ class AstraWeaveService:
                     run_mode = "hardware"
                 elif isinstance(hardware_result, dict):
                     hardware_result.setdefault("fallback_to_simulation", True)
+            if prompt is not None:
+                inference_result = self._execute_inference_runstep(
+                    session=session,
+                    step_name=step_name,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    system_prompt=system_prompt,
+                )
 
             with session.lock:
                 if session.state != SessionState.FAILED:
@@ -323,6 +359,8 @@ class AstraWeaveService:
                         and not bool(hardware_result.get("ok"))
                     ):
                         session.state = SessionState.DEGRADED
+                    elif isinstance(inference_result, dict) and not bool(inference_result.get("ok", True)):
+                        session.state = SessionState.DEGRADED
                     else:
                         session.state = SessionState.DEGRADED if (
                             session.fallback_stability_mode
@@ -331,7 +369,7 @@ class AstraWeaveService:
                         ) else SessionState.READY
 
                 correlation_id = f"{session.session_id}:{step_name}:{new_correlation_id('run')}"
-                return {
+                response: dict[str, object] = {
                     "session_id": session.session_id,
                     "step_name": step_name,
                     "correlation_id": correlation_id,
@@ -346,6 +384,9 @@ class AstraWeaveService:
                     "run_mode": run_mode,
                     "hardware_result": hardware_result,
                 }
+                if prompt is not None:
+                    response["inference_result"] = inference_result
+                return response
         finally:
             with session.lock:
                 session.active_run = False
@@ -921,6 +962,73 @@ class AstraWeaveService:
         if session.tensors:
             return max(DEFAULT_TRANSFER_BYTES, max(item.size_bytes for item in session.tensors.values()))
         return DEFAULT_TRANSFER_BYTES
+
+    def _execute_inference_runstep(
+        self,
+        *,
+        session: _Session,
+        step_name: str,
+        prompt: str,
+        max_tokens: int | None,
+        temperature: float | None,
+        system_prompt: str | None,
+    ) -> dict[str, object]:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "prompt must be a non-empty string when provided")
+        if max_tokens is not None and max_tokens <= 0:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "max_tokens must be positive when provided")
+        if temperature is not None and temperature < 0:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "temperature must be non-negative when provided")
+        if session.resolved_model_name is None:
+            raise ApiError(ApiErrorCode.INVALID_STATE, "session has no resolved model binding")
+
+        runtime = self._inference_runtime_factory(session.inference_backend)
+        try:
+            result = runtime.generate(
+                session.resolved_model_name,
+                prompt=prompt,
+                step_name=step_name,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system_prompt=system_prompt,
+            )
+        except ApiError as exc:
+            return {
+                "ok": False,
+                "backend": session.inference_backend,
+                "model_name": session.resolved_model_name,
+                "error": {
+                    "code": exc.code.value,
+                    "message": str(exc),
+                },
+            }
+        except Exception as exc:  # pragma: no cover - defensive runtime boundary
+            return {
+                "ok": False,
+                "backend": session.inference_backend,
+                "model_name": session.resolved_model_name,
+                "error": {
+                    "code": ApiErrorCode.INTERNAL.value,
+                    "message": f"inference backend execution failed unexpectedly: {exc}",
+                },
+            }
+
+        if not isinstance(result, dict):
+            return {
+                "ok": False,
+                "backend": session.inference_backend,
+                "model_name": session.resolved_model_name,
+                "error": {
+                    "code": ApiErrorCode.INTERNAL.value,
+                    "message": "inference backend must return a JSON object",
+                },
+            }
+
+        normalized = dict(result)
+        normalized.setdefault("ok", True)
+        normalized.setdefault("backend", session.inference_backend)
+        normalized.setdefault("model_name", session.resolved_model_name)
+        return normalized
 
     @staticmethod
     def _hardware_failure_result(

@@ -18,6 +18,7 @@ Phase 2 introduced the local IPC transport layer plus SDK and CLI wrappers aroun
 - `docs/compatibility-matrix.md`
 - `docs/release-governance.md`
 - `docs/test-plan.md`
+- `docs/phase4-live-inference-ctospec.md`
 
 ## Phase 2 Runtime
 
@@ -46,6 +47,40 @@ The service orchestration layer is still intentionally bounded:
 - service/session/tiering behavior remains in-process and deterministic.
 - residency changes, fallback steps, and migration latency are controlled by the Python runtime.
 - the hardware gate currently validates real transfer behavior, while full model-aware tensor orchestration remains a separate future milestone.
+
+## Phase 4 Live Inference Bridge
+
+Phase 4 is the bridge for testing a real local model on a Windows host with large system RAM and a small dGPU.
+
+What it does today:
+
+- starts AstraWeave's local service for session orchestration,
+- loads a model name into the service,
+- sends a real prompt to a local inference backend such as Ollama,
+- and prints a structured JSON report.
+
+What it does not do yet:
+
+- it does not make AstraWeave itself the prompt-generation engine,
+- it does not hide the local backend choice,
+- and it does not log raw prompt or completion text by default.
+
+Example workflow:
+
+```powershell
+# Terminal 1: make sure Ollama is running locally
+ollama serve
+
+# Pull any local model you want to test. A 7B or 8B instruct model is a sensible start.
+ollama pull <your-local-model-tag>
+
+# Terminal 2: run the AstraWeave bridge smoke
+python scripts/live_inference_smoke.py --runtime-backend ollama --model <your-local-model-tag> --prompt "Explain in one paragraph why 128 GB of RAM helps local LLM inference."
+```
+
+The smoke script starts the AstraWeave service itself, loads the chosen model name with the chosen runtime backend, and sends the prompt through AstraWeave `RunStep`. It is the fastest honest test of the current bridge phase.
+
+Note: the smoke path imports the AstraWeave package, so it assumes the runtime import path is healthy.
 
 ## Historical Inputs
 
