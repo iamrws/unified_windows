@@ -1,0 +1,380 @@
+﻿0001: """High-level AstraWeave SDK wrapper.
+0002: 
+0003: The SDK is intentionally thin: it wraps an IPC client when available and
+0004: provides convenient defaults for caller identity, context-manager support, and
+0005: service-style method names.
+0006: """
+0007: 
+0008: from __future__ import annotations
+0009: 
+0010: from typing import Any, Callable
+0011: 
+0012: from .security import CallerIdentity
+0013: from .types import MemoryTier, PolicyProfile
+0014: 
+0015: try:  # pragma: no cover - optional transport layer may land separately
+0016:     from .ipc_client import AstraWeaveIpcClient
+0017: except ImportError:  # pragma: no cover - graceful fallback when transport is absent
+0018:     AstraWeaveIpcClient = None
+0019: 
+0020: 
+0021: class AstraWeaveSDK:
+0022:     """Convenience wrapper around `AstraWeaveIpcClient`.
+0023: 
+0024:     Parameters
+0025:     ----------
+0026:     client:
+0027:         Optional pre-built IPC client instance. When omitted, the SDK will try
+0028:         to construct `AstraWeaveIpcClient` if that transport module is present.
+0029:     default_caller_identity:
+0030:         Default caller identity used when an API method is invoked without an
+0031:         explicit caller.
+0032:     default_user_sid / default_pid:
+0033:         Convenience fields for constructing a default caller identity when a
+0034:         full identity object is not supplied.
+0035:     client_factory:
+0036:         Optional factory for dependency injection. This is useful for tests or
+0037:         alternative transports.
+0038:     client_kwargs:
+0039:         Keyword arguments forwarded to the transport client factory/constructor.
+0040:     """
+0041: 
+0042:     def __init__(
+0043:         self,
+0044:         client: Any | None = None,
+0045:         *,
+0046:         default_caller_identity: CallerIdentity | None = None,
+0047:         default_user_sid: str | None = None,
+0048:         default_pid: int | None = None,
+0049:         client_factory: Callable[..., Any] | None = None,
+0050:         **client_kwargs: Any,
+0051:     ) -> None:
+0052:         self._client = client if client is not None else self._build_client(client_factory, client_kwargs)
+0053:         self._default_caller_identity = self._resolve_default_caller_identity(
+0054:             default_caller_identity,
+0055:             default_user_sid,
+0056:             default_pid,
+0057:         )
+0058:         self._closed = False
+0059: 
+0060:     @property
+0061:     def client(self) -> Any:
+0062:         """Expose the wrapped IPC client."""
+0063: 
+0064:         return self._client
+0065: 
+0066:     @property
+0067:     def default_caller_identity(self) -> CallerIdentity | None:
+0068:         """Return the configured default caller identity, if any."""
+0069: 
+0070:         return self._default_caller_identity
+0071: 
+0072:     def __enter__(self) -> "AstraWeaveSDK":
+0073:         return self
+0074: 
+0075:     def __exit__(self, exc_type, exc, tb) -> bool:
+0076:         self.close()
+0077:         return False
+0078: 
+0079:     def close(self) -> None:
+0080:         """Close the wrapped transport client if it exposes a close method."""
+0081: 
+0082:         if self._closed:
+0083:             return
+0084:         self._closed = True
+0085:         for attr_name in ("close", "disconnect", "stop"):
+0086:             close_fn = getattr(self._client, attr_name, None)
+0087:             if callable(close_fn):
+0088:                 close_fn()
+0089:                 return
+0090: 
+0091:     def CreateSession(self, caller_identity: CallerIdentity | None = None) -> str:
+0092:         return self._invoke("CreateSession", caller_identity=caller_identity)
+0093: 
+0094:     def LoadModel(
+0095:         self,
+0096:         session_id: str,
+0097:         model_name: str,
+0098:         *,
+0099:         runtime_backend: str | None = None,
+0100:         runtime_profile: str | None = None,
+0101:         runtime_backend_options: dict[str, Any] | None = None,
+0102:         caller_identity: CallerIdentity | None = None,
+0103:     ) -> Any:
+0104:         return self._invoke(
+0105:             "LoadModel",
+0106:             session_id,
+0107:             model_name,
+0108:             runtime_backend=runtime_backend,
+0109:             runtime_profile=runtime_profile,
+0110:             runtime_backend_options=runtime_backend_options,
+0111:             caller_identity=caller_identity,
+0112:         )
+0113: 
+0114:     def RegisterTensor(
+0115:         self,
+0116:         session_id: str,
+0117:         tensor_name: str,
+0118:         size_bytes: int,
+0119:         *,
+0120:         caller_identity: CallerIdentity | None = None,
+0121:     ) -> Any:
+0122:         return self._invoke(
+0123:             "RegisterTensor",
+0124:             session_id,
+0125:             tensor_name,
+0126:             size_bytes,
+0127:             caller_identity=caller_identity,
+0128:         )
+0129: 
+0130:     def SetTierHint(
+0131:         self,
+0132:         session_id: str,
+0133:         tensor_name: str,
+0134:         tier: MemoryTier,
+0135:         *,
+0136:         caller_identity: CallerIdentity | None = None,
+0137:     ) -> Any:
+0138:         return self._invoke(
+0139:             "SetTierHint",
+0140:             session_id,
+0141:             tensor_name,
+0142:             tier,
+0143:             caller_identity=caller_identity,
+0144:         )
+0145: 
+0146:     def PrefetchPlan(
+0147:         self,
+0148:         session_id: str,
+0149:         *,
+0150:         caller_identity: CallerIdentity | None = None,
+0151:     ) -> Any:
+0152:         return self._invoke("PrefetchPlan", session_id, caller_identity=caller_identity)
+0153: 
+0154:     def RunStep(
+0155:         self,
+0156:         session_id: str,
+0157:         step_name: str = "run",
+0158:         *,
+0159:         prompt: str | None = None,
+0160:         max_tokens: int | None = None,
+0161:         temperature: float | None = None,
+0162:         runtime_profile_override: str | None = None,
+0163:         runtime_backend_options_override: dict[str, Any] | None = None,
+0164:         caller_identity: CallerIdentity | None = None,
+0165:     ) -> Any:
+0166:         return self._invoke(
+0167:             "RunStep",
+0168:             session_id,
+0169:             step_name,
+0170:             prompt=prompt,
+0171:             max_tokens=max_tokens,
+0172:             temperature=temperature,
+0173:             runtime_profile_override=runtime_profile_override,
+0174:             runtime_backend_options_override=runtime_backend_options_override,
+0175:             caller_identity=caller_identity,
+0176:         )
+0177: 
+0178:     def GetResidency(
+0179:         self,
+0180:         session_id: str,
+0181:         *,
+0182:         caller_identity: CallerIdentity | None = None,
+0183:     ) -> Any:
+0184:         return self._invoke("GetResidency", session_id, caller_identity=caller_identity)
+0185: 
+0186:     def GetPressure(
+0187:         self,
+0188:         session_id: str,
+0189:         *,
+0190:         caller_identity: CallerIdentity | None = None,
+0191:     ) -> Any:
+0192:         return self._invoke("GetPressure", session_id, caller_identity=caller_identity)
+0193: 
+0194:     def SetPolicy(
+0195:         self,
+0196:         session_id: str,
+0197:         policy: PolicyProfile,
+0198:         *,
+0199:         caller_identity: CallerIdentity | None = None,
+0200:     ) -> Any:
+0201:         return self._invoke(
+0202:             "SetPolicy",
+0203:             session_id,
+0204:             policy,
+0205:             caller_identity=caller_identity,
+0206:         )
+0207: 
+0208:     def CloseSession(
+0209:         self,
+0210:         session_id: str,
+0211:         *,
+0212:         caller_identity: CallerIdentity | None = None,
+0213:     ) -> Any:
+0214:         return self._invoke("CloseSession", session_id, caller_identity=caller_identity)
+0215: 
+0216:     def _invoke(
+0217:         self,
+0218:         method_name: str,
+0219:         *args: Any,
+0220:         caller_identity: CallerIdentity | None = None,
+0221:         **kwargs: Any,
+0222:     ) -> Any:
+0223:         caller = self._resolve_caller_identity(caller_identity)
+0224:         method = getattr(self._client, method_name, None)
+0225:         if callable(method):
+0226:             try:
+0227:                 return method(*args, **kwargs, caller_identity=caller)
+0228:             except TypeError:
+0229:                 try:
+0230:                     return method(*args, **kwargs, caller=caller)
+0231:                 except TypeError:
+0232:                     return method(*args, **kwargs)
+0233: 
+0234:         call_fn = getattr(self._client, "call", None)
+0235:         if callable(call_fn):
+0236:             params = self._build_params(method_name, args, kwargs)
+0237:             return self._call_transport(call_fn, method_name, params, caller)
+0238: 
+0239:         raise RuntimeError(
+0240:             f"Wrapped client does not expose method '{method_name}' or a generic call interface."
+0241:         )
+0242: 
+0243:     def _call_transport(
+0244:         self,
+0245:         call_fn: Callable[..., Any],
+0246:         method_name: str,
+0247:         params: dict[str, Any],
+0248:         caller: CallerIdentity | None,
+0249:     ) -> Any:
+0250:         attempts = (
+0251:             (method_name, params, caller),
+0252:             (method_name, params),
+0253:             (method_name,),
+0254:         )
+0255:         keyword_attempts = (
+0256:             {"caller": caller, "params": params},
+0257:             {"caller_identity": caller, "params": params},
+0258:             {"caller": caller},
+0259:             {"caller_identity": caller},
+0260:             {"params": params},
+0261:             {},
+0262:         )
+0263: 
+0264:         for call_args in attempts:
+0265:             try:
+0266:                 return call_fn(*call_args)
+0267:             except TypeError:
+0268:                 pass
+0269:         for call_kwargs in keyword_attempts:
+0270:             try:
+0271:                 return call_fn(method_name, **call_kwargs)
+0272:             except TypeError:
+0273:                 pass
+0274:         raise RuntimeError(f"Transport client cannot dispatch method '{method_name}'.")
+0275: 
+0276:     def _build_params(self, method_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+0277:         if method_name == "CreateSession":
+0278:             return {}
+0279:         if method_name == "LoadModel":
+0280:             session_id, model_name = args
+0281:             params = {"session_id": session_id, "model_name": model_name}
+0282:             runtime_backend = kwargs.get("runtime_backend")
+0283:             if runtime_backend is not None:
+0284:                 params["runtime_backend"] = runtime_backend
+0285:             runtime_profile = kwargs.get("runtime_profile")
+0286:             if runtime_profile is not None:
+0287:                 params["runtime_profile"] = runtime_profile
+0288:             runtime_backend_options = kwargs.get("runtime_backend_options")
+0289:             if runtime_backend_options is not None:
+0290:                 params["runtime_backend_options"] = runtime_backend_options
+0291:             return params
+0292:         if method_name == "RegisterTensor":
+0293:             session_id, tensor_name, size_bytes = args
+0294:             return {
+0295:                 "session_id": session_id,
+0296:                 "tensor_name": tensor_name,
+0297:                 "size_bytes": size_bytes,
+0298:             }
+0299:         if method_name == "SetTierHint":
+0300:             session_id, tensor_name, tier = args
+0301:             return {
+0302:                 "session_id": session_id,
+0303:                 "tensor_name": tensor_name,
+0304:                 "tier": tier,
+0305:             }
+0306:         if method_name == "PrefetchPlan":
+0307:             (session_id,) = args
+0308:             return {"session_id": session_id}
+0309:         if method_name == "RunStep":
+0310:             session_id, step_name = args
+0311:             params = {"session_id": session_id, "step_name": step_name}
+0312:             prompt = kwargs.get("prompt")
+0313:             max_tokens = kwargs.get("max_tokens")
+0314:             temperature = kwargs.get("temperature")
+0315:             runtime_profile_override = kwargs.get("runtime_profile_override")
+0316:             runtime_backend_options_override = kwargs.get("runtime_backend_options_override")
+0317:             if prompt is not None:
+0318:                 params["prompt"] = prompt
+0319:             if max_tokens is not None:
+0320:                 params["max_tokens"] = max_tokens
+0321:             if temperature is not None:
+0322:                 params["temperature"] = temperature
+0323:             if runtime_profile_override is not None:
+0324:                 params["runtime_profile_override"] = runtime_profile_override
+0325:             if runtime_backend_options_override is not None:
+0326:                 params["runtime_backend_options_override"] = runtime_backend_options_override
+0327:             return params
+0328:         if method_name == "GetResidency":
+0329:             (session_id,) = args
+0330:             return {"session_id": session_id}
+0331:         if method_name == "GetPressure":
+0332:             (session_id,) = args
+0333:             return {"session_id": session_id}
+0334:         if method_name == "SetPolicy":
+0335:             session_id, policy = args
+0336:             return {"session_id": session_id, "policy": policy}
+0337:         if method_name == "CloseSession":
+0338:             (session_id,) = args
+0339:             return {"session_id": session_id}
+0340:         raise RuntimeError(f"Unsupported SDK method '{method_name}'.")
+0341: 
+0342:     def _resolve_caller_identity(
+0343:         self,
+0344:         caller_identity: CallerIdentity | None,
+0345:     ) -> CallerIdentity | None:
+0346:         if caller_identity is not None:
+0347:             return caller_identity
+0348:         return self._default_caller_identity
+0349: 
+0350:     def _resolve_default_caller_identity(
+0351:         self,
+0352:         default_caller_identity: CallerIdentity | None,
+0353:         default_user_sid: str | None,
+0354:         default_pid: int | None,
+0355:     ) -> CallerIdentity | None:
+0356:         if default_caller_identity is not None:
+0357:             return default_caller_identity
+0358:         if default_user_sid is None and default_pid is None:
+0359:             return None
+0360:         if default_user_sid is None or default_pid is None:
+0361:             raise ValueError(
+0362:                 "default_user_sid and default_pid must both be provided when constructing a default caller identity"
+0363:             )
+0364:         return CallerIdentity(default_user_sid, default_pid)
+0365: 
+0366:     def _build_client(
+0367:         self,
+0368:         client_factory: Callable[..., Any] | None,
+0369:         client_kwargs: dict[str, Any],
+0370:     ) -> Any:
+0371:         if client_factory is not None:
+0372:             return client_factory(**client_kwargs)
+0373:         if AstraWeaveIpcClient is None:
+0374:             raise RuntimeError(
+0375:                 "AstraWeaveIpcClient is not available; provide a client instance or client_factory."
+0376:             )
+0377:         return AstraWeaveIpcClient(**client_kwargs)
+0378: 
+0379: 
+0380: __all__ = ["AstraWeaveSDK"]

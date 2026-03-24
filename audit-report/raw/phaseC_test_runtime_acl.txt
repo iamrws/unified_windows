@@ -1,0 +1,13 @@
+﻿# ACL Snapshot
+
+## test_runtime/release_gate_1ek_1osp
+ACL_READ_FAILED: Attempted to perform an unauthorized operation.
+
+## test_runtime/release_gate_a3gj37o5
+ACL_READ_FAILED: Attempted to perform an unauthorized operation.
+
+## test_runtime/release_gate_sznvo5hj
+ACL_READ_FAILED: Attempted to perform an unauthorized operation.
+
+## test_runtime/release_gate_u_96txby
+ACL_READ_FAILED: Attempted to perform an unauthorized operation.

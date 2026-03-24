@@ -1,0 +1,116 @@
+﻿0001: """Phase 3 runtime smoke tests over the real IPC path."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import os
+0006: import time
+0007: import unittest
+0008: 
+0009: from astrawave.errors import ApiError, ApiErrorCode
+0010: from astrawave.ipc_client import AstraWeaveIpcClient
+0011: from astrawave.ipc_server import AstraWeaveIpcServer
+0012: from astrawave.security import CallerIdentity, resolve_process_user_sid
+0013: from astrawave.types import MemoryTier
+0014: 
+0015: 
+0016: def _endpoint_uri(endpoint: object) -> str:
+0017:     if isinstance(endpoint, tuple) and len(endpoint) == 2:
+0018:         host, port = endpoint
+0019:         return f"tcp://{host}:{port}"
+0020:     if isinstance(endpoint, str):
+0021:         if endpoint.startswith("\\\\.\\pipe\\"):
+0022:             return f"pipe://{endpoint}"
+0023:         if endpoint.startswith(("tcp://", "pipe://")):
+0024:             return endpoint
+0025:         return f"tcp://{endpoint}"
+0026:     raise AssertionError(f"Unsupported endpoint shape: {endpoint!r}")
+0027: 
+0028: 
+0029: def _wait_for_endpoint(server: AstraWeaveIpcServer) -> str:
+0030:     last_endpoint: object | None = None
+0031:     for _ in range(40):
+0032:         last_endpoint = server.endpoint
+0033:         if last_endpoint:
+0034:             return _endpoint_uri(last_endpoint)
+0035:         time.sleep(0.05)
+0036:     raise AssertionError(f"server did not expose an endpoint; last value={last_endpoint!r}")
+0037: 
+0038: 
+0039: class Phase3RuntimeSmokeTests(unittest.TestCase):
+0040:     def setUp(self) -> None:
+0041:         self.server = AstraWeaveIpcServer(
+0042:             prefer_named_pipe=False,
+0043:             host="127.0.0.1",
+0044:             port=0,
+0045:         )
+0046:         self.server.start()
+0047:         self.addCleanup(self.server.stop)
+0048: 
+0049:         self.owner_sid = self.server.service.security_guard.policy.service_owner_sid
+0050:         self.owner = CallerIdentity(user_sid=self.owner_sid, pid=os.getpid())
+0051:         self.foreign = CallerIdentity(
+0052:             user_sid=(resolve_process_user_sid(os.getpid()) or "S-1-5-21-foreign") + "-foreign",
+0053:             pid=os.getpid(),
+0054:         )
+0055:         self.endpoint = _wait_for_endpoint(self.server)
+0056: 
+0057:     def _make_client(self, caller: CallerIdentity) -> AstraWeaveIpcClient:
+0058:         client = AstraWeaveIpcClient(
+0059:             endpoint=self.endpoint,
+0060:             default_caller=caller,
+0061:             timeout=5.0,
+0062:             prefer_named_pipe=False,
+0063:         ).connect()
+0064:         self.addCleanup(client.close)
+0065:         return client
+0066: 
+0067:     def test_real_ipc_client_executes_basic_lifecycle_flow(self) -> None:
+0068:         client = self._make_client(self.owner)
+0069: 
+0070:         session_id = client.CreateSession(self.owner)
+0071:         self.assertIsInstance(session_id, str)
+0072:         client.LoadModel(session_id, "demo-model", self.owner, runtime_backend="ollama")
+0073:         client.RegisterTensor(session_id, "kv", 1024, self.owner)
+0074:         client.SetTierHint(session_id, "kv", MemoryTier.HOT, self.owner)
+0075: 
+0076:         prefetch_plan = client.PrefetchPlan(session_id, self.owner)
+0077:         self.assertIsInstance(prefetch_plan, list)
+0078:         self.assertEqual(len(prefetch_plan), 1)
+0079: 
+0080:         result = client.RunStep(
+0081:             session_id,
+0082:             "decode",
+0083:             self.owner,
+0084:             prompt="hello",
+0085:             max_tokens=8,
+0086:             temperature=0.1,
+0087:         )
+0088:         self.assertEqual(result["session_id"], session_id)
+0089:         self.assertEqual(result["step_name"], "decode")
+0090:         self.assertIn("correlation_id", result)
+0091: 
+0092:         residency = client.GetResidency(session_id, self.owner)
+0093:         pressure = client.GetPressure(session_id, self.owner)
+0094:         self.assertEqual(residency.session_id, session_id)
+0095:         self.assertEqual(pressure.session_id, session_id)
+0096: 
+0097:         client.CloseSession(session_id, self.owner)
+0098: 
+0099:         with self.assertRaises(ApiError) as cm:
+0100:             client.LoadModel(session_id, "another-model", self.owner)
+0101:         self.assertIn(cm.exception.code, {ApiErrorCode.INVALID_STATE, ApiErrorCode.NOT_FOUND})
+0102: 
+0103:     def test_remote_call_smoke_path_denies_foreign_caller(self) -> None:
+0104:         client = self._make_client(self.owner)
+0105:         session_id = client.CreateSession(self.owner)
+0106:         client.LoadModel(session_id, "demo-model", self.owner)
+0107: 
+0108:         with self.assertRaises(ApiError) as cm:
+0109:             client.GetResidency(session_id, self.foreign)
+0110:         self.assertEqual(cm.exception.code, ApiErrorCode.AUTH_DENIED)
+0111: 
+0112:         client.CloseSession(session_id, self.owner)
+0113: 
+0114: 
+0115: if __name__ == "__main__":
+0116:     unittest.main()

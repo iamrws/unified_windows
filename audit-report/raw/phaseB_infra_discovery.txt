@@ -1,0 +1,20 @@
+﻿# Build/Test/Lint Infrastructure Discovery
+
+## Build config files found in repo
+(none)
+
+## Lint/analysis config files found in repo
+(none)
+
+## Tool availability
+python	AVAILABLE	C:\Python313\python.exe
+pytest	AVAILABLE	C:\Users\grzeg\AppData\Roaming\Python\Python313\Scripts\pytest.exe
+ruff	MISSING
+flake8	MISSING
+pylint	MISSING
+mypy	MISSING
+bandit	MISSING
+cppcheck	MISSING
+cargo	AVAILABLE	C:\Users\grzeg\.cargo\bin\cargo.exe
+cmake	MISSING
+make	MISSING

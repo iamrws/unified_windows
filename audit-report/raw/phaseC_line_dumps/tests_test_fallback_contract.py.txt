@@ -1,0 +1,72 @@
+﻿0001: """Contract tests for fallback ordering and anti-oscillation behavior."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import importlib
+0006: import unittest
+0007: 
+0008: 
+0009: class FallbackContractTests(unittest.TestCase):
+0010:     @classmethod
+0011:     def setUpClass(cls) -> None:
+0012:         try:
+0013:             cls.fallback = importlib.import_module("astrawave.fallback")
+0014:         except ModuleNotFoundError as exc:  # pragma: no cover
+0015:             raise AssertionError("astrawave.fallback is required for the fallback contract tests") from exc
+0016: 
+0017:         try:
+0018:             cls.FallbackController = getattr(cls.fallback, "FallbackController")
+0019:             cls.FallbackStep = getattr(cls.fallback, "FallbackStep")
+0020:         except AttributeError as exc:  # pragma: no cover
+0021:             raise AssertionError("astrawave.fallback must expose FallbackController and FallbackStep") from exc
+0022: 
+0023:     def test_fallback_ladder_order_is_mandatory(self) -> None:
+0024:         expected = [
+0025:             "KV_CONTEXT_REDUCTION",
+0026:             "BATCH_REDUCTION",
+0027:             "PRECISION_REDUCTION",
+0028:             "SELECTIVE_CPU_OFFLOAD",
+0029:             "CONTROLLED_FAIL",
+0030:         ]
+0031: 
+0032:         actual = [step.name for step in self.FallbackStep]
+0033:         self.assertEqual(actual, expected)
+0034: 
+0035:     def test_anti_oscillation_defaults_are_locked(self) -> None:
+0036:         controller = self.FallbackController()
+0037: 
+0038:         self.assertEqual(controller.controls.cooldown_seconds, 30)
+0039:         self.assertEqual(controller.controls.minimum_dwell_seconds, 15)
+0040:         self.assertEqual(controller.controls.churn_threshold, 1)
+0041: 
+0042:     def test_controller_declines_step_changes_inside_cooldown_window(self) -> None:
+0043:         controller = self.FallbackController()
+0044:         state = self.fallback.FallbackState(
+0045:             current_step=self.FallbackStep.BATCH_REDUCTION,
+0046:             last_step_change_ms=0,
+0047:             step_change_history_ms=(0, 1000),
+0048:             stability_mode=False,
+0049:         )
+0050: 
+0051:         decision = controller.evaluate(state, 10_000)
+0052:         self.assertFalse(decision.should_advance)
+0053:         self.assertTrue(decision.enter_stability_mode)
+0054:         self.assertEqual(decision.next_step, self.FallbackStep.BATCH_REDUCTION)
+0055:         self.assertEqual(decision.reason_code, "FALLBACK_CHURN_TRIGGERED_STABILITY_MODE")
+0056: 
+0057:     def test_controller_respects_cooldown_before_advancing(self) -> None:
+0058:         controller = self.FallbackController()
+0059:         state = self.fallback.FallbackState(
+0060:             current_step=self.FallbackStep.BATCH_REDUCTION,
+0061:             last_step_change_ms=0,
+0062:             step_change_history_ms=(),
+0063:             stability_mode=False,
+0064:         )
+0065: 
+0066:         decision = controller.evaluate(state, 10_000)
+0067:         self.assertFalse(decision.should_advance)
+0068:         self.assertEqual(decision.reason_code, "FALLBACK_COOLDOWN_ACTIVE")
+0069: 
+0070: 
+0071: if __name__ == "__main__":
+0072:     unittest.main()

@@ -1,0 +1,319 @@
+﻿0001: """Run required AstraWeave v1 operations drills and emit evidence artifacts.
+0002: 
+0003: This script executes the three mandatory drills from docs/operations-readiness.md:
+0004: 1) auth abuse drill
+0005: 2) budget contraction and recovery drill
+0006: 3) rollback drill
+0007: """
+0008: 
+0009: from __future__ import annotations
+0010: 
+0011: import argparse
+0012: import json
+0013: import sys
+0014: from dataclasses import asdict, dataclass
+0015: from datetime import datetime, timezone
+0016: from pathlib import Path
+0017: from typing import Any
+0018: 
+0019: REPO_ROOT = Path(__file__).resolve().parent.parent
+0020: if str(REPO_ROOT) not in sys.path:
+0021:     sys.path.insert(0, str(REPO_ROOT))
+0022: 
+0023: from astrawave.errors import ApiError, ApiErrorCode
+0024: from astrawave.ipc_client import AstraWeaveIpcClient
+0025: from astrawave.security import CallerIdentity
+0026: from astrawave.service import DEFAULT_SERVICE_OWNER_SID, AstraWeaveService
+0027: from astrawave.service_host import AstraWeaveServiceHost, ServiceHostConfig
+0028: from astrawave.types import MemoryTier
+0029: 
+0030: 
+0031: def _utc_now_iso() -> str:
+0032:     return datetime.now(timezone.utc).isoformat()
+0033: 
+0034: 
+0035: @dataclass(frozen=True)
+0036: class DrillResult:
+0037:     drill_id: str
+0038:     title: str
+0039:     passed: bool
+0040:     expected: str
+0041:     observed: str
+0042:     owner: str
+0043:     started_at: str
+0044:     ended_at: str
+0045:     details: dict[str, Any]
+0046: 
+0047: 
+0048: def _run_auth_abuse_drill() -> DrillResult:
+0049:     started = _utc_now_iso()
+0050:     owner = CallerIdentity(user_sid=DEFAULT_SERVICE_OWNER_SID, pid=1101)
+0051:     foreign = CallerIdentity(user_sid="S-1-5-21-ops-foreign", pid=2201)
+0052:     service = AstraWeaveService()
+0053: 
+0054:     session_id = service.CreateSession(caller_identity=owner)
+0055:     service.LoadModel(session_id, "ops-drill-model", caller_identity=owner)
+0056: 
+0057:     passed = False
+0058:     observed = "Expected AW_ERR_AUTH_DENIED but no denial was raised"
+0059:     details: dict[str, Any] = {"session_id": session_id}
+0060:     try:
+0061:         service.GetPressure(session_id, caller_identity=foreign)
+0062:     except ApiError as exc:
+0063:         details["error_code"] = exc.code.value
+0064:         details["error_message"] = str(exc)
+0065:         if exc.code is ApiErrorCode.AUTH_DENIED:
+0066:             passed = True
+0067:             observed = "Foreign caller denied with AW_ERR_AUTH_DENIED as expected"
+0068:         else:
+0069:             observed = f"Unexpected denial code: {exc.code.value}"
+0070: 
+0071:     ended = _utc_now_iso()
+0072:     return DrillResult(
+0073:         drill_id="DRILL-AUTH-ABUSE",
+0074:         title="Unauthorized caller rejection",
+0075:         passed=passed,
+0076:         expected="Foreign caller is denied when attempting session access",
+0077:         observed=observed,
+0078:         owner="Security owner",
+0079:         started_at=started,
+0080:         ended_at=ended,
+0081:         details=details,
+0082:     )
+0083: 
+0084: 
+0085: def _run_budget_contraction_drill() -> DrillResult:
+0086:     started = _utc_now_iso()
+0087:     owner = CallerIdentity(user_sid=DEFAULT_SERVICE_OWNER_SID, pid=1102)
+0088:     service = AstraWeaveService()
+0089: 
+0090:     session_id = service.CreateSession(caller_identity=owner)
+0091:     service.LoadModel(session_id, "ops-drill-model", caller_identity=owner)
+0092:     service.RegisterTensor(
+0093:         session_id,
+0094:         "kv",
+0095:         64 * 1024 * 1024,
+0096:         caller_identity=owner,
+0097:     )
+0098:     service.SetTierHint(session_id, "kv", MemoryTier.HOT, caller_identity=owner)
+0099:     service.PrefetchPlan(session_id, caller_identity=owner)
+0100: 
+0101:     pressure_before = service.GetPressure(session_id, caller_identity=owner).pressure_level
+0102: 
+0103:     with service._lock:  # intentional internal mutation for synthetic budget drill
+0104:         session = service._sessions[session_id]
+0105:     with session.lock:
+0106:         original_budget = int(session.vram_budget_bytes)
+0107:         session.vram_budget_bytes = max(1, int(session.vram_used_bytes // 4))
+0108:         contracted_budget = int(session.vram_budget_bytes)
+0109: 
+0110:     pressure_contracted = service.GetPressure(session_id, caller_identity=owner).pressure_level
+0111:     run_result = service.RunStep(session_id, step_name="decode", caller_identity=owner)
+0112: 
+0113:     with session.lock:
+0114:         session.vram_budget_bytes = original_budget
+0115:     pressure_recovered = service.GetPressure(session_id, caller_identity=owner).pressure_level
+0116: 
+0117:     fallback_result = run_result.get("fallback_result")
+0118:     fallback_reason = (
+0119:         fallback_result.get("reason_code")
+0120:         if isinstance(fallback_result, dict)
+0121:         else None
+0122:     )
+0123:     correlation_id = run_result.get("correlation_id")
+0124: 
+0125:     passed = (
+0126:         pressure_contracted > pressure_before
+0127:         and pressure_contracted >= 0.75
+0128:         and pressure_recovered < pressure_contracted
+0129:         and isinstance(correlation_id, str)
+0130:         and bool(correlation_id)
+0131:         and isinstance(fallback_reason, str)
+0132:         and bool(fallback_reason)
+0133:     )
+0134: 
+0135:     if passed:
+0136:         observed = (
+0137:             "Budget contraction elevated pressure and triggered reason-coded fallback; "
+0138:             "pressure dropped after restoring budget"
+0139:         )
+0140:     else:
+0141:         observed = (
+0142:             "Budget drill did not satisfy expected pressure/fallback/correlation checks"
+0143:         )
+0144: 
+0145:     details = {
+0146:         "session_id": session_id,
+0147:         "pressure_before": pressure_before,
+0148:         "pressure_contracted": pressure_contracted,
+0149:         "pressure_recovered": pressure_recovered,
+0150:         "original_budget_bytes": original_budget,
+0151:         "contracted_budget_bytes": contracted_budget,
+0152:         "fallback_reason_code": fallback_reason,
+0153:         "correlation_id": correlation_id,
+0154:     }
+0155: 
+0156:     ended = _utc_now_iso()
+0157:     return DrillResult(
+0158:         drill_id="DRILL-BUDGET-CONTRACTION",
+0159:         title="Budget contraction and recovery",
+0160:         passed=passed,
+0161:         expected=(
+0162:             "Synthetic budget contraction raises pressure and emits reason-coded fallback; "
+0163:             "restored budget lowers pressure without hard failure"
+0164:         ),
+0165:         observed=observed,
+0166:         owner="Platform owner",
+0167:         started_at=started,
+0168:         ended_at=ended,
+0169:         details=details,
+0170:     )
+0171: 
+0172: 
+0173: def _format_tcp_endpoint(host_status_endpoint: Any) -> str:
+0174:     if isinstance(host_status_endpoint, tuple) and len(host_status_endpoint) >= 2:
+0175:         return f"tcp://{host_status_endpoint[0]}:{host_status_endpoint[1]}"
+0176:     raise RuntimeError(f"Unexpected host endpoint shape: {host_status_endpoint!r}")
+0177: 
+0178: 
+0179: def _run_rollback_drill() -> DrillResult:
+0180:     started = _utc_now_iso()
+0181:     owner = CallerIdentity(user_sid=DEFAULT_SERVICE_OWNER_SID, pid=1103)
+0182: 
+0183:     candidate_host = AstraWeaveServiceHost(
+0184:         config=ServiceHostConfig(endpoint="tcp://127.0.0.1:0")
+0185:     )
+0186:     previous_host = AstraWeaveServiceHost(
+0187:         config=ServiceHostConfig(endpoint="tcp://127.0.0.1:0")
+0188:     )
+0189: 
+0190:     candidate_status = candidate_host.start()
+0191:     candidate_endpoint = _format_tcp_endpoint(candidate_status.endpoint)
+0192:     with AstraWeaveIpcClient(endpoint=candidate_endpoint, default_caller=owner) as client:
+0193:         candidate_session = client.CreateSession()
+0194:         client.LoadModel(candidate_session, "ops-drill-model")
+0195:         client.CloseSession(candidate_session)
+0196:     stopped_candidate = candidate_host.stop()
+0197: 
+0198:     previous_status = previous_host.start()
+0199:     previous_endpoint = _format_tcp_endpoint(previous_status.endpoint)
+0200:     with AstraWeaveIpcClient(endpoint=previous_endpoint, default_caller=owner) as client:
+0201:         rollback_session = client.CreateSession()
+0202:         client.LoadModel(rollback_session, "ops-drill-model")
+0203:         client.CloseSession(rollback_session)
+0204:     stopped_previous = previous_host.stop()
+0205: 
+0206:     passed = (
+0207:         bool(candidate_endpoint)
+0208:         and bool(previous_endpoint)
+0209:         and stopped_candidate.running is False
+0210:         and stopped_previous.running is False
+0211:         and stopped_candidate.served_requests >= 1
+0212:         and stopped_previous.served_requests >= 1
+0213:     )
+0214: 
+0215:     observed = (
+0216:         "Candidate runtime served traffic, was stopped, and replacement runtime served traffic"
+0217:         if passed
+0218:         else "Rollback runtime drill did not complete expected start/stop/probe flow"
+0219:     )
+0220: 
+0221:     details = {
+0222:         "candidate_endpoint": candidate_endpoint,
+0223:         "candidate_served_requests": stopped_candidate.served_requests,
+0224:         "rollback_endpoint": previous_endpoint,
+0225:         "rollback_served_requests": stopped_previous.served_requests,
+0226:     }
+0227: 
+0228:     ended = _utc_now_iso()
+0229:     return DrillResult(
+0230:         drill_id="DRILL-ROLLBACK",
+0231:         title="Candidate-to-previous rollback validation",
+0232:         passed=passed,
+0233:         expected="Rollback path serves successful probe traffic after candidate shutdown",
+0234:         observed=observed,
+0235:         owner="Release owner",
+0236:         started_at=started,
+0237:         ended_at=ended,
+0238:         details=details,
+0239:     )
+0240: 
+0241: 
+0242: def _write_markdown_report(path: Path, report: dict[str, Any]) -> None:
+0243:     lines: list[str] = []
+0244:     lines.append("# Operations Drill Report")
+0245:     lines.append("")
+0246:     lines.append(f"- Run id: `{report['run_id']}`")
+0247:     lines.append(f"- Started: `{report['started_at']}`")
+0248:     lines.append(f"- Ended: `{report['ended_at']}`")
+0249:     lines.append(f"- Verdict: `{report['verdict']}`")
+0250:     lines.append("")
+0251:     lines.append("| Drill | Owner | Result | Expected | Observed |")
+0252:     lines.append("| --- | --- | --- | --- | --- |")
+0253:     for drill in report["drills"]:
+0254:         result = "pass" if drill["passed"] else "fail"
+0255:         lines.append(
+0256:             f"| `{drill['drill_id']}` | {drill['owner']} | `{result}` | {drill['expected']} | {drill['observed']} |"
+0257:         )
+0258:     lines.append("")
+0259:     lines.append("## Drill Details")
+0260:     lines.append("")
+0261:     for drill in report["drills"]:
+0262:         lines.append(f"### {drill['drill_id']} - {drill['title']}")
+0263:         lines.append("")
+0264:         lines.append(f"- Started: `{drill['started_at']}`")
+0265:         lines.append(f"- Ended: `{drill['ended_at']}`")
+0266:         lines.append("```json")
+0267:         lines.append(json.dumps(drill["details"], indent=2, sort_keys=True))
+0268:         lines.append("```")
+0269:         lines.append("")
+0270:     path.write_text("\n".join(lines), encoding="utf-8")
+0271: 
+0272: 
+0273: def run_operations_drills(run_id: str) -> dict[str, Any]:
+0274:     started = _utc_now_iso()
+0275:     drills = [
+0276:         _run_auth_abuse_drill(),
+0277:         _run_budget_contraction_drill(),
+0278:         _run_rollback_drill(),
+0279:     ]
+0280:     ended = _utc_now_iso()
+0281:     verdict = "pass" if all(d.passed for d in drills) else "fail"
+0282:     return {
+0283:         "run_id": run_id,
+0284:         "started_at": started,
+0285:         "ended_at": ended,
+0286:         "verdict": verdict,
+0287:         "drills": [asdict(item) for item in drills],
+0288:     }
+0289: 
+0290: 
+0291: def main() -> int:
+0292:     parser = argparse.ArgumentParser(description="Run v1 operations drills and write reports.")
+0293:     parser.add_argument(
+0294:         "--run-id",
+0295:         default=datetime.now().strftime("%Y-%m-%d"),
+0296:         help="Stable run id suffix for generated artifacts.",
+0297:     )
+0298:     parser.add_argument(
+0299:         "--out-dir",
+0300:         default="reports/release_gate",
+0301:         help="Directory for generated drill artifacts.",
+0302:     )
+0303:     args = parser.parse_args()
+0304: 
+0305:     out_dir = Path(args.out_dir)
+0306:     out_dir.mkdir(parents=True, exist_ok=True)
+0307: 
+0308:     report = run_operations_drills(run_id=args.run_id)
+0309:     json_path = out_dir / f"operations_drill_{args.run_id}.json"
+0310:     md_path = out_dir / f"operations_drill_{args.run_id}.md"
+0311:     json_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+0312:     _write_markdown_report(md_path, report)
+0313: 
+0314:     print(json.dumps({"ok": True, "json_report": str(json_path), "md_report": str(md_path), "verdict": report["verdict"]}))
+0315:     return 0 if report["verdict"] == "pass" else 1
+0316: 
+0317: 
+0318: if __name__ == "__main__":
+0319:     raise SystemExit(main())

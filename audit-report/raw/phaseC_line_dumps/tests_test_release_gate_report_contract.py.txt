@@ -1,0 +1,318 @@
+﻿0001: """Contract tests for release-gate readiness split reporting."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import io
+0006: import json
+0007: import shutil
+0008: import unittest
+0009: from contextlib import contextmanager, redirect_stdout
+0010: from pathlib import Path
+0011: from unittest.mock import patch
+0012: from uuid import uuid4
+0013: 
+0014: import scripts.generate_release_gate_report as release_gate
+0015: 
+0016: 
+0017: def _write(path: Path, content: str) -> None:
+0018:     path.parent.mkdir(parents=True, exist_ok=True)
+0019:     path.write_text(content, encoding="utf-8")
+0020: 
+0021: 
+0022: def _write_json(path: Path, payload: dict[str, object]) -> None:
+0023:     _write(path, json.dumps(payload, sort_keys=True))
+0024: 
+0025: 
+0026: class ReleaseGateReportContractTests(unittest.TestCase):
+0027:     @contextmanager
+0028:     def _workspace_tmpdir(self):
+0029:         base = Path("test_runtime")
+0030:         base.mkdir(parents=True, exist_ok=True)
+0031:         path = (base / f"release_gate_{uuid4().hex}").resolve()
+0032:         path.mkdir(parents=True, exist_ok=False)
+0033:         try:
+0034:             yield path
+0035:         finally:
+0036:             shutil.rmtree(path, ignore_errors=True)
+0037: 
+0038:     @contextmanager
+0039:     def _patched_repo_root(self, root: Path):
+0040:         with patch.object(release_gate, "REPO_ROOT", root):
+0041:             yield
+0042: 
+0043:     def _all_test_ids(self) -> set[str]:
+0044:         ids: set[str] = set()
+0045:         ids.update(release_gate.SECURITY_GATE_TESTS)
+0046:         ids.update(release_gate.STABILITY_TESTS)
+0047:         ids.update(release_gate.EXPLAINABILITY_TESTS)
+0048:         ids.update(release_gate.API_CONFORMANCE_TESTS)
+0049:         for tests in release_gate.DECISION_LOG_TESTS.values():
+0050:             ids.update(tests)
+0051:         ids.update(
+0052:             {
+0053:                 "test_integrated_service_contract.IntegratedServiceContractTests.test_session_ownership_isolation_denies_cross_user_access",
+0054:                 "test_phase3_runtime_smoke.Phase3RuntimeSmokeTests.test_remote_call_smoke_path_denies_foreign_caller",
+0055:                 "test_ipc_protocol.IpcProtocolContractTests.test_request_envelope_validation_rejects_malformed_input",
+0056:                 "test_ipc_protocol.IpcProtocolContractTests.test_request_envelope_rejects_payloads_over_max_size",
+0057:                 "test_ipc_server.IpcServerContractTests.test_server_rejects_oversized_request_payload",
+0058:                 "test_telemetry_contract.TelemetryContractTests.test_local_only_is_default_and_export_is_disabled",
+0059:                 "test_telemetry_contract.TelemetryContractTests.test_export_requires_explicit_opt_in",
+0060:             }
+0061:         )
+0062:         return ids
+0063: 
+0064:     def _make_unittest_log(self, root: Path, run_id: str, test_ids: set[str]) -> Path:
+0065:         lines = [
+0066:             f"test_case_{index:03d} ({test_id}) ... ok"
+0067:             for index, test_id in enumerate(sorted(test_ids), start=1)
+0068:         ]
+0069:         lines.append("")
+0070:         lines.append(f"Ran {len(test_ids)} tests in 0.123s")
+0071:         lines.append("")
+0072:         lines.append("OK")
+0073:         path = root / "reports" / "runlogs" / f"unittest_rc_{run_id}.txt"
+0074:         _write(path, "\n".join(lines))
+0075:         return path
+0076: 
+0077:     def _make_inputs(self, root: Path, *, run_id: str, include_hardware_gate: bool = True) -> dict[str, Path]:
+0078:         test_ids = self._all_test_ids()
+0079:         unittest_log = self._make_unittest_log(root, run_id, test_ids)
+0080:         runlog_dir = root / "reports" / "runlogs"
+0081:         gate_dir = root / "reports" / "release_gate"
+0082:         artifact_dir = root / "reports" / "release_artifacts"
+0083:         artifact_file = artifact_dir / "placeholder.json"
+0084:         compliance_manifest = artifact_dir / f"compliance_manifest_{run_id}.json"
+0085:         w7 = runlog_dir / f"summary_rc_w7b_chat_{run_id}.json"
+0086:         w13 = runlog_dir / f"summary_rc_w13b_chat_{run_id}.json"
+0087:         operations = gate_dir / f"operations_drill_{run_id}.json"
+0088:         hardware_gate = gate_dir / f"hardware_gate_{run_id}.json"
+0089: 
+0090:         _write_json(w7, {"iterations": 100, "failure_count": 0, "run_step_p95_ms": 181.0})
+0091:         _write_json(w13, {"iterations": 100, "failure_count": 0, "run_step_p95_ms": 183.0})
+0092:         _write_json(
+0093:             operations,
+0094:             {
+0095:                 "verdict": "pass",
+0096:                 "drills": [
+0097:                     {"drill_id": "DRILL-AUTH-ABUSE", "passed": True},
+0098:                     {"drill_id": "DRILL-BUDGET-CONTRACTION", "passed": True},
+0099:                     {"drill_id": "DRILL-ROLLBACK", "passed": True},
+0100:                 ],
+0101:             },
+0102:         )
+0103:         _write_json(artifact_file, {"ok": True})
+0104:         _write_json(
+0105:             compliance_manifest,
+0106:             {"artifacts": {"placeholder": str(artifact_file)}},
+0107:         )
+0108:         if include_hardware_gate:
+0109:             _write_json(
+0110:                 hardware_gate,
+0111:                 {
+0112:                     "gate_checks": {
+0113:                         "service_hardware_mode_active": {"passed": True},
+0114:                         "service_hardware_transfer_ok": {"passed": True},
+0115:                         "service_triggered_nvml_delta_observed": {"passed": True},
+0116:                     }
+0117:                 },
+0118:             )
+0119: 
+0120:         return {
+0121:             "unittest_log": unittest_log,
+0122:             "w7": w7,
+0123:             "w13": w13,
+0124:             "operations": operations,
+0125:             "compliance_manifest": compliance_manifest,
+0126:             "hardware_gate": hardware_gate,
+0127:         }
+0128: 
+0129:     def _make_repo_docs(self, root: Path, *, include_d005: bool = True, include_validation_phrase: bool = True) -> None:
+0130:         decision_rows = [
+0131:             "| D-001 | Runtime vs framework policy boundary | AstraWeave owns cross-tier placement, residency, migration, fallback, and observability. | Core Runtime Lead | 2026-03-24 |",
+0132:             "| D-002 | Tunability level | Stability profile is default with safe knobs only. Throughput profile is opt-in and cannot disable safety rails. | Product + Runtime | 2026-03-24 |",
+0133:             "| D-003 | Minimum hardware bar | v1 acceptance target is Windows 11 + 8 GB dGPU + >= 32 GB RAM; design-optimized target remains 128 GB RAM host. | Product | 2026-03-24 |",
+0134:             "| D-004 | Telemetry surface default | Local-only telemetry is default. Export and diagnostic bundle creation require explicit operator action. | Security + Product | 2026-03-24 |",
+0135:         ]
+0136:         if include_d005:
+0137:             decision_rows.append(
+0138:                 "| D-005 | Hardware strategy contradiction | dGPU reliability-first is primary release path. CacheCoherentUMA is secondary fast path with separate acceptance gates. | Architecture Council | 2026-03-24 |"
+0139:             )
+0140:         _write(
+0141:             root / "plan.md",
+0142:             "\n".join(
+0143:                 [
+0144:                     "# AstraWeave v1 Execution Plan",
+0145:                     "",
+0146:                     "| ID | Decision | Outcome | Owner | Date |",
+0147:                     "| --- | --- | --- | --- | --- |",
+0148:                     *decision_rows,
+0149:                 ]
+0150:             ),
+0151:         )
+0152:         validation_line = (
+0153:             "- [x] P1-06 Implementation behavior matches closed decision log."
+0154:             if include_validation_phrase
+0155:             else "- [x] P1-06 Placeholder"
+0156:         )
+0157:         _write(
+0158:             root / "problems.md",
+0159:             "\n".join(
+0160:                 [
+0161:                     "# Problems",
+0162:                     "",
+0163:                     "Decision status:",
+0164:                     "",
+0165:                     "- Gate evidence required: implementation docs and behavior align with decisions D-001 through D-005.",
+0166:                     validation_line,
+0167:                     "",
+0168:                     "## Release Readiness Checklist",
+0169:                     "",
+0170:                     "- [x] P0-01 Security controls validated by auth/isolation/abuse test results.",
+0171:                     "- [x] P1-06 Implementation behavior matches closed decision log.",
+0172:                 ]
+0173:             ),
+0174:         )
+0175: 
+0176:     def test_generate_reports_marks_hardware_ready_when_full_evidence_passes(self) -> None:
+0177:         with self._workspace_tmpdir() as root:
+0178:             self._make_repo_docs(root)
+0179:             inputs = self._make_inputs(root, run_id="test", include_hardware_gate=True)
+0180:             out_dir = root / "reports" / "release_gate"
+0181:             with self._patched_repo_root(root):
+0182:                 result = release_gate.generate_reports(
+0183:                     run_id="test",
+0184:                     out_dir=out_dir,
+0185:                     unittest_log=inputs["unittest_log"],
+0186:                     w7_summary=inputs["w7"],
+0187:                     w13_summary=inputs["w13"],
+0188:                     operations_report=inputs["operations"],
+0189:                     compliance_manifest=inputs["compliance_manifest"],
+0190:                     hardware_gate_report=inputs["hardware_gate"],
+0191:                 )
+0192:             self.assertEqual(result["verdict"], "hardware_ready")
+0193:             self.assertTrue(result["simulation_ready"])
+0194:             self.assertTrue(result["hardware_ready"])
+0195: 
+0196:     def test_generate_reports_requires_security_drill_and_contract_coverage(self) -> None:
+0197:         with self._workspace_tmpdir() as root:
+0198:             self._make_repo_docs(root)
+0199:             inputs = self._make_inputs(root, run_id="test", include_hardware_gate=True)
+0200:             log_text = inputs["unittest_log"].read_text(encoding="utf-8")
+0201:             missing_test = release_gate.SECURITY_GATE_TESTS[0]
+0202:             filtered = "\n".join(
+0203:                 line for line in log_text.splitlines() if missing_test not in line
+0204:             )
+0205:             inputs["unittest_log"].write_text(filtered, encoding="utf-8")
+0206:             with self._patched_repo_root(root):
+0207:                 result = release_gate.generate_reports(
+0208:                     run_id="test",
+0209:                     out_dir=root / "reports" / "release_gate",
+0210:                     unittest_log=inputs["unittest_log"],
+0211:                     w7_summary=inputs["w7"],
+0212:                     w13_summary=inputs["w13"],
+0213:                     operations_report=inputs["operations"],
+0214:                     compliance_manifest=inputs["compliance_manifest"],
+0215:                     hardware_gate_report=inputs["hardware_gate"],
+0216:                 )
+0217:             self.assertFalse(result["simulation_ready"])
+0218:             readiness = json.loads(
+0219:                 (root / "reports" / "release_gate" / "release_gate_readiness_test.json").read_text(encoding="utf-8")
+0220:             )
+0221:             self.assertFalse(readiness["gates"]["P0-01"]["passed"])
+0222:             self.assertIn(missing_test, readiness["gates"]["P0-01"]["missing_or_failed"])
+0223: 
+0224:     def test_generate_reports_requires_decision_alignment_coverage(self) -> None:
+0225:         with self._workspace_tmpdir() as root:
+0226:             self._make_repo_docs(root, include_d005=False)
+0227:             inputs = self._make_inputs(root, run_id="test", include_hardware_gate=True)
+0228:             with self._patched_repo_root(root):
+0229:                 result = release_gate.generate_reports(
+0230:                     run_id="test",
+0231:                     out_dir=root / "reports" / "release_gate",
+0232:                     unittest_log=inputs["unittest_log"],
+0233:                     w7_summary=inputs["w7"],
+0234:                     w13_summary=inputs["w13"],
+0235:                     operations_report=inputs["operations"],
+0236:                     compliance_manifest=inputs["compliance_manifest"],
+0237:                     hardware_gate_report=inputs["hardware_gate"],
+0238:                 )
+0239:             self.assertFalse(result["simulation_ready"])
+0240:             readiness = json.loads(
+0241:                 (root / "reports" / "release_gate" / "release_gate_readiness_test.json").read_text(encoding="utf-8")
+0242:             )
+0243:             self.assertFalse(readiness["gates"]["P1-06"]["passed"])
+0244:             self.assertIn("D-005", readiness["gates"]["P1-06"]["missing_or_failed"])
+0245: 
+0246:     def test_main_requires_hardware_verdict_by_default(self) -> None:
+0247:         with self._workspace_tmpdir() as root:
+0248:             self._make_repo_docs(root)
+0249:             self._make_inputs(root, run_id="strict", include_hardware_gate=True)
+0250:             stdout = io.StringIO()
+0251:             with self._patched_repo_root(root), redirect_stdout(stdout):
+0252:                 exit_code = release_gate.main(
+0253:                     [
+0254:                         "--artifacts-root",
+0255:                         str(root),
+0256:                         "--run-id",
+0257:                         "strict",
+0258:                         "--out-dir",
+0259:                         "reports/release_gate",
+0260:                     ]
+0261:                 )
+0262:             self.assertEqual(exit_code, 0)
+0263:             self.assertIn('"verdict": "hardware_ready"', stdout.getvalue())
+0264: 
+0265:     def test_main_allows_simulation_only_success_when_explicitly_enabled(self) -> None:
+0266:         with self._workspace_tmpdir() as root:
+0267:             self._make_repo_docs(root)
+0268:             self._make_inputs(root, run_id="sim", include_hardware_gate=False)
+0269:             stdout = io.StringIO()
+0270:             with self._patched_repo_root(root), redirect_stdout(stdout):
+0271:                 exit_code = release_gate.main(
+0272:                     [
+0273:                         "--artifacts-root",
+0274:                         str(root),
+0275:                         "--run-id",
+0276:                         "sim",
+0277:                         "--out-dir",
+0278:                         "reports/release_gate",
+0279:                         "--allow-simulation-only-success",
+0280:                     ]
+0281:                 )
+0282:             self.assertEqual(exit_code, 0)
+0283:             self.assertIn('"verdict": "simulation_ready"', stdout.getvalue())
+0284: 
+0285:     def test_main_does_not_fall_back_to_legacy_dated_artifacts(self) -> None:
+0286:         with self._workspace_tmpdir() as root:
+0287:             self._make_repo_docs(root)
+0288:             self._make_inputs(root, run_id="2099-01-01", include_hardware_gate=False)
+0289:             legacy_gate = root / "reports" / "release_gate" / "hardware_gate_2026-03-24.json"
+0290:             _write_json(
+0291:                 legacy_gate,
+0292:                 {
+0293:                     "gate_checks": {
+0294:                         "service_hardware_mode_active": {"passed": True},
+0295:                         "service_hardware_transfer_ok": {"passed": True},
+0296:                         "service_triggered_nvml_delta_observed": {"passed": True},
+0297:                     }
+0298:                 },
+0299:             )
+0300:             stdout = io.StringIO()
+0301:             with self._patched_repo_root(root), redirect_stdout(stdout):
+0302:                 exit_code = release_gate.main(
+0303:                     [
+0304:                         "--artifacts-root",
+0305:                         str(root),
+0306:                         "--run-id",
+0307:                         "2099-01-01",
+0308:                         "--out-dir",
+0309:                         "reports/release_gate",
+0310:                     ]
+0311:                 )
+0312:             self.assertEqual(exit_code, 1)
+0313:             self.assertIn('"verdict": "simulation_ready"', stdout.getvalue())
+0314:             self.assertNotIn('"verdict": "hardware_ready"', stdout.getvalue())
+0315: 
+0316: 
+0317: if __name__ == "__main__":
+0318:     unittest.main()

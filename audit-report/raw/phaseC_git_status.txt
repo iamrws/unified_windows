@@ -1,0 +1,14 @@
+﻿git : fatal: detected dubious ownership in repository at 'C:/Users/grzeg/Documents/Jito/testmarch24/unified_windows'
+At line:2 char:48
++ ... it-report/raw/phaseC_git_status.txt'; git status --short 2>&1 | Out-F ...
++                                           ~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (fatal: detected...nified_windows':String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+'C:/Users/grzeg/Documents/Jito/testmarch24/unified_windows' is owned by:
+	'S-1-5-21-2355809060-3684030834-485744656-1001'
+but the current user is:
+	'S-1-5-21-2355809060-3684030834-485744656-1006'
+To add an exception for this directory, call:
+
+	git config --global --add safe.directory C:/Users/grzeg/Documents/Jito/testmarch24/unified_windows

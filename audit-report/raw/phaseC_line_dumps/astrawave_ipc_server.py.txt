@@ -1,0 +1,714 @@
+﻿0001: """Local IPC server adapter for AstraWeave.
+0002: 
+0003: This module intentionally uses `astrawave.ipc_protocol` as the canonical wire
+0004: contract. Compatibility wrappers remain for older imports, but request/response
+0005: validation and envelope semantics are centralized in the shared protocol layer.
+0006: """
+0007: 
+0008: from __future__ import annotations
+0009: 
+0010: from dataclasses import dataclass, field
+0011: from inspect import Parameter, signature
+0012: from ipaddress import ip_address
+0013: from multiprocessing.connection import Listener
+0014: import os
+0015: from threading import Event, RLock, Thread
+0016: from typing import Any, Callable, Mapping
+0017: 
+0018: from .errors import ApiError, ApiErrorCode
+0019: from .ipc_protocol import (
+0020:     CallerEnvelope,
+0021:     ErrorPayload,
+0022:     ErrorResponse,
+0023:     MAX_CONTROL_PLANE_PAYLOAD_BYTES,
+0024:     RequestEnvelope,
+0025:     SuccessResponse,
+0026:     estimate_json_size_bytes,
+0027:     error_response,
+0028:     success_response,
+0029:     to_json_value,
+0030:     validate_request_payload,
+0031: )
+0032: from .security import CallerIdentity, SecurityDecision, attest_caller_identity
+0033: from .service import AstraWeaveService
+0034: from .telemetry import SecurityEvent, TelemetryReasonCode
+0035: from .types import MemoryTier, PolicyProfile
+0036: 
+0037: __all__ = [
+0038:     "IpcRequestEnvelope",
+0039:     "IpcResponseEnvelope",
+0040:     "IpcSuccessEnvelope",
+0041:     "IpcErrorEnvelope",
+0042:     "IpcProtocolError",
+0043:     "AstraWeaveIpcServer",
+0044:     "serialize_value",
+0045:     "deserialize_request",
+0046:     "serialize_request",
+0047:     "serialize_response",
+0048: ]
+0049: 
+0050: 
+0051: class IpcProtocolError(ApiError):
+0052:     """Raised for wire-format validation problems."""
+0053: 
+0054: 
+0055: @dataclass(frozen=True, slots=True)
+0056: class IpcRequestEnvelope:
+0057:     """Compatibility request envelope wrapper for older callers."""
+0058: 
+0059:     id: str
+0060:     method: str
+0061:     params: Mapping[str, Any] = field(default_factory=dict)
+0062:     caller: CallerIdentity | None = None
+0063: 
+0064:     def __post_init__(self) -> None:
+0065:         if not isinstance(self.params, Mapping):
+0066:             raise IpcProtocolError(ApiErrorCode.INVALID_ARGUMENT, "params must be a mapping")
+0067:         _to_protocol_request(self.id, self.method, self.params, self.caller)
+0068: 
+0069:     @classmethod
+0070:     def from_mapping(cls, payload: Mapping[str, Any]) -> "IpcRequestEnvelope":
+0071:         protocol_request = validate_request_payload(payload)
+0072:         if not isinstance(protocol_request.params, Mapping):
+0073:             raise IpcProtocolError(ApiErrorCode.INVALID_ARGUMENT, "params must be a mapping")
+0074:         return cls(
+0075:             id=protocol_request.id,
+0076:             method=protocol_request.method,
+0077:             params=dict(protocol_request.params),
+0078:             caller=_caller_identity_from_envelope(protocol_request.caller),
+0079:         )
+0080: 
+0081:     def to_protocol(self) -> RequestEnvelope:
+0082:         return _to_protocol_request(self.id, self.method, self.params, self.caller)
+0083: 
+0084:     def to_dict(self) -> dict[str, Any]:
+0085:         return self.to_protocol().to_dict()
+0086: 
+0087: 
+0088: @dataclass(frozen=True, slots=True)
+0089: class IpcErrorEnvelope:
+0090:     """Compatibility error envelope wrapper."""
+0091: 
+0092:     code: str
+0093:     message: str
+0094: 
+0095:     def to_dict(self) -> dict[str, str]:
+0096:         return ErrorPayload(code=self.code, message=self.message).to_dict()
+0097: 
+0098: 
+0099: @dataclass(frozen=True, slots=True)
+0100: class IpcSuccessEnvelope:
+0101:     """Compatibility success envelope wrapper."""
+0102: 
+0103:     id: str
+0104:     result: Any = None
+0105: 
+0106:     def to_dict(self) -> dict[str, Any]:
+0107:         return success_response(self.result, id=self.id).to_dict()
+0108: 
+0109: 
+0110: @dataclass(frozen=True, slots=True)
+0111: class IpcResponseEnvelope:
+0112:     """Compatibility union-like response envelope helper."""
+0113: 
+0114:     id: str
+0115:     ok: bool
+0116:     result: Any = None
+0117:     error: IpcErrorEnvelope | None = None
+0118: 
+0119:     def to_dict(self) -> dict[str, Any]:
+0120:         if self.ok:
+0121:             return success_response(self.result, id=self.id).to_dict()
+0122:         if self.error is None:
+0123:             err = ApiError(ApiErrorCode.INTERNAL, "internal server error")
+0124:             return error_response(err, id=self.id).to_dict()
+0125:         try:
+0126:             code = ApiErrorCode(self.error.code)
+0127:         except ValueError as exc:
+0128:             raise IpcProtocolError(ApiErrorCode.INVALID_ARGUMENT, "error code is not a known ApiErrorCode") from exc
+0129:         err = ApiError(code, self.error.message)
+0130:         return error_response(err, id=self.id).to_dict()
+0131: 
+0132: 
+0133: def parse_caller(payload: Any) -> CallerIdentity:
+0134:     """Parse a caller payload into a :class:`CallerIdentity`."""
+0135: 
+0136:     if isinstance(payload, CallerIdentity):
+0137:         return payload
+0138:     if isinstance(payload, CallerEnvelope):
+0139:         return CallerIdentity(user_sid=payload.user_sid, pid=payload.pid)
+0140:     if not isinstance(payload, Mapping):
+0141:         raise IpcProtocolError(ApiErrorCode.INVALID_ARGUMENT, "caller must be a mapping")
+0142:     try:
+0143:         parsed = CallerEnvelope.from_dict(payload)
+0144:     except ApiError as exc:
+0145:         raise IpcProtocolError(exc.code, exc.message) from exc
+0146:     return CallerIdentity(user_sid=parsed.user_sid, pid=parsed.pid)
+0147: 
+0148: 
+0149: def serialize_value(value: Any) -> Any:
+0150:     """Convert a Python object into a JSON-serializable representation."""
+0151: 
+0152:     return to_json_value(value)
+0153: 
+0154: 
+0155: def serialize_request(request: IpcRequestEnvelope | RequestEnvelope) -> dict[str, Any]:
+0156:     """Serialize a request envelope to a plain mapping."""
+0157: 
+0158:     if isinstance(request, IpcRequestEnvelope):
+0159:         return request.to_dict()
+0160:     if isinstance(request, RequestEnvelope):
+0161:         return request.to_dict()
+0162:     raise IpcProtocolError(ApiErrorCode.INVALID_ARGUMENT, "request must be an IpcRequestEnvelope or RequestEnvelope")
+0163: 
+0164: 
+0165: def deserialize_request(payload: Mapping[str, Any]) -> IpcRequestEnvelope:
+0166:     """Deserialize and validate a request envelope."""
+0167: 
+0168:     return IpcRequestEnvelope.from_mapping(payload)
+0169: 
+0170: 
+0171: def serialize_response(
+0172:     response: IpcResponseEnvelope | IpcSuccessEnvelope | SuccessResponse | ErrorResponse,
+0173: ) -> dict[str, Any]:
+0174:     """Serialize a response envelope to a plain mapping."""
+0175: 
+0176:     if isinstance(response, (IpcResponseEnvelope, IpcSuccessEnvelope, SuccessResponse, ErrorResponse)):
+0177:         return response.to_dict()
+0178:     raise IpcProtocolError(ApiErrorCode.INVALID_ARGUMENT, "unsupported response envelope type")
+0179: 
+0180: 
+0181: def _error_from_exception(exc: BaseException) -> ApiError:
+0182:     if isinstance(exc, ApiError):
+0183:         return exc
+0184:     return ApiError(ApiErrorCode.INTERNAL, "internal server error")
+0185: 
+0186: 
+0187: def _caller_identity_from_envelope(caller: CallerEnvelope | None) -> CallerIdentity | None:
+0188:     if caller is None:
+0189:         return None
+0190:     return CallerIdentity(user_sid=caller.user_sid, pid=caller.pid)
+0191: 
+0192: 
+0193: def _to_protocol_request(
+0194:     request_id: str,
+0195:     method: str,
+0196:     params: Mapping[str, Any],
+0197:     caller: CallerIdentity | None,
+0198: ) -> RequestEnvelope:
+0199:     caller_envelope = None
+0200:     if caller is not None:
+0201:         caller_envelope = CallerEnvelope(user_sid=caller.user_sid, pid=caller.pid)
+0202:     try:
+0203:         return RequestEnvelope(
+0204:             id=request_id,
+0205:             method=method,
+0206:             params=dict(params),
+0207:             caller=caller_envelope,
+0208:         )
+0209:     except ApiError as exc:
+0210:         raise IpcProtocolError(exc.code, exc.message) from exc
+0211: 
+0212: 
+0213: def _authkey_from_env() -> bytes | None:
+0214:     value = os.environ.get("ASTRAWEAVE_IPC_AUTHKEY", "").strip()
+0215:     if not value:
+0216:         return None
+0217:     return value.encode("utf-8")
+0218: 
+0219: 
+0220: def _is_loopback_host(host: str) -> bool:
+0221:     normalized = host.strip().lower()
+0222:     if normalized == "localhost":
+0223:         return True
+0224:     try:
+0225:         return ip_address(normalized).is_loopback
+0226:     except ValueError:
+0227:         return False
+0228: 
+0229: 
+0230: class AstraWeaveIpcServer:
+0231:     """Local IPC server that dispatches requests onto :class:`AstraWeaveService`."""
+0232: 
+0233:     def __init__(
+0234:         self,
+0235:         service: AstraWeaveService | None = None,
+0236:         *,
+0237:         prefer_named_pipe: bool = True,
+0238:         pipe_name: str | None = None,
+0239:         host: str = "127.0.0.1",
+0240:         port: int = 0,
+0241:         authkey: bytes | None = None,
+0242:         require_explicit_caller: bool = True,
+0243:         bind_caller_per_connection: bool = True,
+0244:         enforce_runtime_caller_attestation: bool = True,
+0245:         caller_attestor: Callable[[CallerIdentity], SecurityDecision] | None = None,
+0246:     ) -> None:
+0247:         self._service = service or AstraWeaveService()
+0248:         self._prefer_named_pipe = prefer_named_pipe
+0249:         self._pipe_name = pipe_name or r"\\.\pipe\astrawave"
+0250:         self._host = host
+0251:         self._port = port
+0252:         self._authkey = authkey if authkey is not None else _authkey_from_env()
+0253:         self._require_explicit_caller = require_explicit_caller
+0254:         self._bind_caller_per_connection = bind_caller_per_connection
+0255:         self._enforce_runtime_caller_attestation = enforce_runtime_caller_attestation
+0256:         self._caller_attestor = caller_attestor or attest_caller_identity
+0257:         self._listener: Listener | None = None
+0258:         self._transport: str | None = None
+0259:         self._endpoint: Any = None
+0260:         self._stop_event = Event()
+0261:         self._lock = RLock()
+0262:         self._thread: Thread | None = None
+0263:         self._served_connections = 0
+0264:         self._served_requests = 0
+0265: 
+0266:     @property
+0267:     def service(self) -> AstraWeaveService:
+0268:         """Expose the wrapped service for tests and diagnostics."""
+0269: 
+0270:         return self._service
+0271: 
+0272:     @property
+0273:     def transport(self) -> str | None:
+0274:         """Return the active transport name if the server is started."""
+0275: 
+0276:         return self._transport
+0277: 
+0278:     @property
+0279:     def endpoint(self) -> Any:
+0280:         """Return the listener endpoint after startup."""
+0281: 
+0282:         return self._endpoint
+0283: 
+0284:     @property
+0285:     def authkey(self) -> bytes | None:
+0286:         """Return the configured listener authkey."""
+0287: 
+0288:         return self._authkey
+0289: 
+0290:     @property
+0291:     def is_running(self) -> bool:
+0292:         """Return whether the server loop is active."""
+0293: 
+0294:         return self._thread is not None and self._thread.is_alive()
+0295: 
+0296:     def __enter__(self) -> "AstraWeaveIpcServer":
+0297:         self.start()
+0298:         return self
+0299: 
+0300:     def __exit__(self, exc_type, exc, tb) -> None:
+0301:         self.stop()
+0302: 
+0303:     def start(self) -> "AstraWeaveIpcServer":
+0304:         """Start the IPC server on a background thread."""
+0305: 
+0306:         with self._lock:
+0307:             if self.is_running:
+0308:                 return self
+0309:             self._stop_event.clear()
+0310:             self._ensure_listener()
+0311:             self._thread = Thread(target=self.serve_forever, name="AstraWeaveIpcServer", daemon=True)
+0312:             self._thread.start()
+0313:         return self
+0314: 
+0315:     def stop(self) -> None:
+0316:         """Stop the server and close the listener."""
+0317: 
+0318:         with self._lock:
+0319:             self._stop_event.set()
+0320:             if self._listener is not None:
+0321:                 try:
+0322:                     self._listener.close()
+0323:                 finally:
+0324:                     self._listener = None
+0325: 
+0326:             thread = self._thread
+0327:             self._thread = None
+0328: 
+0329:         if thread is not None and thread.is_alive():
+0330:             thread.join(timeout=2.0)
+0331: 
+0332:     def serve_once(self) -> int:
+0333:         """Accept and handle exactly one connection."""
+0334: 
+0335:         if self._stop_event.is_set():
+0336:             return 0
+0337: 
+0338:         listener = self._ensure_listener()
+0339:         try:
+0340:             connection = listener.accept()
+0341:         except (OSError, EOFError):
+0342:             if self._stop_event.is_set():
+0343:                 return 0
+0344:             raise
+0345: 
+0346:         self._served_connections += 1
+0347:         try:
+0348:             return self._serve_connection(connection)
+0349:         finally:
+0350:             connection.close()
+0351: 
+0352:     def serve_forever(self) -> int:
+0353:         """Accept connections until :meth:`stop` is called."""
+0354: 
+0355:         processed = 0
+0356:         while not self._stop_event.is_set():
+0357:             try:
+0358:                 processed += self.serve_once()
+0359:             except (OSError, EOFError):
+0360:                 if self._stop_event.is_set():
+0361:                     break
+0362:                 raise
+0363:         return processed
+0364: 
+0365:     def handle_request(
+0366:         self,
+0367:         request: IpcRequestEnvelope | RequestEnvelope | Mapping[str, Any],
+0368:         *,
+0369:         expected_caller: CallerIdentity | None = None,
+0370:     ) -> dict[str, Any]:
+0371:         """Dispatch one request envelope and return a response mapping."""
+0372: 
+0373:         response_payload, _resolved_caller = self._process_request(request, expected_caller=expected_caller)
+0374:         return response_payload
+0375: 
+0376:     def _ensure_listener(self) -> Listener:
+0377:         with self._lock:
+0378:             if self._listener is not None:
+0379:                 return self._listener
+0380: 
+0381:             listener, transport, endpoint = self._create_listener()
+0382:             self._listener = listener
+0383:             self._transport = transport
+0384:             self._endpoint = endpoint
+0385:             return listener
+0386: 
+0387:     def _create_listener(self) -> tuple[Listener, str, Any]:
+0388:         if self._prefer_named_pipe and os.name == "nt":
+0389:             try:
+0390:                 listener = Listener(self._pipe_name, family="AF_PIPE", authkey=self._authkey)
+0391:                 endpoint = self._pipe_name
+0392:                 return listener, "named_pipe", endpoint
+0393:             except Exception:
+0394:                 pass
+0395: 
+0396:         if not _is_loopback_host(self._host):
+0397:             raise ApiError(
+0398:                 ApiErrorCode.INVALID_ARGUMENT,
+0399:                 "IPC server host must be localhost or loopback in v1",
+0400:             )
+0401:         listener = Listener((self._host, self._port), family="AF_INET", authkey=self._authkey)
+0402:         endpoint = getattr(listener, "address", None) or getattr(listener, "_address", None)
+0403:         return listener, "localhost", endpoint
+0404: 
+0405:     def _serve_connection(self, connection) -> int:
+0406:         processed = 0
+0407:         bound_caller: CallerIdentity | None = None
+0408: 
+0409:         while not self._stop_event.is_set():
+0410:             try:
+0411:                 payload = connection.recv()
+0412:             except EOFError:
+0413:                 break
+0414: 
+0415:             expected = bound_caller if self._bind_caller_per_connection else None
+0416:             response, resolved_caller = self._process_request(payload, expected_caller=expected)
+0417:             if bound_caller is None and resolved_caller is not None and self._bind_caller_per_connection:
+0418:                 bound_caller = resolved_caller
+0419: 
+0420:             try:
+0421:                 connection.send(response)
+0422:             except (BrokenPipeError, OSError):
+0423:                 break
+0424:             processed += 1
+0425:             self._served_requests += 1
+0426:         return processed
+0427: 
+0428:     def _process_request(
+0429:         self,
+0430:         request: IpcRequestEnvelope | RequestEnvelope | Mapping[str, Any],
+0431:         *,
+0432:         expected_caller: CallerIdentity | None,
+0433:     ) -> tuple[dict[str, Any], CallerIdentity | None]:
+0434:         request_id = self._extract_request_id(request)
+0435:         try:
+0436:             envelope = self._coerce_request(request)
+0437:             request_id = envelope.id
+0438:             caller = self._resolve_and_authorize_caller(envelope, expected_caller=expected_caller)
+0439:             result = self._dispatch(envelope, caller)
+0440:             return success_response(result, id=envelope.id).to_dict(), caller
+0441:         except BaseException as exc:
+0442:             err = _error_from_exception(exc)
+0443:             self._record_security_deny(error=err, request=request)
+0444:             return error_response(err, id=request_id or "invalid-request").to_dict(), None
+0445: 
+0446:     @staticmethod
+0447:     def _extract_request_id(request: IpcRequestEnvelope | RequestEnvelope | Mapping[str, Any]) -> str:
+0448:         request_id = getattr(request, "id", "")
+0449:         if isinstance(request_id, str) and request_id.strip():
+0450:             return request_id
+0451:         if isinstance(request, Mapping):
+0452:             raw = request.get("id", "")
+0453:             if isinstance(raw, str):
+0454:                 return raw
+0455:             return str(raw) if raw is not None else ""
+0456:         return ""
+0457: 
+0458:     @staticmethod
+0459:     def _coerce_request(
+0460:         request: IpcRequestEnvelope | RequestEnvelope | Mapping[str, Any],
+0461:     ) -> RequestEnvelope:
+0462:         if isinstance(request, RequestEnvelope):
+0463:             AstraWeaveIpcServer._enforce_payload_size(request.to_dict())
+0464:             return request
+0465:         if isinstance(request, IpcRequestEnvelope):
+0466:             protocol_request = request.to_protocol()
+0467:             AstraWeaveIpcServer._enforce_payload_size(protocol_request.to_dict())
+0468:             return protocol_request
+0469:         if isinstance(request, Mapping):
+0470:             AstraWeaveIpcServer._enforce_payload_size(request)
+0471:             return validate_request_payload(request)
+0472:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "request must be a request envelope or mapping")
+0473: 
+0474:     def _resolve_and_authorize_caller(
+0475:         self,
+0476:         request: RequestEnvelope,
+0477:         *,
+0478:         expected_caller: CallerIdentity | None,
+0479:     ) -> CallerIdentity | None:
+0480:         caller = _caller_identity_from_envelope(request.caller)
+0481:         if self._require_explicit_caller and caller is None:
+0482:             raise ApiError(ApiErrorCode.AUTH_DENIED, "caller identity is required at IPC boundary")
+0483:         if caller is None:
+0484:             return None
+0485:         if expected_caller is not None and caller != expected_caller:
+0486:             raise ApiError(ApiErrorCode.AUTH_DENIED, "caller identity changed within the same IPC connection")
+0487:         if self._enforce_runtime_caller_attestation:
+0488:             attestation = self._caller_attestor(caller)
+0489:             if not attestation.allowed:
+0490:                 raise attestation.to_api_error()
+0491:         admission = self._service.security_guard.authorize_caller(caller)
+0492:         if not admission.allowed:
+0493:             raise admission.to_api_error()
+0494:         return caller
+0495: 
+0496:     @staticmethod
+0497:     def _enforce_payload_size(payload: Mapping[str, Any]) -> None:
+0498:         size_bytes = estimate_json_size_bytes(payload)
+0499:         if size_bytes > MAX_CONTROL_PLANE_PAYLOAD_BYTES:
+0500:             raise ApiError(
+0501:                 ApiErrorCode.INVALID_ARGUMENT,
+0502:                 f"request payload exceeds maximum size of {MAX_CONTROL_PLANE_PAYLOAD_BYTES} bytes",
+0503:             )
+0504: 
+0505:     def _dispatch(self, request: RequestEnvelope, caller: CallerIdentity | None) -> Any:
+0506:         if not isinstance(request.params, Mapping):
+0507:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "params must be a mapping")
+0508:         params = dict(request.params)
+0509:         method = request.method
+0510: 
+0511:         if method == "CreateSession":
+0512:             return self._service.CreateSession(caller_identity=caller)
+0513:         if method == "LoadModel":
+0514:             session_id = self._require_str(params, "session_id")
+0515:             model_name = self._require_str(params, "model_name")
+0516:             runtime_backend = self._optional_str(params, "runtime_backend")
+0517:             runtime_profile = self._optional_str(params, "runtime_profile")
+0518:             runtime_backend_options = self._optional_tuning_options(params, "runtime_backend_options")
+0519:             self._call_service_method(
+0520:                 "LoadModel",
+0521:                 session_id,
+0522:                 model_name,
+0523:                 caller_identity=caller,
+0524:                 runtime_backend=runtime_backend,
+0525:                 runtime_profile=runtime_profile,
+0526:                 backend_options=runtime_backend_options,
+0527:                 runtime_backend_options=runtime_backend_options,
+0528:             )
+0529:             return None
+0530:         if method == "RegisterTensor":
+0531:             session_id = self._require_str(params, "session_id")
+0532:             tensor_name = self._require_str(params, "tensor_name")
+0533:             size_bytes = self._require_int(params, "size_bytes")
+0534:             self._service.RegisterTensor(session_id, tensor_name, size_bytes, caller_identity=caller)
+0535:             return None
+0536:         if method == "SetTierHint":
+0537:             session_id = self._require_str(params, "session_id")
+0538:             tensor_name = self._require_str(params, "tensor_name")
+0539:             tier = self._parse_memory_tier(params.get("tier"))
+0540:             self._service.SetTierHint(session_id, tensor_name, tier, caller_identity=caller)
+0541:             return None
+0542:         if method == "PrefetchPlan":
+0543:             session_id = self._require_str(params, "session_id")
+0544:             return self._service.PrefetchPlan(session_id, caller_identity=caller)
+0545:         if method == "RunStep":
+0546:             session_id = self._require_str(params, "session_id")
+0547:             step_name = params.get("step_name", "run")
+0548:             if not isinstance(step_name, str) or not step_name.strip():
+0549:                 raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "step_name must be a non-empty string")
+0550:             prompt = self._optional_str(params, "prompt")
+0551:             max_tokens = self._optional_int(params, "max_tokens")
+0552:             temperature = self._optional_float(params, "temperature")
+0553:             runtime_profile_override = self._optional_str(params, "runtime_profile_override")
+0554:             runtime_backend_options_override = self._optional_tuning_options(
+0555:                 params,
+0556:                 "runtime_backend_options_override",
+0557:             )
+0558:             return self._call_service_method(
+0559:                 "RunStep",
+0560:                 session_id,
+0561:                 step_name=step_name,
+0562:                 caller_identity=caller,
+0563:                 prompt=prompt,
+0564:                 max_tokens=max_tokens,
+0565:                 temperature=temperature,
+0566:                 runtime_profile_override=runtime_profile_override,
+0567:                 backend_options=runtime_backend_options_override,
+0568:                 runtime_backend_options_override=runtime_backend_options_override,
+0569:             )
+0570:         if method == "GetResidency":
+0571:             session_id = self._require_str(params, "session_id")
+0572:             return self._service.GetResidency(session_id, caller_identity=caller)
+0573:         if method == "GetPressure":
+0574:             session_id = self._require_str(params, "session_id")
+0575:             return self._service.GetPressure(session_id, caller_identity=caller)
+0576:         if method == "SetPolicy":
+0577:             session_id = self._require_str(params, "session_id")
+0578:             policy = self._parse_policy_profile(params.get("policy"))
+0579:             self._service.SetPolicy(session_id, policy, caller_identity=caller)
+0580:             return None
+0581:         if method == "CloseSession":
+0582:             session_id = self._require_str(params, "session_id")
+0583:             self._service.CloseSession(session_id, caller_identity=caller)
+0584:             return None
+0585: 
+0586:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unknown IPC method: {method}")
+0587: 
+0588:     @staticmethod
+0589:     def _require_str(params: Mapping[str, Any], key: str) -> str:
+0590:         value = params.get(key)
+0591:         if not isinstance(value, str) or not value.strip():
+0592:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be a non-empty string")
+0593:         return value
+0594: 
+0595:     @staticmethod
+0596:     def _require_int(params: Mapping[str, Any], key: str) -> int:
+0597:         value = params.get(key)
+0598:         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+0599:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be a positive integer")
+0600:         return value
+0601: 
+0602:     @staticmethod
+0603:     def _optional_str(params: Mapping[str, Any], key: str) -> str | None:
+0604:         value = params.get(key)
+0605:         if value is None:
+0606:             return None
+0607:         if not isinstance(value, str) or not value.strip():
+0608:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be a non-empty string")
+0609:         return value
+0610: 
+0611:     @staticmethod
+0612:     def _optional_int(params: Mapping[str, Any], key: str) -> int | None:
+0613:         value = params.get(key)
+0614:         if value is None:
+0615:             return None
+0616:         if not isinstance(value, int) or isinstance(value, bool):
+0617:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be an integer")
+0618:         if value <= 0:
+0619:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be a positive integer")
+0620:         return value
+0621: 
+0622:     @staticmethod
+0623:     def _optional_float(params: Mapping[str, Any], key: str) -> float | None:
+0624:         value = params.get(key)
+0625:         if value is None:
+0626:             return None
+0627:         if not isinstance(value, (int, float)) or isinstance(value, bool):
+0628:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be a number")
+0629:         return float(value)
+0630: 
+0631:     @staticmethod
+0632:     def _optional_tuning_options(params: Mapping[str, Any], key: str) -> dict[str, Any] | None:
+0633:         value = params.get(key)
+0634:         if value is None:
+0635:             return None
+0636:         if not isinstance(value, Mapping):
+0637:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be a JSON object")
+0638: 
+0639:         normalized: dict[str, Any] = {}
+0640:         for option_key, option_value in value.items():
+0641:             if not isinstance(option_key, str) or not option_key.strip():
+0642:                 raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} keys must be non-empty strings")
+0643:             normalized[option_key.strip()] = option_value
+0644:         return normalized
+0645: 
+0646:     def _call_service_method(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+0647:         method = getattr(self._service, method_name)
+0648:         try:
+0649:             params = signature(method).parameters
+0650:         except (TypeError, ValueError):  # pragma: no cover - unusual callable
+0651:             return method(*args, **kwargs)
+0652: 
+0653:         if any(param.kind == Parameter.VAR_KEYWORD for param in params.values()):
+0654:             return method(*args, **kwargs)
+0655: 
+0656:         filtered_kwargs = {key: value for key, value in kwargs.items() if key in params}
+0657:         return method(*args, **filtered_kwargs)
+0658: 
+0659:     @staticmethod
+0660:     def _parse_memory_tier(value: Any) -> MemoryTier:
+0661:         if isinstance(value, MemoryTier):
+0662:             return value
+0663:         if isinstance(value, str):
+0664:             try:
+0665:                 return MemoryTier(value)
+0666:             except ValueError as exc:
+0667:                 raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unknown MemoryTier: {value}") from exc
+0668:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "tier must be a MemoryTier value")
+0669: 
+0670:     @staticmethod
+0671:     def _parse_policy_profile(value: Any) -> PolicyProfile:
+0672:         if isinstance(value, PolicyProfile):
+0673:             return value
+0674:         if isinstance(value, str):
+0675:             try:
+0676:                 return PolicyProfile(value)
+0677:             except ValueError as exc:
+0678:                 raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unknown PolicyProfile: {value}") from exc
+0679:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "policy must be a PolicyProfile value")
+0680: 
+0681:     def _record_security_deny(
+0682:         self,
+0683:         *,
+0684:         error: ApiError,
+0685:         request: IpcRequestEnvelope | RequestEnvelope | Mapping[str, Any],
+0686:     ) -> None:
+0687:         if error.code not in {ApiErrorCode.AUTH_DENIED, ApiErrorCode.RATE_LIMITED}:
+0688:             return
+0689:         request_id = self._extract_request_id(request) or "unknown"
+0690:         caller_id = "unknown"
+0691:         if isinstance(request, RequestEnvelope) and request.caller is not None:
+0692:             caller_id = f"{request.caller.user_sid}:{request.caller.pid}"
+0693:         elif isinstance(request, IpcRequestEnvelope) and request.caller is not None:
+0694:             caller_id = f"{request.caller.user_sid}:{request.caller.pid}"
+0695:         elif isinstance(request, Mapping):
+0696:             caller_raw = request.get("caller")
+0697:             if isinstance(caller_raw, Mapping):
+0698:                 sid = caller_raw.get("user_sid")
+0699:                 pid = caller_raw.get("pid")
+0700:                 if isinstance(sid, str) and isinstance(pid, int):
+0701:                     caller_id = f"{sid}:{pid}"
+0702:         try:
+0703:             self._service.telemetry.record_event(
+0704:                 SecurityEvent(
+0705:                     reason_code=TelemetryReasonCode.SECURITY_DENY,
+0706:                     session_id=request_id,
+0707:                     caller_id=caller_id,
+0708:                     endpoint=str(self._endpoint),
+0709:                     decision=error.code.value,
+0710:                 ),
+0711:                 extra_identifiers={"request_id": request_id},
+0712:             )
+0713:         except Exception:
+0714:             return

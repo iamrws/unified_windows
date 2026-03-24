@@ -1,0 +1,134 @@
+﻿0001: """Phase 2 end-to-end stress test for the IPC-backed AstraWeave stack."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: from contextlib import suppress
+0006: import os
+0007: import unittest
+0008: 
+0009: from astrawave.errors import ApiError, ApiErrorCode
+0010: from astrawave.ipc_client import AstraWeaveIpcClient
+0011: from astrawave.ipc_server import AstraWeaveIpcServer
+0012: from astrawave.sdk import AstraWeaveSDK
+0013: from astrawave.security import CallerIdentity, resolve_process_user_sid
+0014: from astrawave.telemetry import TelemetryReasonCode
+0015: from astrawave.types import MemoryTier
+0016: 
+0017: 
+0018: class Phase2EndToEndTests(unittest.TestCase):
+0019:     """Exercise the real IPC path with caller enforcement and telemetry flow."""
+0020: 
+0021:     def setUp(self) -> None:
+0022:         self.server = AstraWeaveIpcServer(
+0023:             prefer_named_pipe=False,
+0024:             host="127.0.0.1",
+0025:             port=0,
+0026:         )
+0027:         self.server.start()
+0028:         self.addCleanup(self._cleanup)
+0029: 
+0030:         self.owner_sid = self.server.service.security_guard.policy.service_owner_sid
+0031:         self.owner = CallerIdentity(user_sid=self.owner_sid, pid=os.getpid())
+0032:         self.foreign = CallerIdentity(
+0033:             user_sid=(resolve_process_user_sid(os.getpid()) or "S-1-5-21-foreign") + "-foreign",
+0034:             pid=os.getpid(),
+0035:         )
+0036: 
+0037:         endpoint = self._endpoint_uri(self.server.endpoint)
+0038:         self.client = AstraWeaveIpcClient(
+0039:             endpoint=endpoint,
+0040:             default_caller=self.owner,
+0041:             timeout=5.0,
+0042:             prefer_named_pipe=False,
+0043:         ).connect()
+0044:         self.sdk = AstraWeaveSDK(client=self.client)
+0045: 
+0046:     def _cleanup(self) -> None:
+0047:         for obj in (getattr(self, "sdk", None), getattr(self, "client", None)):
+0048:             if obj is None:
+0049:                 continue
+0050:             close = getattr(obj, "close", None)
+0051:             if callable(close):
+0052:                 with suppress(Exception):
+0053:                     close()
+0054:         server = getattr(self, "server", None)
+0055:         if server is not None:
+0056:             with suppress(Exception):
+0057:                 server.stop()
+0058: 
+0059:     @staticmethod
+0060:     def _endpoint_uri(endpoint: object) -> str:
+0061:         if isinstance(endpoint, tuple) and len(endpoint) == 2:
+0062:             host, port = endpoint
+0063:             return f"tcp://{host}:{port}"
+0064:         if isinstance(endpoint, str):
+0065:             if endpoint.startswith("\\\\.\\pipe\\"):
+0066:                 return f"pipe://{endpoint}"
+0067:             return endpoint
+0068:         raise AssertionError(f"Unsupported IPC endpoint format: {endpoint!r}")
+0069: 
+0070:     def test_owner_flow_emits_telemetry_and_remote_state(self) -> None:
+0071:         session_id = self.sdk.CreateSession()
+0072:         self.sdk.LoadModel(session_id, "demo-model", runtime_backend="ollama")
+0073:         self.sdk.RegisterTensor(session_id, "kv", 1)
+0074:         self.sdk.SetTierHint(session_id, "kv", MemoryTier.HOT)
+0075: 
+0076:         session = self.server.service._sessions[session_id]
+0077:         with session.lock:
+0078:             session.vram_budget_bytes = 1
+0079: 
+0080:         prefetch_plan = self.sdk.PrefetchPlan(session_id)
+0081:         self.assertEqual(len(prefetch_plan), 1)
+0082:         self.assertEqual(prefetch_plan[0]["reason_code"], "prefetch")
+0083:         self.assertEqual(prefetch_plan[0]["destination"], "VRAM")
+0084: 
+0085:         pressure = self.sdk.GetPressure(session_id)
+0086:         self.assertEqual(pressure.session_id, session_id)
+0087:         self.assertAlmostEqual(pressure.pressure_level, 1.0)
+0088: 
+0089:         run_result = self.sdk.RunStep(
+0090:             session_id,
+0091:             step_name="decode",
+0092:             prompt="hello",
+0093:             max_tokens=8,
+0094:             temperature=0.1,
+0095:         )
+0096:         self.assertEqual(run_result["session_id"], session_id)
+0097:         self.assertEqual(run_result["step_name"], "decode")
+0098:         self.assertEqual(run_result["state"], "DEGRADED")
+0099:         self.assertEqual(run_result["fallback_result"]["next_step"], "kv_context_reduction")
+0100: 
+0101:         residency = self.sdk.GetResidency(session_id)
+0102:         self.assertEqual(residency.session_state.value, "DEGRADED")
+0103:         self.assertEqual(residency.primary_tier.value, "WARM")
+0104:         self.assertEqual(residency.tensor_residency["kv"].value, "PINNED_RAM")
+0105: 
+0106:         with self.assertRaises(ApiError) as cm:
+0107:             self.client.GetResidency(session_id, caller=self.foreign)
+0108:         self.assertEqual(cm.exception.code, ApiErrorCode.AUTH_DENIED)
+0109: 
+0110:         telemetry_records = self.server.service.telemetry.records
+0111:         reason_codes = [record.reason_code for record in telemetry_records]
+0112:         self.assertGreaterEqual(len(telemetry_records), 4)
+0113:         self.assertIn(TelemetryReasonCode.UNKNOWN, reason_codes)
+0114:         self.assertIn(TelemetryReasonCode.TRANSFER_PREFETCH, reason_codes)
+0115:         self.assertIn(TelemetryReasonCode.FALLBACK_KV_REDUCTION, reason_codes)
+0116:         for record in telemetry_records:
+0117:             self.assertTrue(record.correlation_id.startswith("tel-"))
+0118:             self.assertIsNotNone(record.session_id_hash)
+0119:             self.assertNotEqual(record.session_id_hash, session_id)
+0120: 
+0121:     def test_remote_close_is_idempotent_and_post_close_access_fails(self) -> None:
+0122:         session_id = self.sdk.CreateSession()
+0123:         self.sdk.LoadModel(session_id, "demo-model")
+0124: 
+0125:         self.sdk.CloseSession(session_id)
+0126:         self.sdk.CloseSession(session_id)
+0127: 
+0128:         with self.assertRaises(ApiError) as cm:
+0129:             self.sdk.LoadModel(session_id, "another-model")
+0130:         self.assertIn(cm.exception.code, {ApiErrorCode.INVALID_STATE, ApiErrorCode.NOT_FOUND})
+0131: 
+0132: 
+0133: if __name__ == "__main__":
+0134:     unittest.main()

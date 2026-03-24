@@ -1,0 +1,147 @@
+﻿0001: """Tiering and placement planning for AstraWeave."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: from dataclasses import dataclass, field
+0006: from typing import Iterable, Mapping, Sequence
+0007: 
+0008: from .types import MemoryTier
+0009: 
+0010: 
+0011: @dataclass(frozen=True, slots=True)
+0012: class PlacementRequest:
+0013:     """Description of a resource that needs residency placement."""
+0014: 
+0015:     resource_id: str
+0016:     bytes_required: int
+0017:     is_active: bool = False
+0018:     reuse_score: float = 0.0
+0019:     preferred_tier: MemoryTier | None = None
+0020: 
+0021: 
+0022: @dataclass(frozen=True, slots=True)
+0023: class PlacementDecision:
+0024:     """Placement outcome for a single resource."""
+0025: 
+0026:     resource_id: str
+0027:     tier: MemoryTier
+0028:     bytes_required: int
+0029:     reason_code: str
+0030: 
+0031: 
+0032: @dataclass(frozen=True, slots=True)
+0033: class PlacementPlan:
+0034:     """Complete placement plan returned by the planner."""
+0035: 
+0036:     decisions: tuple[PlacementDecision, ...]
+0037:     hot_bytes: int
+0038:     warm_bytes: int
+0039:     cold_bytes: int
+0040: 
+0041:     def by_tier(self, tier: MemoryTier) -> tuple[PlacementDecision, ...]:
+0042:         """Return all decisions assigned to the requested tier."""
+0043: 
+0044:         return tuple(decision for decision in self.decisions if decision.tier == tier)
+0045: 
+0046: 
+0047: @dataclass(frozen=True, slots=True)
+0048: class PlacementPolicy:
+0049:     """Thresholds used by the placement planner."""
+0050: 
+0051:     hot_reuse_score: float = 0.75
+0052:     warm_reuse_score: float = 0.35
+0053:     hot_headroom_ratio: float = 0.20
+0054: 
+0055: 
+0056: class PlacementPlanner:
+0057:     """Deterministic planner that classifies resources into HOT/WARM/COLD."""
+0058: 
+0059:     def __init__(self, policy: PlacementPolicy | None = None) -> None:
+0060:         self._policy = policy or PlacementPolicy()
+0061: 
+0062:     @property
+0063:     def policy(self) -> PlacementPolicy:
+0064:         """Expose the planner policy for diagnostics."""
+0065: 
+0066:         return self._policy
+0067: 
+0068:     def classify(
+0069:         self,
+0070:         request: PlacementRequest,
+0071:         hot_budget_bytes: int,
+0072:         hot_used_bytes: int = 0,
+0073:     ) -> PlacementDecision:
+0074:         """Classify one resource into a residency tier."""
+0075: 
+0076:         if request.preferred_tier is not None:
+0077:             tier = request.preferred_tier
+0078:             reason_code = "PLACEMENT_PREFERRED_TIER"
+0079:         elif request.is_active or request.reuse_score >= self._policy.hot_reuse_score:
+0080:             if hot_used_bytes + request.bytes_required <= self._reserve_limit(hot_budget_bytes):
+0081:                 tier = MemoryTier.HOT
+0082:                 reason_code = "PLACEMENT_HOT_ACTIVE_OR_HIGH_REUSE"
+0083:             else:
+0084:                 tier = MemoryTier.WARM
+0085:                 reason_code = "PLACEMENT_WARM_HOT_HEADROOM_EXCEEDED"
+0086:         elif request.reuse_score >= self._policy.warm_reuse_score:
+0087:             tier = MemoryTier.WARM
+0088:             reason_code = "PLACEMENT_WARM_REUSE_SCORE"
+0089:         else:
+0090:             tier = MemoryTier.COLD
+0091:             reason_code = "PLACEMENT_COLD_LOW_REUSE"
+0092: 
+0093:         return PlacementDecision(
+0094:             resource_id=request.resource_id,
+0095:             tier=tier,
+0096:             bytes_required=request.bytes_required,
+0097:             reason_code=reason_code,
+0098:         )
+0099: 
+0100:     def plan(
+0101:         self,
+0102:         requests: Sequence[PlacementRequest],
+0103:         hot_budget_bytes: int,
+0104:     ) -> PlacementPlan:
+0105:         """Create a deterministic placement plan for a collection of resources."""
+0106: 
+0107:         decisions: list[PlacementDecision] = []
+0108:         hot_used_bytes = 0
+0109:         warm_bytes = 0
+0110:         cold_bytes = 0
+0111: 
+0112:         for request in requests:
+0113:             decision = self.classify(
+0114:                 request,
+0115:                 hot_budget_bytes=hot_budget_bytes,
+0116:                 hot_used_bytes=hot_used_bytes,
+0117:             )
+0118:             decisions.append(decision)
+0119: 
+0120:             if decision.tier == MemoryTier.HOT:
+0121:                 hot_used_bytes += decision.bytes_required
+0122:             elif decision.tier == MemoryTier.WARM:
+0123:                 warm_bytes += decision.bytes_required
+0124:             else:
+0125:                 cold_bytes += decision.bytes_required
+0126: 
+0127:         return PlacementPlan(
+0128:             decisions=tuple(decisions),
+0129:             hot_bytes=hot_used_bytes,
+0130:             warm_bytes=warm_bytes,
+0131:             cold_bytes=cold_bytes,
+0132:         )
+0133: 
+0134:     def summarize(self, plan: PlacementPlan) -> Mapping[MemoryTier, int]:
+0135:         """Summarize a plan into per-tier byte totals."""
+0136: 
+0137:         return {
+0138:             MemoryTier.HOT: plan.hot_bytes,
+0139:             MemoryTier.WARM: plan.warm_bytes,
+0140:             MemoryTier.COLD: plan.cold_bytes,
+0141:         }
+0142: 
+0143:     def _reserve_limit(self, hot_budget_bytes: int) -> int:
+0144:         """Reserve a fraction of HOT budget to avoid decode-time spikes."""
+0145: 
+0146:         reserve = int(hot_budget_bytes * self._policy.hot_headroom_ratio)
+0147:         return max(hot_budget_bytes - reserve, 0)

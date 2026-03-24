@@ -1,0 +1,653 @@
+﻿0001: """Smoke test for local AstraWeave session orchestration plus local prompt inference.
+0002: 
+0003: This script is intentionally honest about the current split:
+0004: - AstraWeave owns session creation, model registration, and orchestration.
+0005: - A local backend such as Ollama handles prompt generation.
+0006: 
+0007: It is a bridge workflow for testing a Windows host with large system RAM and a
+0008: small dGPU while service-native prompt routing is still landing.
+0009: """
+0010: 
+0011: from __future__ import annotations
+0012: 
+0013: import argparse
+0014: import hashlib
+0015: import json
+0016: import os
+0017: import re
+0018: import sys
+0019: from dataclasses import asdict, is_dataclass
+0020: from datetime import datetime, timezone
+0021: from pathlib import Path
+0022: from typing import Any, Mapping, Sequence
+0023: from urllib import error, request
+0024: 
+0025: REPO_ROOT = Path(__file__).resolve().parent.parent
+0026: if str(REPO_ROOT) not in sys.path:
+0027:     sys.path.insert(0, str(REPO_ROOT))
+0028: 
+0029: from astrawave.inference_runtime import InferenceModelBinding, SimulationInferenceRuntime
+0030: 
+0031: DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+0032: DEFAULT_RUNTIME_BACKEND = "ollama"
+0033: DEFAULT_PROMPT = "Explain in one paragraph why 128 GB of system RAM helps local LLM inference."
+0034: DEFAULT_STEP_NAME = "prompt_smoke"
+0035: DEFAULT_SERVICE_RUNSTEP_MODE = "simulation"
+0036: DEFAULT_IPC_TIMEOUT_SECONDS = float(os.environ.get("ASTRAWEAVE_SMOKE_IPC_TIMEOUT_SECONDS", "120"))
+0037: _POSITIVE_INT_OPTION_KEYS = {"num_ctx", "num_batch", "num_predict", "num_keep", "top_k"}
+0038: _NONNEGATIVE_INT_OPTION_KEYS = {"gpu_layers", "num_gpu"}
+0039: _NONNEGATIVE_FLOAT_OPTION_KEYS = {"temperature"}
+0040: _OPEN_INTERVAL_FLOAT_OPTION_KEYS = {"top_p", "repeat_penalty"}
+0041: _PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
+0042:     "balanced": {
+0043:         "num_ctx": 8192,
+0044:         "num_batch": 2,
+0045:         "num_keep": 128,
+0046:         "top_p": 0.95,
+0047:         "repeat_penalty": 1.1,
+0048:     },
+0049:     "vram_constrained": {
+0050:         "num_ctx": 4096,
+0051:         "num_batch": 1,
+0052:         "num_keep": 64,
+0053:         "top_p": 0.9,
+0054:         "repeat_penalty": 1.1,
+0055:     },
+0056: }
+0057: 
+0058: 
+0059: def _utc_now_iso() -> str:
+0060:     return datetime.now(timezone.utc).isoformat()
+0061: 
+0062: 
+0063: def _json_safe(value: Any) -> Any:
+0064:     if value is None or isinstance(value, (str, int, float, bool)):
+0065:         return value
+0066:     if is_dataclass(value):
+0067:         return _json_safe(asdict(value))
+0068:     if isinstance(value, dict):
+0069:         return {str(key): _json_safe(item) for key, item in value.items()}
+0070:     if isinstance(value, tuple | list):
+0071:         return [_json_safe(item) for item in value]
+0072:     if hasattr(value, "value"):
+0073:         return getattr(value, "value")
+0074:     return value
+0075: 
+0076: 
+0077: def _write_json(payload: Mapping[str, Any], *, stream: str = "stdout") -> None:
+0078:     text = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True)
+0079:     if stream == "stderr":
+0080:         print(text, file=sys.stderr)
+0081:     else:
+0082:         print(text)
+0083: 
+0084: 
+0085: def _service_endpoint_uri(endpoint: Any) -> str:
+0086:     if isinstance(endpoint, tuple) and len(endpoint) == 2:
+0087:         host, port = endpoint
+0088:         return f"tcp://{host}:{port}"
+0089:     if isinstance(endpoint, str):
+0090:         return endpoint
+0091:     return str(endpoint)
+0092: 
+0093: 
+0094: def _normalize_profile(value: str | None) -> str | None:
+0095:     if value is None:
+0096:         return None
+0097:     if not isinstance(value, str) or not value.strip():
+0098:         raise ValueError("runtime profile must be a non-empty string")
+0099:     return value.strip()
+0100: 
+0101: 
+0102: def _parse_model_size_billion(model_name: str) -> float | None:
+0103:     matches = re.findall(r"(?<!\d)(\d+(?:\.\d+)?)\s*[bB](?!\w)", model_name)
+0104:     if not matches:
+0105:         return None
+0106:     try:
+0107:         return float(matches[-1])
+0108:     except ValueError:
+0109:         return None
+0110: 
+0111: 
+0112: def _resolve_runtime_profile(model_name: str, runtime_profile: str | None) -> tuple[str, float | None]:
+0113:     parsed_size = _parse_model_size_billion(model_name)
+0114:     normalized_profile = _normalize_profile(runtime_profile)
+0115:     if normalized_profile is not None and normalized_profile != "auto":
+0116:         return normalized_profile, parsed_size
+0117:     if parsed_size is not None and parsed_size >= 14.0:
+0118:         return "vram_constrained", parsed_size
+0119:     return "balanced", parsed_size
+0120: 
+0121: 
+0122: def _parse_option_pairs(
+0123:     raw_options: Mapping[str, Any] | None,
+0124:     *,
+0125:     field_name: str,
+0126: ) -> dict[str, Any] | None:
+0127:     if raw_options is None:
+0128:         return None
+0129:     if not isinstance(raw_options, Mapping):
+0130:         raise ValueError(f"{field_name} must be a mapping")
+0131: 
+0132:     normalized: dict[str, Any] = {}
+0133:     for key, value in raw_options.items():
+0134:         if not isinstance(key, str) or not key.strip():
+0135:             raise ValueError(f"{field_name} keys must be non-empty strings")
+0136:         normalized[key.strip()] = _validate_option_value(field_name, key.strip(), value)
+0137:     return normalized
+0138: 
+0139: 
+0140: def _parse_cli_option_pairs(raw_options: Sequence[str] | None, *, field_name: str) -> dict[str, Any] | None:
+0141:     if raw_options is None:
+0142:         return None
+0143:     parsed: dict[str, Any] = {}
+0144:     for raw_item in raw_options:
+0145:         if "=" not in raw_item:
+0146:             raise ValueError(f"{field_name} entries must use key=value syntax")
+0147:         key_text, raw_value = raw_item.split("=", 1)
+0148:         key = key_text.strip()
+0149:         if not key:
+0150:             raise ValueError(f"{field_name} keys must be non-empty strings")
+0151:         try:
+0152:             value = json.loads(raw_value)
+0153:         except json.JSONDecodeError:
+0154:             value = raw_value
+0155:         parsed[key] = _validate_option_value(field_name, key, value)
+0156:     return parsed
+0157: 
+0158: 
+0159: def _validate_option_value(field_name: str, key: str, value: Any) -> Any:
+0160:     if key in _POSITIVE_INT_OPTION_KEYS:
+0161:         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+0162:             raise ValueError(f"{field_name}.{key} must be a positive integer")
+0163:         return value
+0164:     if key in _NONNEGATIVE_INT_OPTION_KEYS:
+0165:         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+0166:             raise ValueError(f"{field_name}.{key} must be a non-negative integer")
+0167:         return value
+0168:     if key in _NONNEGATIVE_FLOAT_OPTION_KEYS:
+0169:         if not isinstance(value, (int, float)) or isinstance(value, bool) or float(value) < 0.0:
+0170:             raise ValueError(f"{field_name}.{key} must be a non-negative number")
+0171:         return float(value)
+0172:     if key == "top_p":
+0173:         if not isinstance(value, (int, float)) or isinstance(value, bool):
+0174:             raise ValueError(f"{field_name}.{key} must be a number")
+0175:         numeric_value = float(value)
+0176:         if numeric_value <= 0.0 or numeric_value > 1.0:
+0177:             raise ValueError(f"{field_name}.{key} must be between 0 and 1")
+0178:         return numeric_value
+0179:     if key in _OPEN_INTERVAL_FLOAT_OPTION_KEYS:
+0180:         if not isinstance(value, (int, float)) or isinstance(value, bool):
+0181:             raise ValueError(f"{field_name}.{key} must be a number")
+0182:         numeric_value = float(value)
+0183:         if numeric_value <= 0.0:
+0184:             raise ValueError(f"{field_name}.{key} must be greater than 0")
+0185:         return numeric_value
+0186:     return value
+0187: 
+0188: 
+0189: def _merge_runtime_options(*layers: Mapping[str, Any] | None) -> dict[str, Any]:
+0190:     merged: dict[str, Any] = {}
+0191:     for layer in layers:
+0192:         if layer is None:
+0193:             continue
+0194:         for key, value in layer.items():
+0195:             merged[key] = value
+0196:     return merged
+0197: 
+0198: 
+0199: def _synthesize_load_options(profile: str, model_size_billion: float | None, requested_options: Mapping[str, Any] | None) -> dict[str, Any]:
+0200:     options = dict(_PROFILE_DEFAULTS.get(profile, _PROFILE_DEFAULTS["balanced"]))
+0201:     if model_size_billion is not None and model_size_billion >= 32.0:
+0202:         options["num_ctx"] = min(int(options["num_ctx"]), 3072)
+0203:         options["num_batch"] = 1
+0204:     return _merge_runtime_options(options, requested_options)
+0205: 
+0206: 
+0207: def _synthesize_step_options(
+0208:     load_options: Mapping[str, Any],
+0209:     requested_options: Mapping[str, Any] | None,
+0210:     *,
+0211:     max_tokens: int | None,
+0212:     temperature: float | None,
+0213: ) -> dict[str, Any]:
+0214:     options = dict(load_options)
+0215:     if max_tokens is not None and "num_predict" not in options:
+0216:         options["num_predict"] = max_tokens
+0217:     if temperature is not None and "temperature" not in options:
+0218:         options["temperature"] = temperature
+0219:     return _merge_runtime_options(options, requested_options)
+0220: 
+0221: 
+0222: def _post_json(url: str, payload: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+0223:     data = json.dumps(payload).encode("utf-8")
+0224:     req = request.Request(
+0225:         url,
+0226:         data=data,
+0227:         headers={"Content-Type": "application/json"},
+0228:         method="POST",
+0229:     )
+0230:     with request.urlopen(req, timeout=timeout_seconds) as response:
+0231:         body = response.read().decode("utf-8")
+0232:     decoded = json.loads(body)
+0233:     if not isinstance(decoded, dict):
+0234:         raise RuntimeError("ollama response must be a JSON object")
+0235:     return decoded
+0236: 
+0237: 
+0238: class _ProfiledOllamaRuntime:
+0239:     backend_name = "ollama"
+0240: 
+0241:     def __init__(
+0242:         self,
+0243:         *,
+0244:         base_url: str,
+0245:         timeout_seconds: float,
+0246:         tuning_state: dict[str, Any],
+0247:     ) -> None:
+0248:         self._base_url = base_url.rstrip("/")
+0249:         self._timeout_seconds = timeout_seconds
+0250:         self._tuning_state = tuning_state
+0251: 
+0252:     def load_model(self, model_name: str) -> InferenceModelBinding:
+0253:         requested_profile = self._tuning_state.get("load_requested_profile")
+0254:         requested_options = _parse_option_pairs(
+0255:             self._tuning_state.get("load_requested_options"),
+0256:             field_name="runtime_backend_options",
+0257:         )
+0258:         effective_profile, model_size_billion = _resolve_runtime_profile(model_name, requested_profile)
+0259:         backend_options = _synthesize_load_options(effective_profile, model_size_billion, requested_options)
+0260:         self._tuning_state["effective_load_profile"] = effective_profile
+0261:         self._tuning_state["model_size_billion"] = model_size_billion
+0262:         self._tuning_state["effective_load_options"] = backend_options
+0263:         return InferenceModelBinding(
+0264:             backend=self.backend_name,
+0265:             requested_model_name=model_name,
+0266:             resolved_model_name=model_name,
+0267:             metadata={
+0268:                 "base_url": self._base_url,
+0269:                 "model_size_billion": model_size_billion,
+0270:                 "runtime_profile": effective_profile,
+0271:                 "runtime_backend_options": backend_options,
+0272:                 "supports_prompt_generation": True,
+0273:                 "transport": "http",
+0274:             },
+0275:         )
+0276: 
+0277:     def generate(
+0278:         self,
+0279:         model_name: str,
+0280:         *,
+0281:         prompt: str,
+0282:         step_name: str,
+0283:         max_tokens: int | None = None,
+0284:         temperature: float | None = None,
+0285:         system_prompt: str | None = None,
+0286:     ) -> dict[str, Any]:
+0287:         step_profile = _normalize_profile(self._tuning_state.get("step_requested_profile"))
+0288:         step_requested_options = _parse_option_pairs(
+0289:             self._tuning_state.get("step_requested_options"),
+0290:             field_name="runtime_backend_options_override",
+0291:         )
+0292:         load_profile = self._tuning_state.get("effective_load_profile")
+0293:         effective_profile = step_profile or load_profile or "balanced"
+0294:         load_options = self._tuning_state.get("effective_load_options")
+0295:         if not isinstance(load_options, Mapping):
+0296:             load_options = {}
+0297:         backend_options = _synthesize_step_options(
+0298:             load_options,
+0299:             step_requested_options,
+0300:             max_tokens=max_tokens,
+0301:             temperature=temperature,
+0302:         )
+0303:         self._tuning_state["effective_step_profile"] = effective_profile
+0304:         self._tuning_state["effective_step_options"] = backend_options
+0305:         payload: dict[str, Any] = {
+0306:             "model": model_name,
+0307:             "prompt": prompt,
+0308:             "stream": False,
+0309:         }
+0310:         if system_prompt:
+0311:             payload["system"] = system_prompt
+0312:         options = dict(backend_options)
+0313:         if max_tokens is not None:
+0314:             options["num_predict"] = max_tokens
+0315:         if temperature is not None and "temperature" not in options:
+0316:             options["temperature"] = temperature
+0317:         if options:
+0318:             payload["options"] = options
+0319:         raw = _post_json(f"{self._base_url}/api/generate", payload, self._timeout_seconds)
+0320:         output_text = str(raw.get("response", ""))
+0321:         return {
+0322:             "ok": True,
+0323:             "backend": self.backend_name,
+0324:             "model_name": model_name,
+0325:             "output_text": output_text,
+0326:             "finish_reason": raw.get("done_reason") or ("stop" if raw.get("done") else "unknown"),
+0327:             "usage": {
+0328:                 "prompt_eval_count": raw.get("prompt_eval_count"),
+0329:                 "eval_count": raw.get("eval_count"),
+0330:                 "total_duration": raw.get("total_duration"),
+0331:                 "load_duration": raw.get("load_duration"),
+0332:                 "eval_duration": raw.get("eval_duration"),
+0333:                 "step_name": step_name,
+0334:             },
+0335:             "raw": {key: value for key, value in raw.items() if key not in {"prompt", "context"}},
+0336:         }
+0337: 
+0338: 
+0339: def _current_caller() -> CallerIdentity:
+0340:     from astrawave.security import CallerIdentity, resolve_current_user_sid
+0341:     from astrawave.service import DEFAULT_SERVICE_OWNER_SID
+0342: 
+0343:     sid = resolve_current_user_sid() or DEFAULT_SERVICE_OWNER_SID
+0344:     return CallerIdentity(user_sid=sid, pid=os.getpid())
+0345: 
+0346: 
+0347: def run_live_inference_smoke(
+0348:     *,
+0349:     model_name: str,
+0350:     prompt: str,
+0351:     runtime_backend: str = DEFAULT_RUNTIME_BACKEND,
+0352:     runtime_profile: str | None = None,
+0353:     runtime_backend_options: Mapping[str, Any] | None = None,
+0354:     runtime_profile_override: str | None = None,
+0355:     runtime_backend_options_override: Mapping[str, Any] | None = None,
+0356:     ollama_base_url: str = DEFAULT_OLLAMA_URL,
+0357:     temperature: float = 0.2,
+0358:     max_tokens: int = 128,
+0359:     service_runstep_mode: str = DEFAULT_SERVICE_RUNSTEP_MODE,
+0360:     ipc_timeout_seconds: float = DEFAULT_IPC_TIMEOUT_SECONDS,
+0361: ) -> dict[str, Any]:
+0362:     if runtime_backend == "ollama":
+0363:         # Service-side Ollama runtime reads this env var while loading backend adapters.
+0364:         os.environ["ASTRAWEAVE_OLLAMA_BASE_URL"] = ollama_base_url.rstrip("/")
+0365: 
+0366:     from astrawave.ipc_client import AstraWeaveIpcClient
+0367:     from astrawave.ipc_server import AstraWeaveIpcServer
+0368:     from astrawave.service import AstraWeaveService
+0369: 
+0370:     if not model_name.strip():
+0371:         raise ValueError("model_name must not be empty")
+0372:     if not prompt.strip():
+0373:         raise ValueError("prompt must not be empty")
+0374:     requested_load_profile = _normalize_profile(runtime_profile)
+0375:     requested_load_options = _parse_option_pairs(runtime_backend_options, field_name="runtime_backend_options")
+0376:     requested_step_profile = _normalize_profile(runtime_profile_override)
+0377:     requested_step_options = _parse_option_pairs(
+0378:         runtime_backend_options_override,
+0379:         field_name="runtime_backend_options_override",
+0380:     )
+0381:     planned_load_profile, model_size_billion = _resolve_runtime_profile(model_name, requested_load_profile)
+0382:     planned_load_options = _synthesize_load_options(planned_load_profile, model_size_billion, requested_load_options)
+0383:     planned_step_profile = requested_step_profile or planned_load_profile
+0384:     planned_step_options = _synthesize_step_options(
+0385:         planned_load_options,
+0386:         requested_step_options,
+0387:         max_tokens=max_tokens,
+0388:         temperature=temperature,
+0389:     )
+0390: 
+0391:     tuning_state: dict[str, Any] = {
+0392:         "load_requested_profile": requested_load_profile,
+0393:         "load_requested_options": requested_load_options,
+0394:         "step_requested_profile": requested_step_profile,
+0395:         "step_requested_options": requested_step_options,
+0396:         "model_size_billion": model_size_billion,
+0397:         "effective_load_profile": planned_load_profile,
+0398:         "effective_load_options": planned_load_options,
+0399:         "effective_step_profile": planned_step_profile,
+0400:         "effective_step_options": planned_step_options,
+0401:     }
+0402: 
+0403:     def _inference_runtime_factory(backend_name: str):
+0404:         if backend_name == "simulation":
+0405:             return SimulationInferenceRuntime()
+0406:         if backend_name == "ollama":
+0407:             return _ProfiledOllamaRuntime(
+0408:                 base_url=ollama_base_url,
+0409:                 timeout_seconds=ipc_timeout_seconds,
+0410:                 tuning_state=tuning_state,
+0411:             )
+0412:         raise ValueError(f"unsupported runtime backend: {backend_name}")
+0413: 
+0414:     service = AstraWeaveService(runstep_mode=service_runstep_mode, inference_runtime_factory=_inference_runtime_factory)
+0415:     server = AstraWeaveIpcServer(
+0416:         service=service,
+0417:         prefer_named_pipe=False,
+0418:         host="127.0.0.1",
+0419:         port=0,
+0420:     )
+0421:     caller = _current_caller()
+0422:     started_at = _utc_now_iso()
+0423: 
+0424:     server.start()
+0425:     try:
+0426:         endpoint = _service_endpoint_uri(server.endpoint)
+0427:         with AstraWeaveIpcClient(
+0428:             endpoint=endpoint,
+0429:             default_caller=caller,
+0430:             timeout=ipc_timeout_seconds,
+0431:         ) as client:
+0432:             session_id = client.CreateSession()
+0433:             client.LoadModel(
+0434:                 session_id,
+0435:                 model_name,
+0436:                 runtime_backend=runtime_backend,
+0437:                 runtime_profile=requested_load_profile,
+0438:                 runtime_backend_options=requested_load_options,
+0439:             )
+0440:             run_step_result = client.RunStep(
+0441:                 session_id,
+0442:                 step_name=DEFAULT_STEP_NAME,
+0443:                 prompt=prompt,
+0444:                 max_tokens=max_tokens,
+0445:                 temperature=temperature,
+0446:                 runtime_profile_override=requested_step_profile,
+0447:                 runtime_backend_options_override=requested_step_options,
+0448:             )
+0449:             client.CloseSession(session_id)
+0450: 
+0451:         inference_result = run_step_result.get("inference_result")
+0452:         if not isinstance(inference_result, Mapping):
+0453:             raise RuntimeError("service run-step did not return inference_result")
+0454:         if not bool(inference_result.get("ok", False)):
+0455:             error_block = inference_result.get("error")
+0456:             if isinstance(error_block, Mapping):
+0457:                 code = error_block.get("code", "unknown")
+0458:                 message = error_block.get("message", "unknown inference failure")
+0459:                 raise RuntimeError(f"inference backend failed: {code} {message}")
+0460:             raise RuntimeError("inference backend failed without structured error details")
+0461: 
+0462:         ended_at = _utc_now_iso()
+0463:         prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+0464:         provider = str(inference_result.get("backend", runtime_backend))
+0465:         result_model = str(inference_result.get("model_name", model_name))
+0466:         effective_load_profile = tuning_state.get("effective_load_profile")
+0467:         if not isinstance(effective_load_profile, str):
+0468:             effective_load_profile = requested_load_profile
+0469:         effective_step_profile = tuning_state.get("effective_step_profile")
+0470:         if not isinstance(effective_step_profile, str):
+0471:             effective_step_profile = requested_step_profile or effective_load_profile
+0472:         effective_load_options = tuning_state.get("effective_load_options")
+0473:         if not isinstance(effective_load_options, Mapping):
+0474:             effective_load_options = requested_load_options or {}
+0475:         effective_step_options = tuning_state.get("effective_step_options")
+0476:         if not isinstance(effective_step_options, Mapping):
+0477:             effective_step_options = requested_step_options or {}
+0478:         run_step_report = _json_safe(run_step_result)
+0479:         if isinstance(run_step_report, dict):
+0480:             if requested_step_profile is not None:
+0481:                 run_step_report["runtime_profile_override"] = requested_step_profile
+0482:             if requested_step_options is not None:
+0483:                 run_step_report["runtime_backend_options_override"] = requested_step_options
+0484: 
+0485:         load_model_report: dict[str, Any] = {
+0486:             "session_id": session_id,
+0487:             "model_name": model_name,
+0488:             "runtime_backend": runtime_backend,
+0489:         }
+0490:         if requested_load_profile is not None:
+0491:             load_model_report["runtime_profile"] = requested_load_profile
+0492:         if requested_load_options is not None:
+0493:             load_model_report["runtime_backend_options"] = requested_load_options
+0494: 
+0495:         return {
+0496:             "run_id": started_at,
+0497:             "generated_at": ended_at,
+0498:             "model_name": model_name,
+0499:             "runtime_backend": runtime_backend,
+0500:             "prompt_sha256": prompt_hash,
+0501:             "prompt_length": len(prompt),
+0502:             "runtime_tuning": {
+0503:                 "model_size_billion": tuning_state.get("model_size_billion"),
+0504:                 "requested": {
+0505:                     "load_profile": requested_load_profile,
+0506:                     "load_backend_options": requested_load_options or {},
+0507:                     "step_profile_override": requested_step_profile,
+0508:                     "step_backend_options_override": requested_step_options or {},
+0509:                 },
+0510:                 "effective": {
+0511:                     "load_profile": effective_load_profile,
+0512:                     "load_backend_options": dict(effective_load_options),
+0513:                     "step_profile_override": effective_step_profile,
+0514:                     "step_backend_options_override": dict(effective_step_options),
+0515:                 },
+0516:             },
+0517:             "service": {
+0518:                 "endpoint": endpoint,
+0519:                 "caller": _json_safe(caller),
+0520:                 "session_id": session_id,
+0521:                 "load_model": load_model_report,
+0522:                 "run_step": run_step_report,
+0523:             },
+0524:             "inference": {
+0525:                 "provider": provider,
+0526:                 "base_url": ollama_base_url.rstrip("/") if provider == "ollama" else None,
+0527:                 "model_name": result_model,
+0528:                 "temperature": temperature,
+0529:                 "max_tokens": max_tokens,
+0530:                 "runtime_profile": effective_step_profile,
+0531:                 "runtime_backend_options": dict(effective_step_options),
+0532:                 "result": _json_safe(inference_result),
+0533:             },
+0534:         }
+0535:     finally:
+0536:         server.stop()
+0537: 
+0538: 
+0539: def _build_parser() -> argparse.ArgumentParser:
+0540:     parser = argparse.ArgumentParser(description="Smoke test local AstraWeave orchestration plus local prompt inference.")
+0541:     parser.add_argument(
+0542:         "--model",
+0543:         required=True,
+0544:         help="Model identifier for the selected runtime backend.",
+0545:     )
+0546:     parser.add_argument(
+0547:         "--runtime-backend",
+0548:         choices=["ollama", "simulation"],
+0549:         default=DEFAULT_RUNTIME_BACKEND,
+0550:         help="Prompt runtime backend used by AstraWeave RunStep.",
+0551:     )
+0552:     parser.add_argument(
+0553:         "--runtime-profile",
+0554:         default=None,
+0555:         help="Optional load-time tuning profile (for example: auto or vram_constrained).",
+0556:     )
+0557:     parser.add_argument(
+0558:         "--runtime-option",
+0559:         dest="runtime_options",
+0560:         action="append",
+0561:         default=None,
+0562:         metavar="KEY=VALUE",
+0563:         help="Optional load-time backend tuning option; may be repeated.",
+0564:     )
+0565:     parser.add_argument(
+0566:         "--runtime-profile-override",
+0567:         default=None,
+0568:         help="Optional per-step tuning profile override.",
+0569:     )
+0570:     parser.add_argument(
+0571:         "--runtime-option-override",
+0572:         dest="runtime_option_overrides",
+0573:         action="append",
+0574:         default=None,
+0575:         metavar="KEY=VALUE",
+0576:         help="Optional per-step backend tuning option override; may be repeated.",
+0577:     )
+0578:     parser.add_argument(
+0579:         "--prompt",
+0580:         default=DEFAULT_PROMPT,
+0581:         help="Prompt to send to the local inference backend.",
+0582:     )
+0583:     parser.add_argument(
+0584:         "--ollama-url",
+0585:         default=DEFAULT_OLLAMA_URL,
+0586:         help="Base URL for the local Ollama server (used only when --runtime-backend=ollama).",
+0587:     )
+0588:     parser.add_argument(
+0589:         "--temperature",
+0590:         type=float,
+0591:         default=0.2,
+0592:         help="Sampling temperature sent to the local backend.",
+0593:     )
+0594:     parser.add_argument(
+0595:         "--max-tokens",
+0596:         type=int,
+0597:         default=128,
+0598:         help="Maximum tokens requested from the local backend.",
+0599:     )
+0600:     parser.add_argument(
+0601:         "--service-runstep-mode",
+0602:         choices=["simulation", "auto", "hardware"],
+0603:         default=DEFAULT_SERVICE_RUNSTEP_MODE,
+0604:         help="RunStep mode used when the smoke script exercises AstraWeave orchestration.",
+0605:     )
+0606:     parser.add_argument(
+0607:         "--ipc-timeout-seconds",
+0608:         type=float,
+0609:         default=DEFAULT_IPC_TIMEOUT_SECONDS,
+0610:         help="IPC timeout used for service calls in this smoke script.",
+0611:     )
+0612:     return parser
+0613: 
+0614: 
+0615: def main(argv: Sequence[str] | None = None) -> int:
+0616:     parser = _build_parser()
+0617:     args = parser.parse_args(argv)
+0618:     try:
+0619:         result = run_live_inference_smoke(
+0620:             model_name=args.model,
+0621:             prompt=args.prompt,
+0622:             runtime_backend=args.runtime_backend,
+0623:             runtime_profile=args.runtime_profile,
+0624:             runtime_backend_options=_parse_cli_option_pairs(args.runtime_options, field_name="runtime_options"),
+0625:             runtime_profile_override=args.runtime_profile_override,
+0626:             runtime_backend_options_override=_parse_cli_option_pairs(
+0627:                 args.runtime_option_overrides,
+0628:                 field_name="runtime_option_overrides",
+0629:             ),
+0630:             ollama_base_url=args.ollama_url,
+0631:             temperature=args.temperature,
+0632:             max_tokens=args.max_tokens,
+0633:             service_runstep_mode=args.service_runstep_mode,
+0634:             ipc_timeout_seconds=args.ipc_timeout_seconds,
+0635:         )
+0636:         _write_json({"ok": True, "result": _json_safe(result)})
+0637:         return 0
+0638:     except Exception as exc:
+0639:         _write_json(
+0640:             {
+0641:                 "ok": False,
+0642:                 "error": {
+0643:                     "code": "SMOKE_FAILED",
+0644:                     "message": str(exc),
+0645:                 },
+0646:             },
+0647:             stream="stderr",
+0648:         )
+0649:         return 1
+0650: 
+0651: 
+0652: if __name__ == "__main__":  # pragma: no cover
+0653:     raise SystemExit(main())

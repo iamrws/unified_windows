@@ -1,0 +1,6 @@
+﻿# Test Gap Queries
+## search: prompt must be non-empty string when provided
+astrawave\service.py:1008:            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "prompt must be a non-empty string when provided")
+
+## search: current state=RUNNING in tests
+(no tests assert recovery from RUNNING on RunStep argument errors)

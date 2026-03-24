@@ -1,0 +1,208 @@
+﻿
+=================================== ERRORS ====================================
+_____________ ERROR collecting test_runtime/release_gate_1ek_1osp _____________
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\runner.py:353: in from_call
+    result: TResult | None = func()
+                             ^^^^^^
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\runner.py:398: in collect
+    return list(collector.collect())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\main.py:557: in collect
+    for direntry in scandir(self.path):
+                    ^^^^^^^^^^^^^^^^^^
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\pathlib.py:963: in scandir
+    scandir_iter = os.scandir(path)
+                   ^^^^^^^^^^^^^^^^
+E   PermissionError: [WinError 5] Access is denied: 'C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\test_runtime\\release_gate_1ek_1osp'
+_____________ ERROR collecting test_runtime/release_gate_a3gj37o5 _____________
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\runner.py:353: in from_call
+    result: TResult | None = func()
+                             ^^^^^^
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\runner.py:398: in collect
+    return list(collector.collect())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\main.py:557: in collect
+    for direntry in scandir(self.path):
+                    ^^^^^^^^^^^^^^^^^^
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\pathlib.py:963: in scandir
+    scandir_iter = os.scandir(path)
+                   ^^^^^^^^^^^^^^^^
+E   PermissionError: [WinError 5] Access is denied: 'C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\test_runtime\\release_gate_a3gj37o5'
+_____________ ERROR collecting test_runtime/release_gate_sznvo5hj _____________
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\runner.py:353: in from_call
+    result: TResult | None = func()
+                             ^^^^^^
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\runner.py:398: in collect
+    return list(collector.collect())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\main.py:557: in collect
+    for direntry in scandir(self.path):
+                    ^^^^^^^^^^^^^^^^^^
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\pathlib.py:963: in scandir
+    scandir_iter = os.scandir(path)
+                   ^^^^^^^^^^^^^^^^
+E   PermissionError: [WinError 5] Access is denied: 'C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\test_runtime\\release_gate_sznvo5hj'
+_____________ ERROR collecting test_runtime/release_gate_u_96txby _____________
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\runner.py:353: in from_call
+    result: TResult | None = func()
+                             ^^^^^^
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\runner.py:398: in collect
+    return list(collector.collect())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\main.py:557: in collect
+    for direntry in scandir(self.path):
+                    ^^^^^^^^^^^^^^^^^^
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\pathlib.py:963: in scandir
+    scandir_iter = os.scandir(path)
+                   ^^^^^^^^^^^^^^^^
+E   PermissionError: [WinError 5] Access is denied: 'C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\test_runtime\\release_gate_u_96txby'
+__________ ERROR collecting tests/test_capability_matrix_contract.py __________
+ImportError while importing test module 'C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\tests\test_capability_matrix_contract.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Python313\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\test_capability_matrix_contract.py:7: in <module>
+    from astrawave.capabilities import CapabilityMode, CapabilitySignals, resolve_capability_mode
+E   ModuleNotFoundError: No module named 'astrawave'
+__________ ERROR collecting tests/test_inference_runtime_contract.py __________
+ImportError while importing test module 'C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\tests\test_inference_runtime_contract.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Python313\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\test_inference_runtime_contract.py:7: in <module>
+    from astrawave.errors import ApiError, ApiErrorCode
+E   ModuleNotFoundError: No module named 'astrawave'
+_________ ERROR collecting tests/test_integrated_service_contract.py __________
+ImportError while importing test module 'C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\tests\test_integrated_service_contract.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Python313\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\test_integrated_service_contract.py:7: in <module>
+    from astrawave import AstraWeaveService
+E   ModuleNotFoundError: No module named 'astrawave'
+________________ ERROR collecting tests/test_ipc_client_sdk.py ________________
+ImportError while importing test module 'C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\tests\test_ipc_client_sdk.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Python313\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\test_ipc_client_sdk.py:9: in <module>
+    from astrawave.errors import ApiError, ApiErrorCode
+E   ModuleNotFoundError: No module named 'astrawave'
+_____________ ERROR collecting tests/test_live_inference_smoke.py _____________
+ImportError while importing test module 'C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\tests\test_live_inference_smoke.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Python313\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\test_live_inference_smoke.py:7: in <module>
+    from scripts.live_inference_smoke import run_live_inference_smoke
+E   ModuleNotFoundError: No module named 'scripts.live_inference_smoke'
+______________ ERROR collecting tests/test_phase2_end_to_end.py _______________
+ImportError while importing test module 'C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\tests\test_phase2_end_to_end.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Python313\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\test_phase2_end_to_end.py:9: in <module>
+    from astrawave.errors import ApiError, ApiErrorCode
+E   ModuleNotFoundError: No module named 'astrawave'
+_____________ ERROR collecting tests/test_phase3_runtime_smoke.py _____________
+ImportError while importing test module 'C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\tests\test_phase3_runtime_smoke.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Python313\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\test_phase3_runtime_smoke.py:9: in <module>
+    from astrawave.errors import ApiError, ApiErrorCode
+E   ModuleNotFoundError: No module named 'astrawave'
+_____________ ERROR collecting tests/test_phase3_service_host.py ______________
+ImportError while importing test module 'C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\tests\test_phase3_service_host.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Python313\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\test_phase3_service_host.py:8: in <module>
+    from astrawave.errors import ApiError, ApiErrorCode
+E   ModuleNotFoundError: No module named 'astrawave'
+_____________ ERROR collecting tests/test_ram_target_benchmark.py _____________
+ImportError while importing test module 'C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\tests\test_ram_target_benchmark.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Python313\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\test_ram_target_benchmark.py:7: in <module>
+    from scripts.ram_target_benchmark import (
+E   ModuleNotFoundError: No module named 'scripts.ram_target_benchmark'
+_________ ERROR collecting tests/test_release_gate_report_contract.py _________
+ImportError while importing test module 'C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\tests\test_release_gate_report_contract.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Python313\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\test_release_gate_report_contract.py:14: in <module>
+    import scripts.generate_release_gate_report as release_gate
+E   ModuleNotFoundError: No module named 'scripts.generate_release_gate_report'
+_______________ ERROR collecting tests/test_service_contract.py _______________
+ImportError while importing test module 'C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\tests\test_service_contract.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Python313\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\test_service_contract.py:10: in <module>
+    from astrawave import AstraWeaveService
+E   ModuleNotFoundError: No module named 'astrawave'
+______________ ERROR collecting tests/test_telemetry_contract.py ______________
+ImportError while importing test module 'C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\tests\test_telemetry_contract.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Python313\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\test_telemetry_contract.py:9: in <module>
+    from astrawave.errors import ApiError, ApiErrorCode
+E   ModuleNotFoundError: No module named 'astrawave'
+============================== warnings summary ===============================
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\cacheprovider.py:475
+  C:\Users\grzeg\AppData\Roaming\Python\Python313\site-packages\_pytest\cacheprovider.py:475: PytestCacheWarning: could not create cache path C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\.pytest_cache\v\cache\nodeids: [WinError 5] Access is denied: 'C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\pytest-cache-files-tcann0zp'
+    config.cache.set("cache/nodeids", sorted(self.cached_nodeids))
+
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\cacheprovider.py:429
+  C:\Users\grzeg\AppData\Roaming\Python\Python313\site-packages\_pytest\cacheprovider.py:429: PytestCacheWarning: could not create cache path C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\.pytest_cache\v\cache\lastfailed: [WinError 5] Access is denied: 'C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\pytest-cache-files-3opusnbi'
+    config.cache.set("cache/lastfailed", self.lastfailed)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+ERROR test_runtime/release_gate_1ek_1osp - PermissionError: [WinError 5] Acce...
+ERROR test_runtime/release_gate_a3gj37o5 - PermissionError: [WinError 5] Acce...
+ERROR test_runtime/release_gate_sznvo5hj - PermissionError: [WinError 5] Acce...
+ERROR test_runtime/release_gate_u_96txby - PermissionError: [WinError 5] Acce...
+ERROR tests/test_capability_matrix_contract.py
+ERROR tests/test_inference_runtime_contract.py
+ERROR tests/test_integrated_service_contract.py
+ERROR tests/test_ipc_client_sdk.py
+ERROR tests/test_live_inference_smoke.py
+ERROR tests/test_phase2_end_to_end.py
+ERROR tests/test_phase3_runtime_smoke.py
+ERROR tests/test_phase3_service_host.py
+ERROR tests/test_ram_target_benchmark.py
+ERROR tests/test_release_gate_report_contract.py
+ERROR tests/test_service_contract.py
+ERROR tests/test_telemetry_contract.py
+!!!!!!!!!!!!!!!!!! Interrupted: 16 errors during collection !!!!!!!!!!!!!!!!!!!
+2 warnings, 16 errors in 0.46s
+duration_ms=2239.3561

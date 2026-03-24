@@ -1,0 +1,387 @@
+﻿0001: """CUDA runtime helpers for real host<->device transfer verification.
+0002: 
+0003: The functions in this module are dependency-light and use `ctypes` against
+0004: `nvcuda.dll` so they can run on Windows machines without Python CUDA packages.
+0005: """
+0006: 
+0007: from __future__ import annotations
+0008: 
+0009: import ctypes
+0010: import os
+0011: import zlib
+0012: from time import perf_counter_ns, sleep, time_ns
+0013: from typing import Any, Iterable
+0014: 
+0015: try:  # pragma: no cover - optional in stripped builds
+0016:     from .hardware_probe import collect_hardware_probe
+0017: except Exception:  # pragma: no cover
+0018:     collect_hardware_probe = None
+0019: 
+0020: CUDA_SUCCESS = 0
+0021: DEFAULT_TRANSFER_BYTES = 1_048_576
+0022: DEFAULT_DEVICE_INDEX = 0
+0023: 
+0024: CUresult = ctypes.c_int
+0025: CUdevice = ctypes.c_int
+0026: CUcontext = ctypes.c_void_p
+0027: CUdeviceptr = ctypes.c_uint64
+0028: 
+0029: 
+0030: class CudaDriverError(RuntimeError):
+0031:     """Typed CUDA driver call failure."""
+0032: 
+0033:     def __init__(self, code: int, operation: str, detail: str) -> None:
+0034:         super().__init__(f"{operation} failed with CUDA error {code}: {detail}")
+0035:         self.code = code
+0036:         self.operation = operation
+0037:         self.detail = detail
+0038: 
+0039: 
+0040: def run_cuda_transfer(
+0041:     *,
+0042:     size_bytes: int = DEFAULT_TRANSFER_BYTES,
+0043:     device_index: int = DEFAULT_DEVICE_INDEX,
+0044:     hold_ms: int = 0,
+0045: ) -> dict[str, Any]:
+0046:     """Run a real CUDA host->device->host transfer and return structured results."""
+0047: 
+0048:     if os.name != "nt":
+0049:         return _error_result(
+0050:             code="CUDA_POC_UNSUPPORTED_PLATFORM",
+0051:             message="This runtime currently supports Windows only.",
+0052:             size_bytes=size_bytes,
+0053:             device_index=device_index,
+0054:         )
+0055:     if size_bytes <= 0:
+0056:         return _error_result(
+0057:             code="CUDA_POC_INVALID_ARGUMENT",
+0058:             message="size_bytes must be positive",
+0059:             size_bytes=size_bytes,
+0060:             device_index=device_index,
+0061:         )
+0062: 
+0063:     try:
+0064:         library = ctypes.WinDLL("nvcuda.dll")
+0065:     except OSError as exc:
+0066:         return _error_result(
+0067:             code="CUDA_POC_DRIVER_MISSING",
+0068:             message="nvcuda.dll was not found",
+0069:             detail=str(exc),
+0070:             size_bytes=size_bytes,
+0071:             device_index=device_index,
+0072:         )
+0073: 
+0074:     cu_init, init_name = _resolve_symbol(library, ("cuInit",))
+0075:     cu_device_get, device_get_name = _resolve_symbol(library, ("cuDeviceGet",))
+0076:     cu_ctx_create, ctx_create_name = _resolve_symbol(library, ("cuCtxCreate_v2", "cuCtxCreate"))
+0077:     cu_ctx_destroy, ctx_destroy_name = _resolve_symbol(library, ("cuCtxDestroy_v2", "cuCtxDestroy"))
+0078:     cu_mem_alloc, mem_alloc_name = _resolve_symbol(library, ("cuMemAlloc_v2", "cuMemAlloc"))
+0079:     cu_mem_free, mem_free_name = _resolve_symbol(library, ("cuMemFree_v2", "cuMemFree"))
+0080:     cu_memcpy_htod, memcpy_htod_name = _resolve_symbol(library, ("cuMemcpyHtoD_v2", "cuMemcpyHtoD"))
+0081:     cu_memcpy_dtoh, memcpy_dtoh_name = _resolve_symbol(library, ("cuMemcpyDtoH_v2", "cuMemcpyDtoH"))
+0082: 
+0083:     cu_init.restype = CUresult
+0084:     cu_init.argtypes = [ctypes.c_uint]
+0085: 
+0086:     cu_device_get.restype = CUresult
+0087:     cu_device_get.argtypes = [ctypes.POINTER(CUdevice), ctypes.c_int]
+0088: 
+0089:     cu_ctx_create.restype = CUresult
+0090:     cu_ctx_create.argtypes = [ctypes.POINTER(CUcontext), ctypes.c_uint, CUdevice]
+0091: 
+0092:     cu_ctx_destroy.restype = CUresult
+0093:     cu_ctx_destroy.argtypes = [CUcontext]
+0094: 
+0095:     cu_mem_alloc.restype = CUresult
+0096:     cu_mem_alloc.argtypes = [ctypes.POINTER(CUdeviceptr), ctypes.c_size_t]
+0097: 
+0098:     cu_mem_free.restype = CUresult
+0099:     cu_mem_free.argtypes = [CUdeviceptr]
+0100: 
+0101:     cu_memcpy_htod.restype = CUresult
+0102:     cu_memcpy_htod.argtypes = [CUdeviceptr, ctypes.c_void_p, ctypes.c_size_t]
+0103: 
+0104:     cu_memcpy_dtoh.restype = CUresult
+0105:     cu_memcpy_dtoh.argtypes = [ctypes.c_void_p, CUdeviceptr, ctypes.c_size_t]
+0106: 
+0107:     device = CUdevice()
+0108:     context = CUcontext()
+0109:     device_ptr = CUdeviceptr(0)
+0110:     host_src = (ctypes.c_ubyte * size_bytes)()
+0111:     host_dst = (ctypes.c_ubyte * size_bytes)()
+0112:     for index in range(size_bytes):
+0113:         host_src[index] = (index * 131 + 17) % 251
+0114: 
+0115:     src_crc32 = f"{zlib.crc32(bytes(host_src)) & 0xFFFFFFFF:08x}"
+0116:     started_ns = perf_counter_ns()
+0117:     timings_ms: dict[str, float] = {}
+0118:     nvml_before = _capture_nvml_snapshot(device_index)
+0119:     nvml_after_alloc = _capture_nvml_snapshot(device_index)
+0120:     nvml_after_copy = _capture_nvml_snapshot(device_index)
+0121:     op_error: dict[str, Any] | None = None
+0122: 
+0123:     try:
+0124:         _call_cuda(library, init_name, cu_init, 0)
+0125:         _call_cuda(library, device_get_name, cu_device_get, ctypes.byref(device), device_index)
+0126:         _call_cuda(library, ctx_create_name, cu_ctx_create, ctypes.byref(context), 0, device)
+0127:         _call_cuda(library, mem_alloc_name, cu_mem_alloc, ctypes.byref(device_ptr), size_bytes)
+0128: 
+0129:         if hold_ms > 0:
+0130:             sleep(hold_ms / 1000.0)
+0131:         nvml_after_alloc = _capture_nvml_snapshot(device_index)
+0132: 
+0133:         t0 = perf_counter_ns()
+0134:         _call_cuda(
+0135:             library,
+0136:             memcpy_htod_name,
+0137:             cu_memcpy_htod,
+0138:             device_ptr,
+0139:             ctypes.cast(host_src, ctypes.c_void_p),
+0140:             size_bytes,
+0141:         )
+0142:         timings_ms["copy_h2d_ms"] = (perf_counter_ns() - t0) / 1_000_000.0
+0143: 
+0144:         t1 = perf_counter_ns()
+0145:         _call_cuda(
+0146:             library,
+0147:             memcpy_dtoh_name,
+0148:             cu_memcpy_dtoh,
+0149:             ctypes.cast(host_dst, ctypes.c_void_p),
+0150:             device_ptr,
+0151:             size_bytes,
+0152:         )
+0153:         timings_ms["copy_d2h_ms"] = (perf_counter_ns() - t1) / 1_000_000.0
+0154:         nvml_after_copy = _capture_nvml_snapshot(device_index)
+0155:     except CudaDriverError as exc:
+0156:         op_error = {
+0157:             "code": "CUDA_POC_DRIVER_ERROR",
+0158:             "message": str(exc),
+0159:             "cuda_error_code": exc.code,
+0160:             "operation": exc.operation,
+0161:         }
+0162: 
+0163:     cleanup_errors: list[str] = []
+0164:     if device_ptr.value:
+0165:         try:
+0166:             cu_mem_free(device_ptr)
+0167:         except Exception as exc:  # pragma: no cover - cleanup best-effort
+0168:             cleanup_errors.append(f"cuMemFree cleanup failed: {exc}")
+0169:     if context:
+0170:         try:
+0171:             cu_ctx_destroy(context)
+0172:         except Exception as exc:  # pragma: no cover - cleanup best-effort
+0173:             cleanup_errors.append(f"cuCtxDestroy cleanup failed: {exc}")
+0174: 
+0175:     nvml_after_free = _capture_nvml_snapshot(device_index)
+0176:     nvml_observation = _summarize_nvml_observation(
+0177:         before=nvml_before,
+0178:         after_alloc=nvml_after_alloc,
+0179:         after_copy=nvml_after_copy,
+0180:         after_free=nvml_after_free,
+0181:     )
+0182:     if cleanup_errors:
+0183:         nvml_observation["warnings"] = cleanup_errors
+0184: 
+0185:     if op_error is not None:
+0186:         return {
+0187:             "ok": False,
+0188:             "timestamp_ms": time_ns() // 1_000_000,
+0189:             "size_bytes": size_bytes,
+0190:             "device_index": device_index,
+0191:             "nvml_observation": nvml_observation,
+0192:             "error": op_error,
+0193:         }
+0194: 
+0195:     dst_crc32 = f"{zlib.crc32(bytes(host_dst)) & 0xFFFFFFFF:08x}"
+0196:     verified = src_crc32 == dst_crc32
+0197:     total_ms = (perf_counter_ns() - started_ns) / 1_000_000.0
+0198:     copy_h2d_ms = timings_ms.get("copy_h2d_ms", 0.0)
+0199:     copy_d2h_ms = timings_ms.get("copy_d2h_ms", 0.0)
+0200:     round_trip_gib_per_sec = 0.0
+0201:     if copy_h2d_ms + copy_d2h_ms > 0:
+0202:         seconds = (copy_h2d_ms + copy_d2h_ms) / 1000.0
+0203:         round_trip_gib_per_sec = (2 * size_bytes) / seconds / (1024**3)
+0204: 
+0205:     return {
+0206:         "ok": verified,
+0207:         "timestamp_ms": time_ns() // 1_000_000,
+0208:         "size_bytes": size_bytes,
+0209:         "device_index": int(device.value),
+0210:         "cuda_symbols": {
+0211:             "ctx_create": ctx_create_name,
+0212:             "ctx_destroy": ctx_destroy_name,
+0213:             "mem_alloc": mem_alloc_name,
+0214:             "mem_free": mem_free_name,
+0215:             "memcpy_h2d": memcpy_htod_name,
+0216:             "memcpy_d2h": memcpy_dtoh_name,
+0217:         },
+0218:         "timings_ms": {
+0219:             "copy_h2d_ms": copy_h2d_ms,
+0220:             "copy_d2h_ms": copy_d2h_ms,
+0221:             "total_ms": total_ms,
+0222:         },
+0223:         "throughput": {
+0224:             "round_trip_gib_per_sec": round_trip_gib_per_sec,
+0225:         },
+0226:         "verification": {
+0227:             "src_crc32": src_crc32,
+0228:             "dst_crc32": dst_crc32,
+0229:             "matched": verified,
+0230:         },
+0231:         "nvml_observation": nvml_observation,
+0232:         "error": None if verified else {
+0233:             "code": "CUDA_POC_VERIFY_MISMATCH",
+0234:             "message": "round-trip bytes did not match",
+0235:         },
+0236:     }
+0237: 
+0238: 
+0239: def _summarize_nvml_observation(
+0240:     *,
+0241:     before: dict[str, Any],
+0242:     after_alloc: dict[str, Any],
+0243:     after_copy: dict[str, Any],
+0244:     after_free: dict[str, Any],
+0245: ) -> dict[str, Any]:
+0246:     before_used = before.get("used_bytes")
+0247:     peak_used = _max_int(
+0248:         before_used,
+0249:         after_alloc.get("used_bytes"),
+0250:         after_copy.get("used_bytes"),
+0251:         after_free.get("used_bytes"),
+0252:     )
+0253:     observed_delta_bytes = None
+0254:     if isinstance(before_used, int) and isinstance(peak_used, int):
+0255:         observed_delta_bytes = max(0, peak_used - before_used)
+0256:     return {
+0257:         "device_index": before.get("device_index"),
+0258:         "source": before.get("source", "none"),
+0259:         "before": before,
+0260:         "after_alloc": after_alloc,
+0261:         "after_copy": after_copy,
+0262:         "after_free": after_free,
+0263:         "peak_used_bytes": peak_used,
+0264:         "observed_delta_bytes": observed_delta_bytes,
+0265:         "observed": bool(observed_delta_bytes and observed_delta_bytes > 0),
+0266:     }
+0267: 
+0268: 
+0269: def _capture_nvml_snapshot(device_index: int) -> dict[str, Any]:
+0270:     snapshot = {
+0271:         "timestamp_ms": time_ns() // 1_000_000,
+0272:         "device_index": device_index,
+0273:         "used_bytes": None,
+0274:         "source": "none",
+0275:         "error": None,
+0276:     }
+0277:     if collect_hardware_probe is None:
+0278:         snapshot["error"] = "hardware_probe module unavailable"
+0279:         return snapshot
+0280:     try:
+0281:         probe = collect_hardware_probe()
+0282:     except Exception as exc:  # pragma: no cover - defensive
+0283:         snapshot["error"] = str(exc)
+0284:         return snapshot
+0285: 
+0286:     nvml_block = probe.get("nvml")
+0287:     if isinstance(nvml_block, dict) and nvml_block.get("available"):
+0288:         devices = nvml_block.get("devices")
+0289:         if isinstance(devices, list):
+0290:             for entry in devices:
+0291:                 if isinstance(entry, dict) and int(entry.get("index", -1)) == device_index:
+0292:                     value = entry.get("memory_used_bytes")
+0293:                     if isinstance(value, int):
+0294:                         snapshot["used_bytes"] = value
+0295:                         snapshot["source"] = "nvml"
+0296:                         return snapshot
+0297:     nvidia_block = probe.get("nvidia_smi")
+0298:     if isinstance(nvidia_block, dict) and nvidia_block.get("available"):
+0299:         devices = nvidia_block.get("devices")
+0300:         if isinstance(devices, list):
+0301:             for entry in devices:
+0302:                 if isinstance(entry, dict) and int(entry.get("index", -1)) == device_index:
+0303:                     value = entry.get("memory_used_bytes")
+0304:                     if isinstance(value, int):
+0305:                         snapshot["used_bytes"] = value
+0306:                         snapshot["source"] = "nvidia-smi"
+0307:                         return snapshot
+0308: 
+0309:     snapshot["error"] = "no NVML/nvidia-smi memory reading for device index"
+0310:     return snapshot
+0311: 
+0312: 
+0313: def _max_int(*values: Any) -> int | None:
+0314:     ints = [item for item in values if isinstance(item, int)]
+0315:     return max(ints) if ints else None
+0316: 
+0317: 
+0318: def _error_result(
+0319:     *,
+0320:     code: str,
+0321:     message: str,
+0322:     size_bytes: int,
+0323:     device_index: int,
+0324:     detail: str | None = None,
+0325: ) -> dict[str, Any]:
+0326:     payload: dict[str, Any] = {
+0327:         "ok": False,
+0328:         "timestamp_ms": time_ns() // 1_000_000,
+0329:         "size_bytes": size_bytes,
+0330:         "device_index": device_index,
+0331:         "error": {
+0332:             "code": code,
+0333:             "message": message,
+0334:         },
+0335:         "nvml_observation": {
+0336:             "device_index": device_index,
+0337:             "source": "none",
+0338:             "observed": False,
+0339:             "observed_delta_bytes": None,
+0340:         },
+0341:     }
+0342:     if detail:
+0343:         payload["error"]["detail"] = detail
+0344:     return payload
+0345: 
+0346: 
+0347: def _resolve_symbol(library: ctypes.WinDLL, names: Iterable[str]):
+0348:     for name in names:
+0349:         symbol = getattr(library, name, None)
+0350:         if symbol is not None:
+0351:             return symbol, name
+0352:     available = ", ".join(names)
+0353:     raise AttributeError(f"none of the symbols are available: {available}")
+0354: 
+0355: 
+0356: def _lookup_cuda_error(library: ctypes.WinDLL, code: int) -> str:
+0357:     get_error_name = getattr(library, "cuGetErrorName", None)
+0358:     get_error_string = getattr(library, "cuGetErrorString", None)
+0359:     text_parts: list[str] = []
+0360: 
+0361:     if get_error_name is not None:
+0362:         get_error_name.restype = CUresult
+0363:         get_error_name.argtypes = [CUresult, ctypes.POINTER(ctypes.c_char_p)]
+0364:         name_ptr = ctypes.c_char_p()
+0365:         if int(get_error_name(CUresult(code), ctypes.byref(name_ptr))) == CUDA_SUCCESS and name_ptr.value:
+0366:             text_parts.append(name_ptr.value.decode("utf-8", errors="replace"))
+0367: 
+0368:     if get_error_string is not None:
+0369:         get_error_string.restype = CUresult
+0370:         get_error_string.argtypes = [CUresult, ctypes.POINTER(ctypes.c_char_p)]
+0371:         message_ptr = ctypes.c_char_p()
+0372:         if int(get_error_string(CUresult(code), ctypes.byref(message_ptr))) == CUDA_SUCCESS and message_ptr.value:
+0373:             text_parts.append(message_ptr.value.decode("utf-8", errors="replace"))
+0374: 
+0375:     return " | ".join(text_parts) if text_parts else "unknown CUDA error"
+0376: 
+0377: 
+0378: def _call_cuda(
+0379:     library: ctypes.WinDLL,
+0380:     operation: str,
+0381:     function,
+0382:     *args: Any,
+0383: ) -> int:
+0384:     rc = int(function(*args))
+0385:     if rc != CUDA_SUCCESS:
+0386:         raise CudaDriverError(rc, operation, _lookup_cuda_error(library, rc))
+0387:     return rc

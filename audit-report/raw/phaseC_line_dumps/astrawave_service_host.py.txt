@@ -1,0 +1,291 @@
+﻿0001: """Production-style runtime host for AstraWeave IPC service loops.
+0002: 
+0003: The host wraps :class:`AstraWeaveIpcServer` with a small amount of lifecycle
+0004: management so tests and future CLI entrypoints can start, inspect, and stop the
+0005: runtime deterministically without depending on additional infrastructure.
+0006: """
+0007: 
+0008: from __future__ import annotations
+0009: 
+0010: from dataclasses import dataclass
+0011: from ipaddress import ip_address
+0012: from threading import Event, RLock
+0013: from time import monotonic
+0014: from typing import Any
+0015: from urllib.parse import urlparse
+0016: import os
+0017: 
+0018: from .ipc_server import AstraWeaveIpcServer
+0019: from .service import AstraWeaveService
+0020: 
+0021: 
+0022: def _is_loopback_host(host: str) -> bool:
+0023:     normalized = host.strip().lower()
+0024:     if normalized == "localhost":
+0025:         return True
+0026:     try:
+0027:         return ip_address(normalized).is_loopback
+0028:     except ValueError:
+0029:         return False
+0030: 
+0031: 
+0032: def _require_loopback_host(host: str) -> str:
+0033:     normalized = (host or "").strip() or "127.0.0.1"
+0034:     if not _is_loopback_host(normalized):
+0035:         raise ValueError("endpoint host must be localhost or loopback in v1")
+0036:     return normalized
+0037: 
+0038: 
+0039: @dataclass(frozen=True, slots=True)
+0040: class ServiceHostConfig:
+0041:     """Configuration for the AstraWeave runtime host."""
+0042: 
+0043:     endpoint: str | None = None
+0044:     prefer_named_pipe: bool = False
+0045:     pipe_name: str = r"\\.\pipe\astrawave"
+0046:     host: str = "127.0.0.1"
+0047:     port: int = 0
+0048:     authkey: bytes | None = None
+0049:     poll_interval_seconds: float = 0.05
+0050: 
+0051:     def __post_init__(self) -> None:
+0052:         if self.host is not None and not str(self.host).strip():
+0053:             raise ValueError("host must be a non-empty string when provided")
+0054:         if self.port < 0:
+0055:             raise ValueError("port must be zero or a positive integer")
+0056:         if not self.pipe_name or not self.pipe_name.strip():
+0057:             raise ValueError("pipe_name must be a non-empty string")
+0058:         if self.poll_interval_seconds <= 0:
+0059:             raise ValueError("poll_interval_seconds must be positive")
+0060: 
+0061: 
+0062: @dataclass(frozen=True, slots=True)
+0063: class ServiceHostStatus:
+0064:     """Snapshot of host runtime state for diagnostics and tests."""
+0065: 
+0066:     running: bool
+0067:     transport: str | None
+0068:     endpoint: Any
+0069:     uptime_seconds: float | None
+0070:     served_connections: int
+0071:     served_requests: int
+0072: 
+0073: 
+0074: class AstraWeaveServiceHost:
+0075:     """Manage the lifecycle of an AstraWeave IPC runtime host."""
+0076: 
+0077:     def __init__(
+0078:         self,
+0079:         config: ServiceHostConfig | None = None,
+0080:         *,
+0081:         service: AstraWeaveService | None = None,
+0082:         server: AstraWeaveIpcServer | None = None,
+0083:     ) -> None:
+0084:         self._config = config or ServiceHostConfig()
+0085:         self._service = service
+0086:         self._server = server
+0087:         self._lock = RLock()
+0088:         self._stop_event = Event()
+0089:         self._started_at: float | None = None
+0090:         self._stopped_at: float | None = None
+0091: 
+0092:     @property
+0093:     def config(self) -> ServiceHostConfig:
+0094:         """Return the host configuration."""
+0095: 
+0096:         return self._config
+0097: 
+0098:     @property
+0099:     def service(self) -> AstraWeaveService:
+0100:         """Return the wrapped service instance, creating one if needed."""
+0101: 
+0102:         with self._lock:
+0103:             if self._service is None and self._server is not None:
+0104:                 self._service = self._server.service
+0105:             if self._service is None:
+0106:                 self._service = AstraWeaveService()
+0107:             return self._service
+0108: 
+0109:     @property
+0110:     def server(self) -> AstraWeaveIpcServer | None:
+0111:         """Expose the current server instance, if one has been created."""
+0112: 
+0113:         return self._server
+0114: 
+0115:     @property
+0116:     def is_running(self) -> bool:
+0117:         """Return whether the host-managed server loop is active."""
+0118: 
+0119:         server = self._server
+0120:         return server is not None and server.is_running
+0121: 
+0122:     def __enter__(self) -> "AstraWeaveServiceHost":
+0123:         self.start()
+0124:         return self
+0125: 
+0126:     def __exit__(self, exc_type, exc, tb) -> None:
+0127:         self.stop()
+0128: 
+0129:     def start(self) -> ServiceHostStatus:
+0130:         """Start the underlying IPC server if it is not already running."""
+0131: 
+0132:         with self._lock:
+0133:             server = self._ensure_server()
+0134:             if server.is_running:
+0135:                 return self.status()
+0136: 
+0137:             self._stop_event.clear()
+0138:             self._stopped_at = None
+0139:             try:
+0140:                 server.start()
+0141:             except Exception:
+0142:                 self._stopped_at = monotonic()
+0143:                 self._stop_event.set()
+0144:                 raise
+0145:             self._started_at = monotonic()
+0146:             return self.status()
+0147: 
+0148:     def stop(self) -> ServiceHostStatus:
+0149:         """Stop the host and release the underlying server resources."""
+0150: 
+0151:         with self._lock:
+0152:             self._stop_event.set()
+0153:             server = self._server
+0154:             if server is not None:
+0155:                 try:
+0156:                     server.stop()
+0157:                 finally:
+0158:                     self._stopped_at = monotonic()
+0159:             else:
+0160:                 self._stopped_at = monotonic()
+0161:             return self.status()
+0162: 
+0163:     def serve_forever(self) -> ServiceHostStatus:
+0164:         """Run until :meth:`stop` is called or the server exits unexpectedly."""
+0165: 
+0166:         self.start()
+0167:         while not self._stop_event.wait(self._config.poll_interval_seconds):
+0168:             server = self._server
+0169:             if server is None or not server.is_running:
+0170:                 break
+0171:         return self.status()
+0172: 
+0173:     def run_for(self, duration_seconds: float) -> ServiceHostStatus:
+0174:         """Run the host for a bounded amount of time and then stop it."""
+0175: 
+0176:         if duration_seconds < 0:
+0177:             raise ValueError("duration_seconds must be zero or positive")
+0178:         self.start()
+0179:         self._stop_event.wait(duration_seconds)
+0180:         return self.stop()
+0181: 
+0182:     def status(self) -> ServiceHostStatus:
+0183:         """Return a structured status snapshot for diagnostics."""
+0184: 
+0185:         server = self._server
+0186:         running = server.is_running if server is not None else False
+0187:         uptime_seconds = self._compute_uptime_seconds(running=running)
+0188:         transport = server.transport if server is not None else None
+0189:         endpoint = server.endpoint if server is not None else self._planned_endpoint()
+0190:         served_connections = int(getattr(server, "_served_connections", 0)) if server is not None else 0
+0191:         served_requests = int(getattr(server, "_served_requests", 0)) if server is not None else 0
+0192:         return ServiceHostStatus(
+0193:             running=running,
+0194:             transport=transport,
+0195:             endpoint=endpoint,
+0196:             uptime_seconds=uptime_seconds,
+0197:             served_connections=served_connections,
+0198:             served_requests=served_requests,
+0199:         )
+0200: 
+0201:     @property
+0202:     def endpoint(self) -> Any:
+0203:         """Expose the current or planned endpoint."""
+0204: 
+0205:         return self.status().endpoint
+0206: 
+0207:     @property
+0208:     def transport(self) -> str | None:
+0209:         """Expose the current or planned transport."""
+0210: 
+0211:         return self.status().transport
+0212: 
+0213:     def _ensure_server(self) -> AstraWeaveIpcServer:
+0214:         with self._lock:
+0215:             if self._server is not None:
+0216:                 if self._service is None:
+0217:                     self._service = self._server.service
+0218:                 return self._server
+0219: 
+0220:             prefer_named_pipe, pipe_name, host, port = self._resolve_transport_settings()
+0221:             self._server = AstraWeaveIpcServer(
+0222:                 service=self.service,
+0223:                 prefer_named_pipe=prefer_named_pipe,
+0224:                 pipe_name=pipe_name,
+0225:                 host=host,
+0226:                 port=port,
+0227:                 authkey=self._config.authkey,
+0228:             )
+0229:             return self._server
+0230: 
+0231:     def _resolve_transport_settings(self) -> tuple[bool, str, str, int]:
+0232:         endpoint = (self._config.endpoint or "").strip()
+0233:         if not endpoint or endpoint == "auto":
+0234:             if os.name == "nt" and self._config.prefer_named_pipe:
+0235:                 return True, self._config.pipe_name, self._config.host, self._config.port
+0236:             host = _require_loopback_host(self._config.host)
+0237:             return False, self._config.pipe_name, host, self._config.port
+0238: 
+0239:         if endpoint.startswith("pipe://"):
+0240:             return True, endpoint.removeprefix("pipe://"), self._config.host, self._config.port
+0241: 
+0242:         if endpoint.startswith("\\\\.\\pipe\\"):
+0243:             return True, endpoint, self._config.host, self._config.port
+0244: 
+0245:         parsed = urlparse(endpoint)
+0246:         if parsed.scheme == "tcp":
+0247:             host = _require_loopback_host(parsed.hostname or self._config.host)
+0248:             try:
+0249:                 parsed_port = parsed.port
+0250:             except ValueError as exc:
+0251:                 raise ValueError(f"invalid TCP endpoint port: {endpoint}") from exc
+0252:             port = parsed_port if parsed_port is not None else self._config.port or 0
+0253:             return False, self._config.pipe_name, host, port
+0254: 
+0255:         if ":" in endpoint and not endpoint.startswith("["):
+0256:             host, _, port_text = endpoint.rpartition(":")
+0257:             if not host:
+0258:                 host = self._config.host
+0259:             host = _require_loopback_host(host)
+0260:             try:
+0261:                 port = int(port_text)
+0262:             except ValueError as exc:
+0263:                 raise ValueError(f"invalid TCP endpoint port: {endpoint}") from exc
+0264:             return False, self._config.pipe_name, host, port
+0265: 
+0266:         if os.name == "nt" and self._config.prefer_named_pipe:
+0267:             return True, endpoint, self._config.host, self._config.port
+0268: 
+0269:         return False, self._config.pipe_name, _require_loopback_host(endpoint), self._config.port
+0270: 
+0271:     def _planned_endpoint(self) -> Any:
+0272:         prefer_named_pipe, pipe_name, host, port = self._resolve_transport_settings()
+0273:         if prefer_named_pipe:
+0274:             return pipe_name
+0275:         return (host, port)
+0276: 
+0277:     def _compute_uptime_seconds(self, *, running: bool) -> float | None:
+0278:         if self._started_at is None:
+0279:             return None
+0280:         if running:
+0281:             return round(max(0.0, monotonic() - self._started_at), 6)
+0282:         if self._stopped_at is not None:
+0283:             return round(max(0.0, self._stopped_at - self._started_at), 6)
+0284:         return None
+0285: 
+0286: 
+0287: __all__ = [
+0288:     "AstraWeaveServiceHost",
+0289:     "ServiceHostConfig",
+0290:     "ServiceHostStatus",
+0291: ]

@@ -1,0 +1,278 @@
+﻿0001: """Generate release governance artifacts for AstraWeave RC builds.
+0002: 
+0003: Artifacts:
+0004: - CycloneDX JSON SBOM
+0005: - third-party attribution manifest
+0006: - signing verification report
+0007: - checksums for generated artifacts
+0008: - consolidated compliance manifest
+0009: """
+0010: 
+0011: from __future__ import annotations
+0012: 
+0013: import argparse
+0014: import ast
+0015: import hashlib
+0016: import importlib.metadata
+0017: import json
+0018: import sys
+0019: import uuid
+0020: from datetime import datetime, timezone
+0021: from pathlib import Path
+0022: from typing import Any
+0023: 
+0024: REPO_ROOT = Path(__file__).resolve().parent.parent
+0025: 
+0026: 
+0027: def _utc_now_iso() -> str:
+0028:     return datetime.now(timezone.utc).isoformat()
+0029: 
+0030: 
+0031: def _sha256(path: Path) -> str:
+0032:     h = hashlib.sha256()
+0033:     with path.open("rb") as f:
+0034:         for chunk in iter(lambda: f.read(65536), b""):
+0035:             h.update(chunk)
+0036:     return h.hexdigest()
+0037: 
+0038: 
+0039: def _discover_imports(paths: list[Path]) -> set[str]:
+0040:     imports: set[str] = set()
+0041:     for py_path in paths:
+0042:         try:
+0043:             tree = ast.parse(py_path.read_text(encoding="utf-8"))
+0044:         except (SyntaxError, UnicodeDecodeError):
+0045:             continue
+0046:         for node in ast.walk(tree):
+0047:             if isinstance(node, ast.Import):
+0048:                 for alias in node.names:
+0049:                     imports.add(alias.name.split(".")[0])
+0050:             elif isinstance(node, ast.ImportFrom):
+0051:                 if getattr(node, "level", 0):
+0052:                     continue
+0053:                 if node.module:
+0054:                     imports.add(node.module.split(".")[0])
+0055:     return imports
+0056: 
+0057: 
+0058: def _runtime_python_files() -> list[Path]:
+0059:     candidates = sorted((REPO_ROOT / "astrawave").rglob("*.py"))
+0060:     return [p for p in candidates if "__pycache__" not in p.parts]
+0061: 
+0062: 
+0063: def _resolve_third_party_modules(imports: set[str]) -> list[dict[str, Any]]:
+0064:     stdlib = getattr(sys, "stdlib_module_names", set())
+0065:     package_map = importlib.metadata.packages_distributions()
+0066: 
+0067:     third_party = sorted(
+0068:         name
+0069:         for name in imports
+0070:         if name
+0071:         and name not in stdlib
+0072:         and name not in {"astrawave", "__future__"}
+0073:     )
+0074: 
+0075:     rows: list[dict[str, Any]] = []
+0076:     for module in third_party:
+0077:         distributions = package_map.get(module, [])
+0078:         if distributions:
+0079:             for dist_name in distributions:
+0080:                 try:
+0081:                     md = importlib.metadata.metadata(dist_name)
+0082:                     version = importlib.metadata.version(dist_name)
+0083:                 except importlib.metadata.PackageNotFoundError:
+0084:                     md = {}
+0085:                     version = "unknown"
+0086:                 rows.append(
+0087:                     {
+0088:                         "module": module,
+0089:                         "distribution": dist_name,
+0090:                         "version": version,
+0091:                         "license": md.get("License", "UNKNOWN") or "UNKNOWN",
+0092:                     }
+0093:                 )
+0094:         else:
+0095:             rows.append(
+0096:                 {
+0097:                     "module": module,
+0098:                     "distribution": None,
+0099:                     "version": "unknown",
+0100:                     "license": "UNKNOWN",
+0101:                 }
+0102:             )
+0103:     return rows
+0104: 
+0105: 
+0106: def _cyclonedx_component_ref(name: str, version: str) -> str:
+0107:     return f"pkg:pypi/{name}@{version}"
+0108: 
+0109: 
+0110: def _build_sbom(third_party: list[dict[str, Any]]) -> dict[str, Any]:
+0111:     root_ref = _cyclonedx_component_ref("astrawave", "0.1.0-rc")
+0112:     components = []
+0113:     dependencies = []
+0114: 
+0115:     for dep in third_party:
+0116:         dist = dep["distribution"] or dep["module"]
+0117:         version = dep["version"] or "unknown"
+0118:         bom_ref = _cyclonedx_component_ref(dist, version)
+0119:         components.append(
+0120:             {
+0121:                 "type": "library",
+0122:                 "name": dist,
+0123:                 "version": version,
+0124:                 "bom-ref": bom_ref,
+0125:                 "licenses": [
+0126:                     {
+0127:                         "license": {
+0128:                             "name": dep["license"] or "UNKNOWN",
+0129:                         }
+0130:                     }
+0131:                 ],
+0132:                 "properties": [
+0133:                     {"name": "astrawave.module", "value": dep["module"]},
+0134:                 ],
+0135:             }
+0136:         )
+0137:         dependencies.append(bom_ref)
+0138: 
+0139:     sbom = {
+0140:         "bomFormat": "CycloneDX",
+0141:         "specVersion": "1.5",
+0142:         "serialNumber": f"urn:uuid:{uuid.uuid4()}",
+0143:         "version": 1,
+0144:         "metadata": {
+0145:             "timestamp": _utc_now_iso(),
+0146:             "tools": [
+0147:                 {
+0148:                     "vendor": "AstraWeave",
+0149:                     "name": "generate_compliance_artifacts.py",
+0150:                     "version": "1",
+0151:                 }
+0152:             ],
+0153:             "component": {
+0154:                 "type": "application",
+0155:                 "name": "astrawave",
+0156:                 "version": "0.1.0-rc",
+0157:                 "bom-ref": root_ref,
+0158:                 "licenses": [
+0159:                     {
+0160:                         "license": {
+0161:                             "id": "Apache-2.0",
+0162:                         }
+0163:                     }
+0164:                 ],
+0165:             },
+0166:         },
+0167:         "components": components,
+0168:         "dependencies": [
+0169:             {
+0170:                 "ref": root_ref,
+0171:                 "dependsOn": dependencies,
+0172:             }
+0173:         ],
+0174:     }
+0175:     return sbom
+0176: 
+0177: 
+0178: def _write_json(path: Path, payload: dict[str, Any]) -> None:
+0179:     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+0180: 
+0181: 
+0182: def generate_compliance_bundle(run_id: str, out_dir: Path) -> dict[str, Any]:
+0183:     out_dir.mkdir(parents=True, exist_ok=True)
+0184: 
+0185:     imports = _discover_imports(_runtime_python_files())
+0186:     third_party = _resolve_third_party_modules(imports)
+0187:     sbom_payload = _build_sbom(third_party=third_party)
+0188: 
+0189:     sbom_path = out_dir / f"sbom_{run_id}.cdx.json"
+0190:     _write_json(sbom_path, sbom_payload)
+0191: 
+0192:     attribution_payload = {
+0193:         "run_id": run_id,
+0194:         "generated_at": _utc_now_iso(),
+0195:         "project_license_target": "Apache-2.0",
+0196:         "runtime_scope": "astrawave package imports",
+0197:         "third_party_dependencies": third_party,
+0198:         "notes": (
+0199:             [
+0200:                 "No non-stdlib runtime dependencies detected in astrawave package imports."
+0201:             ]
+0202:             if not third_party
+0203:             else []
+0204:         ),
+0205:     }
+0206:     attribution_path = out_dir / f"attribution_{run_id}.json"
+0207:     _write_json(attribution_path, attribution_payload)
+0208: 
+0209:     signing_payload = {
+0210:         "run_id": run_id,
+0211:         "generated_at": _utc_now_iso(),
+0212:         "channel": "rc",
+0213:         "artifact_type": "source-only",
+0214:         "binary_artifacts_discovered": [],
+0215:         "signing_policy_for_binaries": "required",
+0216:         "verification_status": "not_applicable_for_source_only_rc",
+0217:         "verification_notes": [
+0218:             "No compiled binaries were generated in this RC evidence bundle.",
+0219:             "If binary artifacts are later produced, code-sign verification becomes mandatory.",
+0220:         ],
+0221:     }
+0222:     signing_path = out_dir / f"signing_verification_{run_id}.json"
+0223:     _write_json(signing_path, signing_payload)
+0224: 
+0225:     checksums_payload = {
+0226:         "run_id": run_id,
+0227:         "generated_at": _utc_now_iso(),
+0228:         "algorithm": "sha256",
+0229:         "files": [
+0230:             {"path": str(sbom_path), "sha256": _sha256(sbom_path)},
+0231:             {"path": str(attribution_path), "sha256": _sha256(attribution_path)},
+0232:             {"path": str(signing_path), "sha256": _sha256(signing_path)},
+0233:         ],
+0234:     }
+0235:     checksums_path = out_dir / f"checksums_{run_id}.json"
+0236:     _write_json(checksums_path, checksums_payload)
+0237: 
+0238:     manifest_payload = {
+0239:         "run_id": run_id,
+0240:         "generated_at": _utc_now_iso(),
+0241:         "artifacts": {
+0242:             "sbom": str(sbom_path),
+0243:             "attribution": str(attribution_path),
+0244:             "signing_verification": str(signing_path),
+0245:             "checksums": str(checksums_path),
+0246:         },
+0247:         "summary": {
+0248:             "third_party_dependency_count": len(third_party),
+0249:             "source_only_rc": True,
+0250:         },
+0251:     }
+0252:     manifest_path = out_dir / f"compliance_manifest_{run_id}.json"
+0253:     _write_json(manifest_path, manifest_payload)
+0254:     return manifest_payload
+0255: 
+0256: 
+0257: def main() -> int:
+0258:     parser = argparse.ArgumentParser(description="Generate RC compliance artifacts.")
+0259:     parser.add_argument(
+0260:         "--run-id",
+0261:         default=datetime.now().strftime("%Y-%m-%d"),
+0262:         help="Stable run id suffix for generated artifacts.",
+0263:     )
+0264:     parser.add_argument(
+0265:         "--out-dir",
+0266:         default="reports/release_artifacts",
+0267:         help="Directory for generated compliance artifacts.",
+0268:     )
+0269:     args = parser.parse_args()
+0270: 
+0271:     out_dir = (REPO_ROOT / args.out_dir).resolve()
+0272:     manifest = generate_compliance_bundle(run_id=args.run_id, out_dir=out_dir)
+0273:     print(json.dumps({"ok": True, "manifest": manifest}, indent=2, sort_keys=True))
+0274:     return 0
+0275: 
+0276: 
+0277: if __name__ == "__main__":
+0278:     raise SystemExit(main())

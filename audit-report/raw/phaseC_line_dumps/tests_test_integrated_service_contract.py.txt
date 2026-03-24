@@ -1,0 +1,128 @@
+﻿0001: """Integrated service contract tests for security and telemetry behavior."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import unittest
+0006: 
+0007: from astrawave import AstraWeaveService
+0008: from astrawave.errors import ApiError, ApiErrorCode
+0009: from astrawave.security import CallerIdentity, SecurityGuard, SecurityPolicy
+0010: from astrawave.telemetry import (
+0011:     TelemetryPipeline,
+0012:     TelemetryPolicy,
+0013:     TelemetryReasonCode,
+0014: )
+0015: from astrawave.types import MemoryTier
+0016: 
+0017: 
+0018: class IntegratedServiceHarness:
+0019:     """Small test harness that composes service, security, and telemetry."""
+0020: 
+0021:     def __init__(
+0022:         self,
+0023:         *,
+0024:         owner_sid: str = "S-1-5-21-1000",
+0025:         create_session_limit_per_minute: int = 6,
+0026:         max_concurrent_sessions_per_caller: int = 8,
+0027:     ) -> None:
+0028:         self.guard = SecurityGuard(
+0029:             SecurityPolicy(
+0030:                 service_owner_sid=owner_sid,
+0031:                 create_session_limit_per_minute=create_session_limit_per_minute,
+0032:                 max_concurrent_sessions_per_caller=max_concurrent_sessions_per_caller,
+0033:             )
+0034:         )
+0035:         self.telemetry = TelemetryPipeline(TelemetryPolicy())
+0036:         self.service = AstraWeaveService(
+0037:             security_guard=self.guard,
+0038:             telemetry_pipeline=self.telemetry,
+0039:         )
+0040:         self.session_owners: dict[str, str] = {}
+0041: 
+0042:     def create_session(self, caller: CallerIdentity) -> str:
+0043:         session_id = self.service.CreateSession(caller_identity=caller)
+0044:         self.session_owners[session_id] = caller.user_sid
+0045:         return session_id
+0046: 
+0047:     def load_model(self, caller: CallerIdentity, session_id: str, model_name: str) -> None:
+0048:         self.service.LoadModel(session_id, model_name, caller_identity=caller)
+0049: 
+0050:     def register_tensor(self, caller: CallerIdentity, session_id: str, tensor_name: str, size_bytes: int) -> None:
+0051:         self.service.RegisterTensor(session_id, tensor_name, size_bytes, caller_identity=caller)
+0052: 
+0053:     def run_step(self, caller: CallerIdentity, session_id: str, step_name: str = "run") -> dict[str, object]:
+0054:         return self.service.RunStep(session_id, step_name=step_name, caller_identity=caller)
+0055: 
+0056:     def get_residency(self, caller: CallerIdentity, session_id: str):
+0057:         return self.service.GetResidency(session_id, caller_identity=caller)
+0058: 
+0059:     def close_session(self, caller: CallerIdentity, session_id: str) -> None:
+0060:         self.service.CloseSession(session_id, caller_identity=caller)
+0061:         self.session_owners.pop(session_id, None)
+0062: 
+0063: 
+0064: class IntegratedServiceContractTests(unittest.TestCase):
+0065:     def setUp(self) -> None:
+0066:         self.owner = CallerIdentity(user_sid="S-1-5-21-1000", pid=1001)
+0067:         self.foreign = CallerIdentity(user_sid="S-1-5-21-2000", pid=2002)
+0068: 
+0069:     def test_session_ownership_isolation_denies_cross_user_access(self) -> None:
+0070:         harness = IntegratedServiceHarness()
+0071:         session_id = harness.create_session(self.owner)
+0072:         harness.load_model(self.owner, session_id, "demo-model")
+0073:         harness.register_tensor(self.owner, session_id, "kv", 1024)
+0074: 
+0075:         with self.assertRaises(ApiError) as cm:
+0076:             harness.get_residency(self.foreign, session_id)
+0077:         self.assertEqual(cm.exception.code, ApiErrorCode.AUTH_DENIED)
+0078: 
+0079:         with self.assertRaises(ApiError) as cm:
+0080:             harness.close_session(self.foreign, session_id)
+0081:         self.assertEqual(cm.exception.code, ApiErrorCode.AUTH_DENIED)
+0082: 
+0083:     def test_create_session_through_service_enforces_security_guard_limits(self) -> None:
+0084:         rate_limited_harness = IntegratedServiceHarness()
+0085:         for _ in range(6):
+0086:             rate_limited_harness.create_session(self.owner)
+0087: 
+0088:         with self.assertRaises(ApiError) as cm:
+0089:             rate_limited_harness.create_session(self.owner)
+0090:         self.assertEqual(cm.exception.code, ApiErrorCode.RATE_LIMITED)
+0091: 
+0092:         capped_harness = IntegratedServiceHarness(create_session_limit_per_minute=100)
+0093:         for _ in range(8):
+0094:             capped_harness.create_session(self.owner)
+0095: 
+0096:         with self.assertRaises(ApiError) as cm:
+0097:             capped_harness.create_session(self.owner)
+0098:         self.assertEqual(cm.exception.code, ApiErrorCode.RESOURCE_EXHAUSTED)
+0099: 
+0100:     def test_service_emits_telemetry_events_with_stable_reason_codes_and_correlation_ids(self) -> None:
+0101:         harness = IntegratedServiceHarness()
+0102:         session_id = harness.create_session(self.owner)
+0103:         harness.load_model(self.owner, session_id, "demo-model")
+0104:         harness.register_tensor(self.owner, session_id, "kv", 1024)
+0105:         harness.service.SetTierHint(session_id, "kv", MemoryTier.HOT, caller_identity=self.owner)
+0106:         harness.service.PrefetchPlan(session_id, caller_identity=self.owner)
+0107:         harness.run_step(self.owner, session_id, step_name="decode")
+0108:         harness.close_session(self.owner, session_id)
+0109: 
+0110:         records = harness.telemetry.records
+0111:         self.assertGreaterEqual(len(records), 3)
+0112: 
+0113:         reason_codes = [record.reason_code for record in records]
+0114:         self.assertIn(TelemetryReasonCode.UNKNOWN, reason_codes)
+0115:         self.assertIn(TelemetryReasonCode.TRANSFER_PREFETCH, reason_codes)
+0116: 
+0117:         for record in records:
+0118:             self.assertRegex(record.correlation_id, r"^tel-[0-9a-f-]{36}$")
+0119:             self.assertIsNotNone(record.session_id_hash)
+0120:             self.assertNotEqual(record.session_id_hash, session_id)
+0121: 
+0122:         event_types = {record.event_type.value for record in records}
+0123:         self.assertIn("custom", event_types)
+0124:         self.assertIn("transfer_event", event_types)
+0125: 
+0126: 
+0127: if __name__ == "__main__":
+0128:     unittest.main()

@@ -1,0 +1,494 @@
+﻿0001: """Local-only trust boundary helpers for AstraWeave.
+0002: 
+0003: This module is intentionally framework-agnostic. It provides pure data types
+0004: and a small in-memory guard that service code can use to enforce caller
+0005: identity, authorization, rate limits, and concurrent-session caps.
+0006: """
+0007: 
+0008: from __future__ import annotations
+0009: 
+0010: from collections import deque
+0011: import ctypes
+0012: import errno
+0013: from dataclasses import dataclass, field
+0014: from enum import Enum
+0015: import os
+0016: from threading import RLock
+0017: from time import monotonic
+0018: from typing import Callable, Deque, Dict, FrozenSet, Optional, Tuple
+0019: 
+0020: from ctypes import wintypes
+0021: 
+0022: from .errors import ApiError, ApiErrorCode
+0023: 
+0024: CallerKey = Tuple[str, int]
+0025: Clock = Callable[[], float]
+0026: PidLookup = Callable[[int], bool]
+0027: SidLookup = Callable[[int], str | None]
+0028: 
+0029: 
+0030: class _SidAndAttributes(ctypes.Structure):
+0031:     _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+0032: 
+0033: 
+0034: class _TokenUser(ctypes.Structure):
+0035:     _fields_ = [("User", _SidAndAttributes)]
+0036: 
+0037: CREATE_SESSION_LIMIT_PER_MINUTE = 6
+0038: MAX_CONCURRENT_SESSIONS_PER_CALLER = 8
+0039: RATE_WINDOW_SECONDS = 60.0
+0040: 
+0041: 
+0042: class SecurityDenyReason(str, Enum):
+0043:     """Deterministic denial reasons for security decisions."""
+0044: 
+0045:     INVALID_CALLER = "INVALID_CALLER"
+0046:     UNKNOWN_CALLER = "UNKNOWN_CALLER"
+0047:     RATE_LIMIT_EXCEEDED = "RATE_LIMIT_EXCEEDED"
+0048:     MAX_CONCURRENT_SESSIONS = "MAX_CONCURRENT_SESSIONS"
+0049: 
+0050: 
+0051: ERROR_CODE_BY_DENY_REASON: dict[SecurityDenyReason, ApiErrorCode] = {
+0052:     SecurityDenyReason.INVALID_CALLER: ApiErrorCode.INVALID_ARGUMENT,
+0053:     SecurityDenyReason.UNKNOWN_CALLER: ApiErrorCode.AUTH_DENIED,
+0054:     SecurityDenyReason.RATE_LIMIT_EXCEEDED: ApiErrorCode.RATE_LIMITED,
+0055:     SecurityDenyReason.MAX_CONCURRENT_SESSIONS: ApiErrorCode.RESOURCE_EXHAUSTED,
+0056: }
+0057: 
+0058: 
+0059: @dataclass(frozen=True, slots=True)
+0060: class CallerIdentity:
+0061:     """Identity tuple used by the trust-boundary helpers.
+0062: 
+0063:     The service authorizes callers by user SID and tracks usage by the full
+0064:     caller key (SID + PID) so same-user processes remain isolated for rate
+0065:     limiting and session-count accounting.
+0066:     """
+0067: 
+0068:     user_sid: str
+0069:     pid: int
+0070: 
+0071:     def __post_init__(self) -> None:
+0072:         if not self.user_sid or not self.user_sid.strip():
+0073:             raise ValueError("user_sid must be a non-empty string")
+0074:         if not isinstance(self.pid, int) or isinstance(self.pid, bool) or self.pid <= 0:
+0075:             raise ValueError("pid must be a positive integer")
+0076: 
+0077:     @property
+0078:     def key(self) -> CallerKey:
+0079:         return (self.user_sid, self.pid)
+0080: 
+0081: 
+0082: @dataclass(frozen=True, slots=True)
+0083: class SecurityPolicy:
+0084:     """Immutable authorization policy for the local service."""
+0085: 
+0086:     service_owner_sid: str
+0087:     allowed_cross_user_sids: FrozenSet[str] = field(default_factory=frozenset)
+0088:     create_session_limit_per_minute: int = CREATE_SESSION_LIMIT_PER_MINUTE
+0089:     max_concurrent_sessions_per_caller: int = MAX_CONCURRENT_SESSIONS_PER_CALLER
+0090:     rate_window_seconds: float = RATE_WINDOW_SECONDS
+0091: 
+0092:     def __post_init__(self) -> None:
+0093:         if not self.service_owner_sid or not self.service_owner_sid.strip():
+0094:             raise ValueError("service_owner_sid must be a non-empty string")
+0095:         if self.create_session_limit_per_minute <= 0:
+0096:             raise ValueError("create_session_limit_per_minute must be positive")
+0097:         if self.max_concurrent_sessions_per_caller <= 0:
+0098:             raise ValueError("max_concurrent_sessions_per_caller must be positive")
+0099:         if self.rate_window_seconds <= 0:
+0100:             raise ValueError("rate_window_seconds must be positive")
+0101:         normalized = frozenset(
+0102:             sid.strip() for sid in self.allowed_cross_user_sids if sid and sid.strip()
+0103:         )
+0104:         object.__setattr__(self, "allowed_cross_user_sids", normalized)
+0105: 
+0106: 
+0107: @dataclass(frozen=True, slots=True)
+0108: class SecurityDecision:
+0109:     """Result of an authorization or admission check."""
+0110: 
+0111:     allowed: bool
+0112:     error_code: ApiErrorCode = ApiErrorCode.OK
+0113:     reason: Optional[SecurityDenyReason] = None
+0114:     message: str = ""
+0115:     retry_after_seconds: Optional[int] = None
+0116: 
+0117:     def to_api_error(self) -> Optional[ApiError]:
+0118:         """Convert a deny decision into a stable API error object."""
+0119: 
+0120:         if self.allowed:
+0121:             return None
+0122:         return ApiError(self.error_code, self.message or self.error_code.value)
+0123: 
+0124: 
+0125: def decision_allowed(message: str = "") -> SecurityDecision:
+0126:     """Create an allow decision."""
+0127: 
+0128:     return SecurityDecision(True, ApiErrorCode.OK, None, message)
+0129: 
+0130: 
+0131: def decision_denied(
+0132:     reason: SecurityDenyReason,
+0133:     message: str,
+0134:     *,
+0135:     retry_after_seconds: Optional[int] = None,
+0136: ) -> SecurityDecision:
+0137:     """Create a deterministic deny decision for a given reason."""
+0138: 
+0139:     return SecurityDecision(
+0140:         allowed=False,
+0141:         error_code=ERROR_CODE_BY_DENY_REASON[reason],
+0142:         reason=reason,
+0143:         message=message,
+0144:         retry_after_seconds=retry_after_seconds,
+0145:     )
+0146: 
+0147: 
+0148: def is_valid_caller_identity(caller: CallerIdentity) -> bool:
+0149:     """Return `True` when the caller identity is structurally valid."""
+0150: 
+0151:     try:
+0152:         return (
+0153:             bool(caller.user_sid.strip())
+0154:             and isinstance(caller.pid, int)
+0155:             and not isinstance(caller.pid, bool)
+0156:             and caller.pid > 0
+0157:         )
+0158:     except AttributeError:
+0159:         return False
+0160: 
+0161: 
+0162: def is_plausible_user_sid(user_sid: str) -> bool:
+0163:     """Return `True` when the caller SID is structurally safe to trust-check."""
+0164: 
+0165:     if not isinstance(user_sid, str):
+0166:         return False
+0167:     normalized = user_sid.strip()
+0168:     if not normalized or len(normalized) > 256:
+0169:         return False
+0170:     if any(ord(ch) < 32 for ch in normalized):
+0171:         return False
+0172:     if any(ch.isspace() for ch in normalized):
+0173:         return False
+0174:     return normalized.startswith("S-")
+0175: 
+0176: 
+0177: def process_exists(pid: int) -> bool:
+0178:     """Return `True` when the PID currently maps to a live local process."""
+0179: 
+0180:     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+0181:         return False
+0182:     if os.name == "nt":
+0183:         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+0184:         process_handle = kernel32.OpenProcess(0x1000, False, pid)
+0185:         if process_handle:
+0186:             kernel32.CloseHandle(process_handle)
+0187:             return True
+0188:         return ctypes.get_last_error() == 5
+0189:     try:
+0190:         os.kill(pid, 0)
+0191:     except OSError as exc:
+0192:         return exc.errno == errno.EPERM
+0193:     return True
+0194: 
+0195: 
+0196: def resolve_process_user_sid(pid: int) -> str | None:
+0197:     """Return the Windows SID string for a process owner when available."""
+0198: 
+0199:     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+0200:         return None
+0201:     if os.name != "nt":
+0202:         return None
+0203: 
+0204:     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+0205:     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+0206: 
+0207:     process_handle = wintypes.HANDLE()
+0208:     token_handle = wintypes.HANDLE()
+0209:     sid_string = wintypes.LPWSTR()
+0210:     process_handle = kernel32.OpenProcess(0x1000, False, pid)
+0211:     if not process_handle:
+0212:         return None
+0213: 
+0214:     try:
+0215:         if not advapi32.OpenProcessToken(process_handle, 0x0008, ctypes.byref(token_handle)):
+0216:             return None
+0217:         try:
+0218:             required = wintypes.DWORD(0)
+0219:             advapi32.GetTokenInformation(token_handle, 1, None, 0, ctypes.byref(required))
+0220:             if required.value <= 0:
+0221:                 return None
+0222: 
+0223:             buffer = ctypes.create_string_buffer(required.value)
+0224:             if not advapi32.GetTokenInformation(token_handle, 1, buffer, required.value, ctypes.byref(required)):
+0225:                 return None
+0226: 
+0227:             token_user = _TokenUser.from_buffer_copy(buffer)
+0228:             sid_ptr = ctypes.c_void_p(token_user.User.Sid)
+0229:             if not sid_ptr.value:
+0230:                 return None
+0231:             if not advapi32.ConvertSidToStringSidW(sid_ptr, ctypes.byref(sid_string)):
+0232:                 return None
+0233:             try:
+0234:                 return str(sid_string.value) if sid_string.value else None
+0235:             finally:
+0236:                 ctypes.windll.kernel32.LocalFree(sid_string)
+0237:         finally:
+0238:             kernel32.CloseHandle(token_handle)
+0239:     finally:
+0240:         kernel32.CloseHandle(process_handle)
+0241: 
+0242: 
+0243: def resolve_current_user_sid() -> str | None:
+0244:     """Return the current process owner SID when the platform can provide it."""
+0245: 
+0246:     return resolve_process_user_sid(os.getpid())
+0247: 
+0248: 
+0249: def attest_caller_identity(
+0250:     caller: CallerIdentity,
+0251:     *,
+0252:     pid_lookup: PidLookup | None = None,
+0253:     sid_lookup: SidLookup | None = None,
+0254: ) -> SecurityDecision:
+0255:     """Attest the caller against the live process table when possible."""
+0256: 
+0257:     if not is_valid_caller_identity(caller) or not is_plausible_user_sid(caller.user_sid):
+0258:         return decision_denied(
+0259:             SecurityDenyReason.INVALID_CALLER,
+0260:             "caller identity is malformed",
+0261:         )
+0262: 
+0263:     pid_lookup = pid_lookup or process_exists
+0264:     sid_lookup = sid_lookup or resolve_process_user_sid
+0265: 
+0266:     try:
+0267:         pid_is_active = pid_lookup(caller.pid)
+0268:     except Exception:
+0269:         pid_is_active = False
+0270:     if not pid_is_active:
+0271:         return decision_denied(
+0272:             SecurityDenyReason.UNKNOWN_CALLER,
+0273:             "caller PID is not active on this host",
+0274:         )
+0275: 
+0276:     try:
+0277:         resolved_sid = sid_lookup(caller.pid)
+0278:     except Exception:
+0279:         resolved_sid = None
+0280: 
+0281:     if resolved_sid is not None and resolved_sid.strip() != caller.user_sid.strip():
+0282:         return decision_denied(
+0283:             SecurityDenyReason.UNKNOWN_CALLER,
+0284:             "caller SID does not match the active process owner",
+0285:         )
+0286: 
+0287:     if resolved_sid is not None:
+0288:         return decision_allowed("caller attested by PID and process owner SID")
+0289:     return decision_allowed("caller PID verified; OS SID attestation unavailable")
+0290: 
+0291: 
+0292: class SecurityGuard:
+0293:     """In-memory authorization and abuse-control helper.
+0294: 
+0295:     The guard enforces:
+0296:     - same-user default allow
+0297:     - cross-user explicit allowlist
+0298:     - rate limiting for CreateSession attempts
+0299:     - maximum concurrent sessions per caller
+0300: 
+0301:     It is safe to use from service code and easy to unit test thanks to the
+0302:     injectable monotonic clock.
+0303:     """
+0304: 
+0305:     def __init__(
+0306:         self,
+0307:         policy: SecurityPolicy,
+0308:         *,
+0309:         clock: Clock = monotonic,
+0310:     ) -> None:
+0311:         self._policy = policy
+0312:         self._clock = clock
+0313:         self._lock = RLock()
+0314:         self._create_session_attempts: Dict[CallerKey, Deque[float]] = {}
+0315:         self._active_sessions: Dict[CallerKey, int] = {}
+0316: 
+0317:     @property
+0318:     def policy(self) -> SecurityPolicy:
+0319:         """Return the current security policy."""
+0320: 
+0321:         return self._policy
+0322: 
+0323:     def authorize_caller(self, caller: CallerIdentity) -> SecurityDecision:
+0324:         """Check whether a caller is allowed to use the local service."""
+0325: 
+0326:         if not is_valid_caller_identity(caller):
+0327:             return decision_denied(
+0328:                 SecurityDenyReason.INVALID_CALLER,
+0329:                 "caller identity is malformed",
+0330:             )
+0331: 
+0332:         if caller.user_sid == self._policy.service_owner_sid:
+0333:             return decision_allowed("same-user caller accepted")
+0334: 
+0335:         if caller.user_sid in self._policy.allowed_cross_user_sids:
+0336:             return decision_allowed("cross-user caller accepted by policy")
+0337: 
+0338:         return decision_denied(
+0339:             SecurityDenyReason.UNKNOWN_CALLER,
+0340:             "caller is not authorized for this local service",
+0341:         )
+0342: 
+0343:     def can_create_session(self, caller: CallerIdentity, *, now: Optional[float] = None) -> SecurityDecision:
+0344:         """Check admission for `CreateSession` without mutating state."""
+0345: 
+0346:         auth = self.authorize_caller(caller)
+0347:         if not auth.allowed:
+0348:             return auth
+0349: 
+0350:         with self._lock:
+0351:             moment = self._resolve_now(now)
+0352:             attempts = self._get_attempt_bucket(caller.key)
+0353:             self._prune_old_attempts(attempts, moment)
+0354: 
+0355:             if len(attempts) >= self._policy.create_session_limit_per_minute:
+0356:                 retry_after = self._retry_after_seconds(attempts, moment)
+0357:                 return decision_denied(
+0358:                     SecurityDenyReason.RATE_LIMIT_EXCEEDED,
+0359:                     "CreateSession rate limit exceeded",
+0360:                     retry_after_seconds=retry_after,
+0361:                 )
+0362: 
+0363:             active_sessions = self._active_sessions.get(caller.key, 0)
+0364:             if active_sessions >= self._policy.max_concurrent_sessions_per_caller:
+0365:                 return decision_denied(
+0366:                     SecurityDenyReason.MAX_CONCURRENT_SESSIONS,
+0367:                     "maximum concurrent sessions reached for caller",
+0368:                 )
+0369: 
+0370:             return decision_allowed("caller admitted for CreateSession")
+0371: 
+0372:     def admit_create_session(self, caller: CallerIdentity, *, now: Optional[float] = None) -> SecurityDecision:
+0373:         """Atomically approve and record a `CreateSession` attempt.
+0374: 
+0375:         Call this only when the service is ready to create a session. On
+0376:         success, the caller is counted toward both the rolling rate limit and
+0377:         the concurrent-session cap. Denials caused by concurrent-session
+0378:         exhaustion still count as attempts so repeated hammering is not free.
+0379:         """
+0380: 
+0381:         auth = self.authorize_caller(caller)
+0382:         if not auth.allowed:
+0383:             return auth
+0384: 
+0385:         with self._lock:
+0386:             moment = self._resolve_now(now)
+0387:             attempts = self._get_attempt_bucket(caller.key)
+0388:             self._prune_old_attempts(attempts, moment)
+0389: 
+0390:             if len(attempts) >= self._policy.create_session_limit_per_minute:
+0391:                 retry_after = self._retry_after_seconds(attempts, moment)
+0392:                 return decision_denied(
+0393:                     SecurityDenyReason.RATE_LIMIT_EXCEEDED,
+0394:                     "CreateSession rate limit exceeded",
+0395:                     retry_after_seconds=retry_after,
+0396:                 )
+0397: 
+0398:             attempts.append(moment)
+0399:             active_sessions = self._active_sessions.get(caller.key, 0)
+0400:             if active_sessions >= self._policy.max_concurrent_sessions_per_caller:
+0401:                 return decision_denied(
+0402:                     SecurityDenyReason.MAX_CONCURRENT_SESSIONS,
+0403:                     "maximum concurrent sessions reached for caller",
+0404:                 )
+0405: 
+0406:             self._active_sessions[caller.key] = active_sessions + 1
+0407:             return decision_allowed("CreateSession admitted")
+0408: 
+0409:     def release_session(self, caller: CallerIdentity) -> None:
+0410:         """Release one active session slot for a caller.
+0411: 
+0412:         The operation is intentionally idempotent. Releasing when no active
+0413:         session is tracked is a no-op.
+0414:         """
+0415: 
+0416:         if not is_valid_caller_identity(caller):
+0417:             return
+0418: 
+0419:         with self._lock:
+0420:             active_sessions = self._active_sessions.get(caller.key, 0)
+0421:             if active_sessions <= 1:
+0422:                 self._active_sessions.pop(caller.key, None)
+0423:             else:
+0424:                 self._active_sessions[caller.key] = active_sessions - 1
+0425: 
+0426:     def active_session_count(self, caller: CallerIdentity) -> int:
+0427:         """Return the currently tracked active sessions for a caller."""
+0428: 
+0429:         if not is_valid_caller_identity(caller):
+0430:             return 0
+0431:         with self._lock:
+0432:             return self._active_sessions.get(caller.key, 0)
+0433: 
+0434:     def snapshot(self) -> dict[CallerKey, dict[str, int]]:
+0435:         """Return a test-friendly snapshot of internal counters."""
+0436: 
+0437:         with self._lock:
+0438:             return {
+0439:                 caller_key: {
+0440:                     "active_sessions": self._active_sessions.get(caller_key, 0),
+0441:                     "recent_create_session_attempts": len(
+0442:                         self._create_session_attempts.get(caller_key, deque())
+0443:                     ),
+0444:                 }
+0445:                 for caller_key in set(self._create_session_attempts) | set(self._active_sessions)
+0446:             }
+0447: 
+0448:     def _resolve_now(self, now: Optional[float]) -> float:
+0449:         return self._clock() if now is None else now
+0450: 
+0451:     def _get_attempt_bucket(self, caller_key: CallerKey) -> Deque[float]:
+0452:         bucket = self._create_session_attempts.get(caller_key)
+0453:         if bucket is None:
+0454:             bucket = deque()
+0455:             self._create_session_attempts[caller_key] = bucket
+0456:         return bucket
+0457: 
+0458:     def _prune_old_attempts(self, attempts: Deque[float], now: float) -> None:
+0459:         cutoff = now - self._policy.rate_window_seconds
+0460:         while attempts and attempts[0] < cutoff:
+0461:             attempts.popleft()
+0462: 
+0463:     def _retry_after_seconds(self, attempts: Deque[float], now: float) -> int:
+0464:         if not attempts:
+0465:             return int(self._policy.rate_window_seconds)
+0466:         oldest = attempts[0]
+0467:         remaining = self._policy.rate_window_seconds - (now - oldest)
+0468:         if remaining <= 0:
+0469:             return 0
+0470:         return int(remaining) + (0 if remaining.is_integer() else 1)
+0471: 
+0472: 
+0473: __all__ = [
+0474:     "attest_caller_identity",
+0475:     "CallerIdentity",
+0476:     "Clock",
+0477:     "CREATE_SESSION_LIMIT_PER_MINUTE",
+0478:     "ERROR_CODE_BY_DENY_REASON",
+0479:     "MAX_CONCURRENT_SESSIONS_PER_CALLER",
+0480:     "PidLookup",
+0481:     "RATE_WINDOW_SECONDS",
+0482:     "SecurityDecision",
+0483:     "SecurityDenyReason",
+0484:     "SecurityGuard",
+0485:     "SecurityPolicy",
+0486:     "SidLookup",
+0487:     "decision_allowed",
+0488:     "decision_denied",
+0489:     "is_valid_caller_identity",
+0490:     "is_plausible_user_sid",
+0491:     "process_exists",
+0492:     "resolve_current_user_sid",
+0493:     "resolve_process_user_sid",
+0494: ]

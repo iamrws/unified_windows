@@ -1,0 +1,11 @@
+﻿............................................................ [ 61%]
+.....................................                                    [100%]
+============================== warnings summary ===============================
+..\..\..\..\AppData\Roaming\Python\Python313\site-packages\_pytest\cacheprovider.py:475
+  C:\Users\grzeg\AppData\Roaming\Python\Python313\site-packages\_pytest\cacheprovider.py:475: PytestCacheWarning: could not create cache path C:\Users\grzeg\Documents\Jito\testmarch24\unified_windows\.pytest_cache\v\cache\nodeids: [WinError 5] Access is denied: 'C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\pytest-cache-files-dizwyc9y'
+    config.cache.set("cache/nodeids", sorted(self.cached_nodeids))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+97 passed, 1 warning, 12 subtests passed in 15.50s
+duration_ms=16729.3589
+exit_code=0

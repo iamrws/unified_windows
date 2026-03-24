@@ -1,0 +1,95 @@
+﻿0001: """Core AstraWeave domain types."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: from dataclasses import dataclass, field
+0006: from enum import Enum
+0007: from typing import Mapping
+0008: 
+0009: 
+0010: class MemoryTier(str, Enum):
+0011:     """Logical residency tiers used by the policy engine."""
+0012: 
+0013:     HOT = "HOT"
+0014:     WARM = "WARM"
+0015:     COLD = "COLD"
+0016: 
+0017: 
+0018: class ResidencyState(str, Enum):
+0019:     """Concrete residency state for a tensor or session-owned resource."""
+0020: 
+0021:     VRAM = "VRAM"
+0022:     PINNED_RAM = "PINNED_RAM"
+0023:     PAGEABLE_RAM = "PAGEABLE_RAM"
+0024:     CPU_ONLY = "CPU_ONLY"
+0025: 
+0026: 
+0027: class PolicyProfile(str, Enum):
+0028:     """Supported policy profiles."""
+0029: 
+0030:     STABILITY = "stability"
+0031:     THROUGHPUT = "throughput"
+0032: 
+0033: 
+0034: class SessionState(str, Enum):
+0035:     """Lifecycle states for a session."""
+0036: 
+0037:     NEW = "NEW"
+0038:     SESSION_CREATED = "SESSION_CREATED"
+0039:     MODEL_LOADED = "MODEL_LOADED"
+0040:     READY = "READY"
+0041:     RUNNING = "RUNNING"
+0042:     DEGRADED = "DEGRADED"
+0043:     CLOSED = "CLOSED"
+0044:     FAILED = "FAILED"
+0045: 
+0046: 
+0047: @dataclass(frozen=True, slots=True)
+0048: class PressureSnapshot:
+0049:     """Snapshot of the current memory pressure for a session."""
+0050: 
+0051:     session_id: str
+0052:     vram_budget_bytes: int
+0053:     vram_used_bytes: int
+0054:     pinned_ram_used_bytes: int
+0055:     pressure_level: float
+0056:     policy_profile: PolicyProfile
+0057:     timestamp_ms: int
+0058: 
+0059: 
+0060: @dataclass(frozen=True, slots=True)
+0061: class ResidencySnapshot:
+0062:     """Summarized residency view for a session."""
+0063: 
+0064:     session_id: str
+0065:     session_state: SessionState
+0066:     primary_tier: MemoryTier
+0067:     tensor_residency: Mapping[str, ResidencyState] = field(default_factory=dict)
+0068:     vram_bytes: int = 0
+0069:     pinned_ram_bytes: int = 0
+0070:     pageable_ram_bytes: int = 0
+0071:     cpu_only_bytes: int = 0
+0072:     active_run_in_progress: bool = False
+0073: 
+0074: 
+0075: @dataclass(frozen=True, slots=True)
+0076: class TransferEvent:
+0077:     """Telemetry-friendly migration event."""
+0078: 
+0079:     session_id: str
+0080:     source: ResidencyState
+0081:     destination: ResidencyState
+0082:     bytes_moved: int
+0083:     reason_code: str
+0084:     timestamp_ms: int
+0085: 
+0086: 
+0087: @dataclass(frozen=True, slots=True)
+0088: class FallbackEvent:
+0089:     """Telemetry-friendly fallback event."""
+0090: 
+0091:     session_id: str
+0092:     step: str
+0093:     reason_code: str
+0094:     timestamp_ms: int
+0095: 

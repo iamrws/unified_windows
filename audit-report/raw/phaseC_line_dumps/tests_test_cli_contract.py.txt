@@ -1,0 +1,300 @@
+﻿0001: """Contract tests for the AstraWeave CLI."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import json
+0006: import os
+0007: import hashlib
+0008: import subprocess
+0009: import sys
+0010: import unittest
+0011: from pathlib import Path
+0012: import tempfile
+0013: 
+0014: 
+0015: class AstraWeaveCliContractTests(unittest.TestCase):
+0016:     def setUp(self) -> None:
+0017:         self.endpoint = "local://default"
+0018:         self.python = sys.executable
+0019:         self.repo_root = Path(__file__).resolve().parents[1]
+0020:         self.state_path = self._endpoint_path(self.endpoint)
+0021:         self._cleanup_state()
+0022: 
+0023:     def tearDown(self) -> None:
+0024:         self._cleanup_state()
+0025: 
+0026:     def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
+0027:         env = os.environ.copy()
+0028:         env["PYTHONPATH"] = str(self.repo_root)
+0029:         return subprocess.run(
+0030:             [self.python, "-m", "astrawave.cli", "--endpoint", self.endpoint, *args],
+0031:             cwd=self.repo_root,
+0032:             env=env,
+0033:             text=True,
+0034:             capture_output=True,
+0035:             check=False,
+0036:         )
+0037: 
+0038:     def run_cli_default(self, *args: str) -> subprocess.CompletedProcess[str]:
+0039:         env = os.environ.copy()
+0040:         env["PYTHONPATH"] = str(self.repo_root)
+0041:         return subprocess.run(
+0042:             [self.python, "-m", "astrawave.cli", *args],
+0043:             cwd=self.repo_root,
+0044:             env=env,
+0045:             text=True,
+0046:             capture_output=True,
+0047:             check=False,
+0048:         )
+0049: 
+0050:     def _endpoint_path(self, endpoint: str) -> Path:
+0051:         digest = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()
+0052:         return Path(tempfile.gettempdir()) / "astrawave_cli_state" / f"{digest}.json"
+0053: 
+0054:     def _cleanup_state(self) -> None:
+0055:         if self.state_path.exists():
+0056:             self.state_path.unlink()
+0057: 
+0058:     def parse_json(self, payload: str) -> dict[str, object]:
+0059:         data = json.loads(payload)
+0060:         self.assertIsInstance(data, dict)
+0061:         return data
+0062: 
+0063:     def assert_success_envelope(self, payload: str) -> dict[str, object]:
+0064:         data = self.parse_json(payload)
+0065:         self.assertTrue(data["ok"])
+0066:         self.assertIn("result", data)
+0067:         return data
+0068: 
+0069:     def assert_error_envelope(self, payload: str) -> dict[str, object]:
+0070:         data = self.parse_json(payload)
+0071:         self.assertFalse(data["ok"])
+0072:         self.assertIn("error", data)
+0073:         error = data["error"]
+0074:         self.assertIsInstance(error, dict)
+0075:         self.assertIn("code", error)
+0076:         self.assertIn("message", error)
+0077:         return data
+0078: 
+0079:     def test_success_output_is_json_envelope(self) -> None:
+0080:         completed = self.run_cli("create-session")
+0081:         self.assertEqual(completed.returncode, 0, completed.stderr)
+0082: 
+0083:         envelope = self.assert_success_envelope(completed.stdout)
+0084:         result = envelope["result"]
+0085:         self.assertIsInstance(result, dict)
+0086:         self.assertIn("session_id", result)
+0087: 
+0088:     def test_error_output_is_json_envelope_and_nonzero_exit(self) -> None:
+0089:         completed = self.run_cli("load-model", "missing-session", "demo-model")
+0090:         self.assertNotEqual(completed.returncode, 0)
+0091: 
+0092:         envelope = self.assert_error_envelope(completed.stderr)
+0093:         error = envelope["error"]
+0094:         self.assertEqual(error["code"], "AW_ERR_NOT_FOUND")
+0095: 
+0096:     def test_local_backend_snapshot_mode_supports_multi_command_flow(self) -> None:
+0097:         create = self.run_cli("create-session")
+0098:         self.assertEqual(create.returncode, 0, create.stderr)
+0099:         create_envelope = self.assert_success_envelope(create.stdout)
+0100:         session_id = create_envelope["result"]["session_id"]
+0101: 
+0102:         load = self.run_cli("load-model", str(session_id), "demo-model")
+0103:         self.assertEqual(load.returncode, 0, load.stderr)
+0104:         self.assert_success_envelope(load.stdout)
+0105: 
+0106:         register = self.run_cli("register-tensor", str(session_id), "kv", "1024")
+0107:         self.assertEqual(register.returncode, 0, register.stderr)
+0108:         self.assert_success_envelope(register.stdout)
+0109: 
+0110:         tier = self.run_cli("set-tier-hint", str(session_id), "kv", "HOT")
+0111:         self.assertEqual(tier.returncode, 0, tier.stderr)
+0112:         self.assert_success_envelope(tier.stdout)
+0113: 
+0114:         prefetch = self.run_cli("prefetch-plan", str(session_id))
+0115:         self.assertEqual(prefetch.returncode, 0, prefetch.stderr)
+0116:         prefetch_envelope = self.assert_success_envelope(prefetch.stdout)
+0117:         self.assertIn("migrations", prefetch_envelope["result"])
+0118: 
+0119:         step = self.run_cli("run-step", str(session_id), "--step-name", "decode")
+0120:         self.assertEqual(step.returncode, 0, step.stderr)
+0121:         step_envelope = self.assert_success_envelope(step.stdout)
+0122:         self.assertEqual(step_envelope["result"]["session_id"], session_id)
+0123: 
+0124:         residency = self.run_cli("get-residency", str(session_id))
+0125:         self.assertEqual(residency.returncode, 0, residency.stderr)
+0126:         residency_envelope = self.assert_success_envelope(residency.stdout)
+0127:         self.assertEqual(residency_envelope["result"]["session_id"], session_id)
+0128: 
+0129:         close = self.run_cli("close-session", str(session_id))
+0130:         self.assertEqual(close.returncode, 0, close.stderr)
+0131:         close_envelope = self.assert_success_envelope(close.stdout)
+0132:         self.assertEqual(close_envelope["result"]["closed"], True)
+0133: 
+0134:     def test_local_backend_accepts_runtime_backend_and_generation_flags(self) -> None:
+0135:         create = self.run_cli("--backend", "local", "create-session")
+0136:         self.assertEqual(create.returncode, 0, create.stderr)
+0137:         session_id = self.assert_success_envelope(create.stdout)["result"]["session_id"]
+0138: 
+0139:         load = self.run_cli(
+0140:             "--backend",
+0141:             "local",
+0142:             "load-model",
+0143:             str(session_id),
+0144:             "demo-model",
+0145:             "--runtime-backend",
+0146:             "ollama",
+0147:         )
+0148:         self.assertEqual(load.returncode, 0, load.stderr)
+0149:         load_envelope = self.assert_success_envelope(load.stdout)
+0150:         self.assertEqual(load_envelope["result"]["runtime_backend"], "ollama")
+0151: 
+0152:         step = self.run_cli(
+0153:             "--backend",
+0154:             "local",
+0155:             "run-step",
+0156:             str(session_id),
+0157:             "--step-name",
+0158:             "decode",
+0159:             "--prompt",
+0160:             "Write a one-line summary.",
+0161:             "--max-tokens",
+0162:             "16",
+0163:             "--temperature",
+0164:             "0.2",
+0165:         )
+0166:         self.assertEqual(step.returncode, 0, step.stderr)
+0167:         step_envelope = self.assert_success_envelope(step.stdout)
+0168:         self.assertEqual(step_envelope["result"]["prompt"], "Write a one-line summary.")
+0169:         self.assertEqual(step_envelope["result"]["generation"]["max_tokens"], 16)
+0170:         self.assertEqual(step_envelope["result"]["generation"]["temperature"], 0.2)
+0171:         self.assertEqual(step_envelope["result"]["inference_result"]["backend"], "ollama")
+0172: 
+0173:     def test_local_backend_accepts_runtime_tuning_flags(self) -> None:
+0174:         create = self.run_cli("--backend", "local", "create-session")
+0175:         self.assertEqual(create.returncode, 0, create.stderr)
+0176:         session_id = self.assert_success_envelope(create.stdout)["result"]["session_id"]
+0177: 
+0178:         load = self.run_cli(
+0179:             "--backend",
+0180:             "local",
+0181:             "load-model",
+0182:             str(session_id),
+0183:             "qwen2.5:14b",
+0184:             "--runtime-profile",
+0185:             "vram_constrained",
+0186:             "--runtime-option",
+0187:             "num_ctx=4096",
+0188:             "--runtime-option",
+0189:             "num_batch=1",
+0190:         )
+0191:         self.assertEqual(load.returncode, 0, load.stderr)
+0192:         load_envelope = self.assert_success_envelope(load.stdout)
+0193:         self.assertEqual(load_envelope["result"]["runtime_profile"], "vram_constrained")
+0194:         self.assertEqual(load_envelope["result"]["runtime_backend_options"], {"num_ctx": 4096, "num_batch": 1})
+0195: 
+0196:         step = self.run_cli(
+0197:             "--backend",
+0198:             "local",
+0199:             "run-step",
+0200:             str(session_id),
+0201:             "--step-name",
+0202:             "decode",
+0203:             "--prompt",
+0204:             "Write a one-line summary.",
+0205:             "--runtime-profile-override",
+0206:             "memory_saver",
+0207:             "--runtime-option-override",
+0208:             "num_predict=64",
+0209:             "--runtime-option-override",
+0210:             "top_p=0.9",
+0211:         )
+0212:         self.assertEqual(step.returncode, 0, step.stderr)
+0213:         step_envelope = self.assert_success_envelope(step.stdout)
+0214:         self.assertEqual(step_envelope["result"]["generation"]["runtime_profile"], "vram_constrained")
+0215:         self.assertEqual(step_envelope["result"]["generation"]["runtime_profile_override"], "memory_saver")
+0216:         self.assertEqual(
+0217:             step_envelope["result"]["generation"]["runtime_backend_options_override"],
+0218:             {"num_predict": 64, "top_p": 0.9},
+0219:         )
+0220:         self.assertEqual(step_envelope["result"]["inference_result"]["runtime_profile"], "vram_constrained")
+0221: 
+0222:     def test_runtime_option_validation_is_typed_for_cli(self) -> None:
+0223:         create = self.run_cli("--backend", "local", "create-session")
+0224:         self.assertEqual(create.returncode, 0, create.stderr)
+0225:         session_id = self.assert_success_envelope(create.stdout)["result"]["session_id"]
+0226: 
+0227:         completed = self.run_cli(
+0228:             "--backend",
+0229:             "local",
+0230:             "load-model",
+0231:             str(session_id),
+0232:             "demo-model",
+0233:             "--runtime-option",
+0234:             "num_ctx=0",
+0235:         )
+0236:         self.assertNotEqual(completed.returncode, 0)
+0237:         envelope = self.assert_error_envelope(completed.stderr)
+0238:         self.assertEqual(envelope["error"]["code"], "AW_ERR_INVALID_ARGUMENT")
+0239: 
+0240:     def test_default_backend_prefers_remote_and_fails_cleanly_without_server(self) -> None:
+0241:         auto_state = self._endpoint_path("auto")
+0242:         if auto_state.exists():
+0243:             auto_state.unlink()
+0244:         self.addCleanup(lambda: auto_state.exists() and auto_state.unlink())
+0245: 
+0246:         completed = self.run_cli_default("create-session")
+0247:         self.assertNotEqual(completed.returncode, 0)
+0248:         envelope = self.assert_error_envelope(completed.stderr)
+0249:         self.assertEqual(envelope["error"]["code"], "AW_ERR_INTERNAL")
+0250:         self.assertFalse(auto_state.exists())
+0251: 
+0252:     def test_local_backend_can_be_selected_explicitly(self) -> None:
+0253:         completed = self.run_cli_default("--backend", "local", "create-session")
+0254:         self.assertEqual(completed.returncode, 0, completed.stderr)
+0255:         envelope = self.assert_success_envelope(completed.stdout)
+0256:         self.assertIn("session_id", envelope["result"])
+0257: 
+0258:     def test_invalid_tcp_endpoint_is_reported_as_typed_json_error(self) -> None:
+0259:         completed = self.run_cli_default("--endpoint", "tcp://127.0.0.1:notaport", "create-session")
+0260:         self.assertNotEqual(completed.returncode, 0)
+0261:         envelope = self.assert_error_envelope(completed.stderr)
+0262:         self.assertEqual(envelope["error"]["code"], "AW_ERR_INVALID_ARGUMENT")
+0263:         self.assertNotIn("Traceback", completed.stderr)
+0264: 
+0265:     def test_serve_rejects_non_localhost_tcp_bind(self) -> None:
+0266:         completed = self.run_cli_default(
+0267:             "serve",
+0268:             "--transport",
+0269:             "tcp",
+0270:             "--endpoint",
+0271:             "tcp://0.0.0.0:8765",
+0272:             "--duration-seconds",
+0273:             "0",
+0274:         )
+0275:         self.assertNotEqual(completed.returncode, 0)
+0276:         envelope = self.assert_error_envelope(completed.stderr)
+0277:         self.assertEqual(envelope["error"]["code"], "AW_ERR_INVALID_ARGUMENT")
+0278:         self.assertNotIn("Traceback", completed.stderr)
+0279: 
+0280:     def test_hardware_probe_returns_structured_json_even_without_nvidia_tools(self) -> None:
+0281:         completed = self.run_cli_default("hardware-probe")
+0282:         self.assertEqual(completed.returncode, 0, completed.stderr)
+0283: 
+0284:         envelope = self.assert_success_envelope(completed.stdout)
+0285:         result = envelope["result"]
+0286:         self.assertIsInstance(result, dict)
+0287:         self.assertIn("timestamp_ms", result)
+0288:         self.assertIsInstance(result["timestamp_ms"], int)
+0289:         self.assertIn("warnings", result)
+0290:         self.assertIsInstance(result["warnings"], list)
+0291:         self.assertIn("effective", result)
+0292:         self.assertIsInstance(result["effective"], dict)
+0293:         self.assertIn("nvidia_smi", result)
+0294:         self.assertIsInstance(result["nvidia_smi"], dict)
+0295:         self.assertIn("nvml", result)
+0296:         self.assertIsInstance(result["nvml"], dict)
+0297: 
+0298: 
+0299: if __name__ == "__main__":
+0300:     unittest.main()

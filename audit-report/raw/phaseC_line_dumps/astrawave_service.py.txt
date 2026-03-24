@@ -1,0 +1,1207 @@
+﻿0001: """In-memory AstraWeave service prototype with integrated runtime modules."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: from dataclasses import dataclass, field
+0006: from inspect import Parameter, signature
+0007: import os
+0008: from threading import RLock
+0009: from time import time_ns
+0010: from typing import Any, Callable, Dict, Iterable, Mapping, Optional
+0011: from uuid import uuid4
+0012: 
+0013: try:
+0014:     from .cuda_runtime import DEFAULT_DEVICE_INDEX, DEFAULT_TRANSFER_BYTES, run_cuda_transfer as _run_cuda_transfer
+0015: except Exception:  # pragma: no cover - optional runtime path
+0016:     DEFAULT_DEVICE_INDEX = 0
+0017:     DEFAULT_TRANSFER_BYTES = 1_048_576
+0018:     _run_cuda_transfer = None
+0019: 
+0020: from .errors import ApiError, ApiErrorCode
+0021: from .fallback import FallbackController, FallbackState, FallbackStep
+0022: from .inference_runtime import (
+0023:     InferenceRuntime,
+0024:     create_inference_runtime,
+0025:     resolve_backend_and_model_name,
+0026: )
+0027: from .runtime_tuning import merge_backend_options, resolve_runtime_tuning
+0028: from .security import CallerIdentity, SecurityGuard, SecurityPolicy, resolve_current_user_sid
+0029: from .telemetry import (
+0030:     FallbackEvent as TelemetryFallbackEvent,
+0031:     TelemetryEvent,
+0032:     TelemetryEventType,
+0033:     TelemetryPipeline,
+0034:     TelemetryPolicy,
+0035:     TelemetryReasonCode,
+0036:     TransferEvent as TelemetryTransferEvent,
+0037:     new_correlation_id,
+0038: )
+0039: from .types import (
+0040:     FallbackEvent,
+0041:     MemoryTier,
+0042:     PolicyProfile,
+0043:     PressureSnapshot,
+0044:     ResidencySnapshot,
+0045:     ResidencyState,
+0046:     SessionState,
+0047:     TransferEvent,
+0048: )
+0049: 
+0050: HIGH_PRESSURE_THRESHOLD = 0.75
+0051: DEFAULT_SERVICE_OWNER_SID = resolve_current_user_sid() or "S-1-5-21-AstraWeave-Owner"
+0052: DEFAULT_RUNSTEP_MODE = "auto"
+0053: RUNSTEP_MODE_ENV = "ASTRAWEAVE_RUNSTEP_MODE"
+0054: RUNSTEP_MODE_ENABLE_ENV = "ASTRAWEAVE_ENABLE_HARDWARE_RUNSTEP"
+0055: HARDWARE_TRANSFER_BYTES_ENV = "ASTRAWEAVE_HARDWARE_TRANSFER_BYTES"
+0056: HARDWARE_DEVICE_INDEX_ENV = "ASTRAWEAVE_HARDWARE_DEVICE_INDEX"
+0057: HARDWARE_HOLD_MS_ENV = "ASTRAWEAVE_HARDWARE_HOLD_MS"
+0058: DEFAULT_HARDWARE_HOLD_MS = 75
+0059: 
+0060: HardwareExecutor = Callable[..., dict[str, Any]]
+0061: InferenceRuntimeFactory = Callable[[str], InferenceRuntime]
+0062: 
+0063: 
+0064: @dataclass(frozen=True, slots=True, kw_only=True)
+0065: class _SessionLifecycleEvent(TelemetryEvent):
+0066:     """Internal telemetry event for session lifecycle boundaries."""
+0067: 
+0068:     event_type = TelemetryEventType.CUSTOM
+0069:     action: str
+0070:     detail: str | None = None
+0071: 
+0072: 
+0073: @dataclass(slots=True)
+0074: class _TensorRecord:
+0075:     """Tracked tensor metadata used by the service prototype."""
+0076: 
+0077:     name: str
+0078:     size_bytes: int
+0079:     tier_hint: MemoryTier = MemoryTier.WARM
+0080:     residency: ResidencyState = ResidencyState.PINNED_RAM
+0081: 
+0082: 
+0083: @dataclass(slots=True)
+0084: class _Session:
+0085:     """Tracked in-memory session state."""
+0086: 
+0087:     session_id: str
+0088:     owner_identity: CallerIdentity
+0089:     state: SessionState = SessionState.SESSION_CREATED
+0090:     model_name: Optional[str] = None
+0091:     inference_backend: str = "simulation"
+0092:     resolved_model_name: Optional[str] = None
+0093:     inference_metadata: dict[str, Any] = field(default_factory=dict)
+0094:     policy_profile: PolicyProfile = PolicyProfile.STABILITY
+0095:     tensors: Dict[str, _TensorRecord] = field(default_factory=dict)
+0096:     active_run: bool = False
+0097:     closed: bool = False
+0098:     fallback_current_step: FallbackStep | None = None
+0099:     fallback_last_step_change_ms: int | None = None
+0100:     fallback_step_change_history_ms: tuple[int, ...] = ()
+0101:     fallback_stability_mode: bool = False
+0102:     fallback_events: list[FallbackEvent] = field(default_factory=list)
+0103:     transfer_history: list[TransferEvent] = field(default_factory=list)
+0104:     lock: RLock = field(default_factory=RLock)
+0105:     vram_budget_bytes: int = 8 * 1024**3
+0106:     vram_used_bytes: int = 0
+0107:     pinned_ram_used_bytes: int = 0
+0108:     pageable_ram_used_bytes: int = 0
+0109:     cpu_only_used_bytes: int = 0
+0110: 
+0111: 
+0112: class AstraWeaveService:
+0113:     """Prototype implementation of AstraWeave service APIs.
+0114: 
+0115:     The service enforces the lifecycle described in `docs/api-contract.md`:
+0116: 
+0117:     `CreateSession -> LoadModel -> RegisterTensor/SetTierHint/PrefetchPlan -> RunStep -> CloseSession`
+0118: 
+0119:     It integrates the existing support modules:
+0120:     - `SecurityGuard` for caller admission and ownership checks
+0121:     - `TelemetryPipeline` for local-only structured telemetry
+0122:     - `FallbackController` for deterministic pressure-driven fallback
+0123:     """
+0124: 
+0125:     def __init__(
+0126:         self,
+0127:         *,
+0128:         security_guard: SecurityGuard | None = None,
+0129:         telemetry_pipeline: TelemetryPipeline | None = None,
+0130:         fallback_controller: FallbackController | None = None,
+0131:         runstep_mode: str | None = None,
+0132:         hardware_executor: HardwareExecutor | None = None,
+0133:         inference_runtime_factory: InferenceRuntimeFactory | None = None,
+0134:     ) -> None:
+0135:         self._security = security_guard or SecurityGuard(
+0136:             SecurityPolicy(service_owner_sid=DEFAULT_SERVICE_OWNER_SID)
+0137:         )
+0138:         self._telemetry = telemetry_pipeline or TelemetryPipeline(
+0139:             policy=TelemetryPolicy(local_only=True, export_opt_in=False)
+0140:         )
+0141:         self._fallback_controller = fallback_controller or FallbackController()
+0142:         self._service_owner_sid = self._security.policy.service_owner_sid
+0143:         self._sessions: Dict[str, _Session] = {}
+0144:         self._closed_sessions: Dict[str, _Session] = {}
+0145:         self._lock = RLock()
+0146:         self._runstep_mode_override = runstep_mode
+0147:         self._hardware_executor = hardware_executor or _run_cuda_transfer
+0148:         self._inference_runtime_factory = inference_runtime_factory or create_inference_runtime
+0149: 
+0150:     @property
+0151:     def telemetry(self) -> TelemetryPipeline:
+0152:         """Expose the telemetry pipeline for tests and diagnostics."""
+0153: 
+0154:         return self._telemetry
+0155: 
+0156:     @property
+0157:     def security_guard(self) -> SecurityGuard:
+0158:         """Expose the security guard for tests and diagnostics."""
+0159: 
+0160:         return self._security
+0161: 
+0162:     @property
+0163:     def fallback_controller(self) -> FallbackController:
+0164:         """Expose the fallback controller for tests and diagnostics."""
+0165: 
+0166:         return self._fallback_controller
+0167: 
+0168:     def CreateSession(self, caller_identity: CallerIdentity | None = None) -> str:
+0169:         """Create a new session and return its opaque identifier."""
+0170: 
+0171:         caller = self._resolve_creation_caller(caller_identity)
+0172:         admission = self._security.admit_create_session(caller)
+0173:         if not admission.allowed:
+0174:             raise admission.to_api_error()
+0175: 
+0176:         session_id = str(uuid4())
+0177:         session = _Session(session_id=session_id, owner_identity=caller)
+0178:         with self._lock:
+0179:             self._sessions[session_id] = session
+0180: 
+0181:         try:
+0182:             self._record_lifecycle_event(
+0183:                 session=session,
+0184:                 caller=caller,
+0185:                 action="create_session",
+0186:                 detail="session_created",
+0187:             )
+0188:         except Exception:
+0189:             with self._lock:
+0190:                 self._sessions.pop(session_id, None)
+0191:             self._security.release_session(caller)
+0192:             raise
+0193: 
+0194:         return session_id
+0195: 
+0196:     def LoadModel(
+0197:         self,
+0198:         session_id: str,
+0199:         model_name: str,
+0200:         *,
+0201:         runtime_backend: str | None = None,
+0202:         runtime_profile: str | None = None,
+0203:         runtime_backend_options: Mapping[str, Any] | None = None,
+0204:         backend_options: Mapping[str, Any] | None = None,
+0205:         caller_identity: CallerIdentity | None = None,
+0206:     ) -> None:
+0207:         """Attach a model to a session and transition it toward READY."""
+0208: 
+0209:         session, _caller = self._get_authorized_session(session_id, caller_identity, "LoadModel")
+0210:         self._require_state(session, {SessionState.SESSION_CREATED}, "LoadModel")
+0211:         backend_name, resolved_model_name = resolve_backend_and_model_name(
+0212:             model_name,
+0213:             runtime_backend=runtime_backend,
+0214:         )
+0215:         tuning = resolve_runtime_tuning(
+0216:             resolved_model_name,
+0217:             runtime_profile=runtime_profile,
+0218:             backend_options=merge_backend_options(backend_options, runtime_backend_options),
+0219:         )
+0220:         runtime = self._inference_runtime_factory(backend_name)
+0221:         binding = self._call_runtime_method(
+0222:             runtime,
+0223:             "load_model",
+0224:             resolved_model_name,
+0225:             runtime_profile=tuning.profile_name,
+0226:             backend_options=tuning.backend_options,
+0227:         )
+0228:         with session.lock:
+0229:             session.model_name = model_name
+0230:             session.inference_backend = binding.backend
+0231:             session.resolved_model_name = binding.resolved_model_name
+0232:             session.inference_metadata = self._build_inference_metadata(
+0233:                 binding.metadata,
+0234:                 requested_model_name=binding.requested_model_name,
+0235:                 runtime_profile=tuning.profile_name,
+0236:                 model_size_billion=tuning.model_size_billion,
+0237:                 model_size_label=tuning.model_size_label,
+0238:                 backend_options=tuning.backend_options,
+0239:             )
+0240:             session.state = SessionState.MODEL_LOADED
+0241:             session.state = SessionState.READY
+0242: 
+0243:     def RegisterTensor(
+0244:         self,
+0245:         session_id: str,
+0246:         tensor_name: str,
+0247:         size_bytes: int,
+0248:         *,
+0249:         caller_identity: CallerIdentity | None = None,
+0250:     ) -> None:
+0251:         """Register a tensor and initialize its residency metadata."""
+0252: 
+0253:         session, _caller = self._get_authorized_session(session_id, caller_identity, "RegisterTensor")
+0254:         self._require_state(
+0255:             session,
+0256:             {SessionState.MODEL_LOADED, SessionState.READY, SessionState.DEGRADED},
+0257:             "RegisterTensor",
+0258:         )
+0259:         if not tensor_name:
+0260:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "tensor_name must not be empty")
+0261:         if size_bytes <= 0:
+0262:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "size_bytes must be positive")
+0263:         with session.lock:
+0264:             if tensor_name in session.tensors:
+0265:                 raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "tensor already registered")
+0266:             session.tensors[tensor_name] = _TensorRecord(
+0267:                 name=tensor_name,
+0268:                 size_bytes=size_bytes,
+0269:                 tier_hint=MemoryTier.WARM,
+0270:                 residency=ResidencyState.PINNED_RAM,
+0271:             )
+0272:             session.pinned_ram_used_bytes += size_bytes
+0273:             session.state = SessionState.READY
+0274: 
+0275:     def SetTierHint(
+0276:         self,
+0277:         session_id: str,
+0278:         tensor_name: str,
+0279:         tier: MemoryTier,
+0280:         *,
+0281:         caller_identity: CallerIdentity | None = None,
+0282:     ) -> None:
+0283:         """Update the tier hint for a previously registered tensor."""
+0284: 
+0285:         session, _caller = self._get_authorized_session(session_id, caller_identity, "SetTierHint")
+0286:         self._require_state(
+0287:             session,
+0288:             {SessionState.MODEL_LOADED, SessionState.READY, SessionState.DEGRADED},
+0289:             "SetTierHint",
+0290:         )
+0291:         with session.lock:
+0292:             tensor = self._get_tensor(session, tensor_name)
+0293:             tensor.tier_hint = self._normalize_tier(tier)
+0294: 
+0295:     def PrefetchPlan(
+0296:         self,
+0297:         session_id: str,
+0298:         *,
+0299:         caller_identity: CallerIdentity | None = None,
+0300:     ) -> list[TransferEvent]:
+0301:         """Generate a simple prefetch plan for the session."""
+0302: 
+0303:         session, caller = self._get_authorized_session(session_id, caller_identity, "PrefetchPlan")
+0304:         self._require_state(session, {SessionState.READY, SessionState.DEGRADED}, "PrefetchPlan")
+0305:         with session.lock:
+0306:             plan: list[TransferEvent] = []
+0307:             for tensor in sorted(session.tensors.values(), key=lambda item: item.name):
+0308:                 destination = self._residency_for_tier(tensor.tier_hint)
+0309:                 if tensor.residency != destination:
+0310:                     event = self._migrate_tensor(
+0311:                         session=session,
+0312:                         tensor=tensor,
+0313:                         destination=destination,
+0314:                         reason_code="prefetch",
+0315:                         telemetry_reason=TelemetryReasonCode.TRANSFER_PREFETCH,
+0316:                         telemetry_mode=session.policy_profile.value,
+0317:                         telemetry_direction="prefetch",
+0318:                         caller=caller,
+0319:                     )
+0320:                     plan.append(event)
+0321:             return plan
+0322: 
+0323:     def RunStep(
+0324:         self,
+0325:         session_id: str,
+0326:         step_name: str = "run",
+0327:         *,
+0328:         prompt: str | None = None,
+0329:         max_tokens: int | None = None,
+0330:         temperature: float | None = None,
+0331:         system_prompt: str | None = None,
+0332:         runtime_profile_override: str | None = None,
+0333:         runtime_backend_options_override: Mapping[str, Any] | None = None,
+0334:         backend_options: Mapping[str, Any] | None = None,
+0335:         caller_identity: CallerIdentity | None = None,
+0336:     ) -> dict[str, object]:
+0337:         """Execute one inference step with single-flight protection per session."""
+0338: 
+0339:         session, caller = self._get_authorized_session(session_id, caller_identity, "RunStep")
+0340:         self._require_state(session, {SessionState.READY, SessionState.DEGRADED}, "RunStep")
+0341:         if not step_name:
+0342:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "step_name must not be empty")
+0343: 
+0344:         with session.lock:
+0345:             if session.active_run:
+0346:                 raise ApiError(ApiErrorCode.CONFLICT_RUN_IN_PROGRESS, "a RunStep is already active")
+0347:             session.active_run = True
+0348:             session.state = SessionState.RUNNING
+0349: 
+0350:         try:
+0351:             now_ms = self._now_ms()
+0352:             pressure_level = self._compute_pressure_level(session)
+0353:             fallback_result: dict[str, object] | None = None
+0354:             requested_run_mode = self._resolve_runstep_mode()
+0355:             run_mode = "simulation"
+0356:             hardware_result: dict[str, object] | None = None
+0357:             inference_result: dict[str, object] | None = None
+0358: 
+0359:             if pressure_level >= HIGH_PRESSURE_THRESHOLD or session.fallback_stability_mode:
+0360:                 fallback_result = self._advance_fallback(session=session, caller=caller, now_ms=now_ms)
+0361:             if requested_run_mode in {"auto", "hardware"}:
+0362:                 hardware_result = self._execute_hardware_runstep(session=session, step_name=step_name)
+0363:                 if isinstance(hardware_result, dict) and bool(hardware_result.get("ok")):
+0364:                     run_mode = "hardware"
+0365:                 elif isinstance(hardware_result, dict):
+0366:                     hardware_result.setdefault("fallback_to_simulation", True)
+0367:             if prompt is not None:
+0368:                 effective_backend_options = self._resolve_effective_backend_options(
+0369:                     session=session,
+0370:                     runtime_profile_override=runtime_profile_override,
+0371:                     runtime_backend_options_override=runtime_backend_options_override,
+0372:                     backend_options=backend_options,
+0373:                 )
+0374:                 inference_result = self._execute_inference_runstep(
+0375:                     session=session,
+0376:                     step_name=step_name,
+0377:                     prompt=prompt,
+0378:                     max_tokens=max_tokens,
+0379:                     temperature=temperature,
+0380:                     system_prompt=system_prompt,
+0381:                     backend_options=effective_backend_options,
+0382:                 )
+0383: 
+0384:             with session.lock:
+0385:                 if session.state != SessionState.FAILED:
+0386:                     if (
+0387:                         requested_run_mode in {"auto", "hardware"}
+0388:                         and isinstance(hardware_result, dict)
+0389:                         and not bool(hardware_result.get("ok"))
+0390:                     ):
+0391:                         session.state = SessionState.DEGRADED
+0392:                     elif isinstance(inference_result, dict) and not bool(inference_result.get("ok", True)):
+0393:                         session.state = SessionState.DEGRADED
+0394:                     else:
+0395:                         session.state = SessionState.DEGRADED if (
+0396:                             session.fallback_stability_mode
+0397:                             or session.fallback_current_step is not None
+0398:                             or pressure_level >= HIGH_PRESSURE_THRESHOLD
+0399:                         ) else SessionState.READY
+0400: 
+0401:                 correlation_id = f"{session.session_id}:{step_name}:{new_correlation_id('run')}"
+0402:                 response: dict[str, object] = {
+0403:                     "session_id": session.session_id,
+0404:                     "step_name": step_name,
+0405:                     "correlation_id": correlation_id,
+0406:                     "state": session.state,
+0407:                     "policy_profile": session.policy_profile,
+0408:                     "pressure_level": pressure_level,
+0409:                     "fallback_step": session.fallback_current_step.value
+0410:                     if session.fallback_current_step is not None
+0411:                     else None,
+0412:                     "fallback_result": fallback_result,
+0413:                     "requested_run_mode": requested_run_mode,
+0414:                     "run_mode": run_mode,
+0415:                     "hardware_result": hardware_result,
+0416:                 }
+0417:                 if prompt is not None:
+0418:                     response["inference_result"] = inference_result
+0419:                 return response
+0420:         finally:
+0421:             with session.lock:
+0422:                 session.active_run = False
+0423: 
+0424:     def GetResidency(
+0425:         self,
+0426:         session_id: str,
+0427:         *,
+0428:         caller_identity: CallerIdentity | None = None,
+0429:     ) -> ResidencySnapshot:
+0430:         """Return a session-scoped residency snapshot."""
+0431: 
+0432:         session, _caller = self._get_authorized_session(session_id, caller_identity, "GetResidency")
+0433:         with session.lock:
+0434:             tensor_residency = {name: tensor.residency for name, tensor in session.tensors.items()}
+0435:             primary_tier = self._derive_primary_tier(session)
+0436:             return ResidencySnapshot(
+0437:                 session_id=session.session_id,
+0438:                 session_state=session.state,
+0439:                 primary_tier=primary_tier,
+0440:                 tensor_residency=tensor_residency,
+0441:                 vram_bytes=session.vram_used_bytes,
+0442:                 pinned_ram_bytes=session.pinned_ram_used_bytes,
+0443:                 pageable_ram_bytes=session.pageable_ram_used_bytes,
+0444:                 cpu_only_bytes=session.cpu_only_used_bytes,
+0445:                 active_run_in_progress=session.active_run,
+0446:             )
+0447: 
+0448:     def GetPressure(
+0449:         self,
+0450:         session_id: str,
+0451:         *,
+0452:         caller_identity: CallerIdentity | None = None,
+0453:     ) -> PressureSnapshot:
+0454:         """Return the current pressure snapshot for a session."""
+0455: 
+0456:         session, _caller = self._get_authorized_session(session_id, caller_identity, "GetPressure")
+0457:         with session.lock:
+0458:             pressure_level = self._compute_pressure_level(session)
+0459:             return PressureSnapshot(
+0460:                 session_id=session.session_id,
+0461:                 vram_budget_bytes=session.vram_budget_bytes,
+0462:                 vram_used_bytes=session.vram_used_bytes,
+0463:                 pinned_ram_used_bytes=session.pinned_ram_used_bytes,
+0464:                 pressure_level=pressure_level,
+0465:                 policy_profile=session.policy_profile,
+0466:                 timestamp_ms=self._now_ms(),
+0467:             )
+0468: 
+0469:     def SetPolicy(
+0470:         self,
+0471:         session_id: str,
+0472:         policy: PolicyProfile,
+0473:         *,
+0474:         caller_identity: CallerIdentity | None = None,
+0475:     ) -> None:
+0476:         """Switch the session policy profile."""
+0477: 
+0478:         session, _caller = self._get_authorized_session(session_id, caller_identity, "SetPolicy")
+0479:         with session.lock:
+0480:             if session.active_run:
+0481:                 raise ApiError(ApiErrorCode.INVALID_STATE, "cannot change policy during RunStep")
+0482:             session.policy_profile = self._normalize_policy(policy)
+0483: 
+0484:     def CloseSession(
+0485:         self,
+0486:         session_id: str,
+0487:         *,
+0488:         caller_identity: CallerIdentity | None = None,
+0489:     ) -> None:
+0490:         """Close a session. Closing a known session is idempotent."""
+0491: 
+0492:         with self._lock:
+0493:             session = self._sessions.get(session_id)
+0494:             if session is None:
+0495:                 session = self._closed_sessions.get(session_id)
+0496:                 if session is None:
+0497:                     raise ApiError(ApiErrorCode.NOT_FOUND, "session not found")
+0498:                 _caller = self._resolve_session_caller(session, caller_identity, "CloseSession")
+0499:                 return
+0500: 
+0501:         caller = self._resolve_session_caller(session, caller_identity, "CloseSession")
+0502:         was_open = False
+0503: 
+0504:         with session.lock:
+0505:             if not session.closed:
+0506:                 was_open = True
+0507:                 session.state = SessionState.CLOSED
+0508:                 session.closed = True
+0509:                 session.active_run = False
+0510: 
+0511:         if was_open:
+0512:             self._record_lifecycle_event(
+0513:                 session=session,
+0514:                 caller=caller,
+0515:                 action="close_session",
+0516:                 detail="session_closed",
+0517:             )
+0518: 
+0519:             with self._lock:
+0520:                 self._closed_sessions[session_id] = session
+0521:                 self._sessions.pop(session_id, None)
+0522:             self._security.release_session(session.owner_identity)
+0523: 
+0524:     def _resolve_creation_caller(self, caller_identity: CallerIdentity | None) -> CallerIdentity:
+0525:         if caller_identity is None:
+0526:             return CallerIdentity(self._service_owner_sid, os.getpid())
+0527:         if not self._is_valid_caller_identity(caller_identity):
+0528:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "caller identity is malformed")
+0529:         return caller_identity
+0530: 
+0531:     def _resolve_session_caller(
+0532:         self,
+0533:         session: _Session,
+0534:         caller_identity: CallerIdentity | None,
+0535:         api_name: str,
+0536:     ) -> CallerIdentity:
+0537:         caller = session.owner_identity if caller_identity is None else caller_identity
+0538:         if not self._is_valid_caller_identity(caller):
+0539:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "caller identity is malformed")
+0540: 
+0541:         admission = self._security.authorize_caller(caller)
+0542:         if not admission.allowed:
+0543:             raise admission.to_api_error()
+0544:         if caller.user_sid != session.owner_identity.user_sid:
+0545:             raise ApiError(ApiErrorCode.AUTH_DENIED, f"{api_name} caller does not own the session")
+0546:         return caller
+0547: 
+0548:     def _get_authorized_session(
+0549:         self,
+0550:         session_id: str,
+0551:         caller_identity: CallerIdentity | None,
+0552:         api_name: str,
+0553:     ) -> tuple[_Session, CallerIdentity]:
+0554:         session = self._get_session(session_id)
+0555:         if session.closed or session.state == SessionState.CLOSED:
+0556:             raise ApiError(ApiErrorCode.INVALID_STATE, "session is closed")
+0557:         caller = self._resolve_session_caller(session, caller_identity, api_name)
+0558:         return session, caller
+0559: 
+0560:     def _get_session(self, session_id: str) -> _Session:
+0561:         with self._lock:
+0562:             session = self._sessions.get(session_id) or self._closed_sessions.get(session_id)
+0563:             if session is None:
+0564:                 raise ApiError(ApiErrorCode.NOT_FOUND, "session not found")
+0565:             return session
+0566: 
+0567:     @staticmethod
+0568:     def _require_state(session: _Session, allowed: Iterable[SessionState], api_name: str) -> None:
+0569:         if session.state not in allowed:
+0570:             allowed_states = ", ".join(state.value for state in allowed)
+0571:             raise ApiError(
+0572:                 ApiErrorCode.INVALID_STATE,
+0573:                 f"{api_name} requires one of: {allowed_states}; current state={session.state.value}",
+0574:             )
+0575: 
+0576:     @staticmethod
+0577:     def _normalize_tier(tier: MemoryTier) -> MemoryTier:
+0578:         if not isinstance(tier, MemoryTier):
+0579:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "tier must be a MemoryTier")
+0580:         return tier
+0581: 
+0582:     @staticmethod
+0583:     def _normalize_policy(policy: PolicyProfile) -> PolicyProfile:
+0584:         if not isinstance(policy, PolicyProfile):
+0585:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "policy must be a PolicyProfile")
+0586:         return policy
+0587: 
+0588:     @staticmethod
+0589:     def _residency_for_tier(tier: MemoryTier) -> ResidencyState:
+0590:         if tier is MemoryTier.HOT:
+0591:             return ResidencyState.VRAM
+0592:         if tier is MemoryTier.WARM:
+0593:             return ResidencyState.PINNED_RAM
+0594:         return ResidencyState.PAGEABLE_RAM
+0595: 
+0596:     def _get_tensor(self, session: _Session, tensor_name: str) -> _TensorRecord:
+0597:         if tensor_name not in session.tensors:
+0598:             raise ApiError(ApiErrorCode.NOT_FOUND, "tensor not registered")
+0599:         return session.tensors[tensor_name]
+0600: 
+0601:     def _migrate_tensor(
+0602:         self,
+0603:         session: _Session,
+0604:         tensor: _TensorRecord,
+0605:         destination: ResidencyState,
+0606:         *,
+0607:         reason_code: str,
+0608:         telemetry_reason: TelemetryReasonCode,
+0609:         telemetry_direction: str,
+0610:         telemetry_mode: str,
+0611:         caller: CallerIdentity | None = None,
+0612:     ) -> TransferEvent:
+0613:         source = tensor.residency
+0614:         tensor.residency = destination
+0615:         self._apply_residency_bytes(session, tensor.size_bytes, source, destination)
+0616:         event = TransferEvent(
+0617:             session_id=session.session_id,
+0618:             source=source,
+0619:             destination=destination,
+0620:             bytes_moved=tensor.size_bytes,
+0621:             reason_code=reason_code,
+0622:             timestamp_ms=self._now_ms(),
+0623:         )
+0624:         session.transfer_history.append(event)
+0625:         self._telemetry.record_event(
+0626:             TelemetryTransferEvent(
+0627:                 reason_code=telemetry_reason,
+0628:                 session_id=session.session_id,
+0629:                 bytes_moved=tensor.size_bytes,
+0630:                 direction=telemetry_direction,
+0631:                 latency_ms=self._estimate_transfer_latency_ms(tensor.size_bytes),
+0632:                 mode=telemetry_mode,
+0633:             ),
+0634:             extra_identifiers={
+0635:                 "tensor_name": tensor.name,
+0636:                 "source": source.value,
+0637:                 "destination": destination.value,
+0638:                 **(
+0639:                     {
+0640:                         "caller_sid": caller.user_sid,
+0641:                         "caller_pid": caller.pid,
+0642:                     }
+0643:                     if caller is not None
+0644:                     else {}
+0645:                 ),
+0646:             },
+0647:         )
+0648:         return event
+0649: 
+0650:     def _record_lifecycle_event(
+0651:         self,
+0652:         session: _Session,
+0653:         caller: CallerIdentity,
+0654:         action: str,
+0655:         detail: str,
+0656:     ) -> None:
+0657:         self._telemetry.record_event(
+0658:             _SessionLifecycleEvent(
+0659:                 reason_code=TelemetryReasonCode.UNKNOWN,
+0660:                 session_id=session.session_id,
+0661:                 action=action,
+0662:                 detail=detail,
+0663:             ),
+0664:             extra_identifiers={
+0665:                 "caller_sid": caller.user_sid,
+0666:                 "caller_pid": caller.pid,
+0667:             },
+0668:         )
+0669: 
+0670:     def _advance_fallback(
+0671:         self,
+0672:         *,
+0673:         session: _Session,
+0674:         caller: CallerIdentity,
+0675:         now_ms: int,
+0676:     ) -> dict[str, object]:
+0677:         state = FallbackState(
+0678:             current_step=session.fallback_current_step,
+0679:             last_step_change_ms=session.fallback_last_step_change_ms,
+0680:             step_change_history_ms=session.fallback_step_change_history_ms,
+0681:             stability_mode=session.fallback_stability_mode,
+0682:         )
+0683:         decision = self._fallback_controller.evaluate(state, now_ms)
+0684: 
+0685:         if decision.enter_stability_mode:
+0686:             session.fallback_stability_mode = True
+0687: 
+0688:         if not decision.should_advance:
+0689:             session.state = SessionState.DEGRADED if not session.fallback_stability_mode else SessionState.DEGRADED
+0690:             return {
+0691:                 "should_advance": False,
+0692:                 "next_step": session.fallback_current_step.value if session.fallback_current_step else None,
+0693:                 "enter_stability_mode": session.fallback_stability_mode,
+0694:                 "reason_code": decision.reason_code,
+0695:             }
+0696: 
+0697:         next_step = decision.next_step
+0698:         if next_step is None:
+0699:             session.state = SessionState.FAILED
+0700:             session.fallback_current_step = None
+0701:             session.fallback_last_step_change_ms = now_ms
+0702:             session.fallback_step_change_history_ms = session.fallback_step_change_history_ms + (now_ms,)
+0703:             self._record_fallback_event(
+0704:                 session=session,
+0705:                 caller=caller,
+0706:                 ladder_step=FallbackStep.CONTROLLED_FAIL.value,
+0707:                 telemetry_reason=TelemetryReasonCode.FALLBACK_CONTROLLED_FAIL,
+0708:                 reason_code=decision.reason_code,
+0709:                 now_ms=now_ms,
+0710:             )
+0711:             return {
+0712:                 "should_advance": True,
+0713:                 "next_step": FallbackStep.CONTROLLED_FAIL.value,
+0714:                 "enter_stability_mode": session.fallback_stability_mode,
+0715:                 "reason_code": decision.reason_code,
+0716:             }
+0717: 
+0718:         if next_step is FallbackStep.CONTROLLED_FAIL:
+0719:             session.fallback_current_step = next_step
+0720:             session.fallback_last_step_change_ms = now_ms
+0721:             session.fallback_step_change_history_ms = session.fallback_step_change_history_ms + (now_ms,)
+0722:             session.state = SessionState.FAILED
+0723:             self._record_fallback_event(
+0724:                 session=session,
+0725:                 caller=caller,
+0726:                 ladder_step=next_step.value,
+0727:                 telemetry_reason=TelemetryReasonCode.FALLBACK_CONTROLLED_FAIL,
+0728:                 reason_code=decision.reason_code,
+0729:                 now_ms=now_ms,
+0730:             )
+0731:             return {
+0732:                 "should_advance": True,
+0733:                 "next_step": next_step.value,
+0734:                 "enter_stability_mode": session.fallback_stability_mode,
+0735:                 "reason_code": decision.reason_code,
+0736:             }
+0737: 
+0738:         self._apply_deterministic_fallback(session=session, next_step=next_step, caller=caller)
+0739:         session.fallback_current_step = next_step
+0740:         session.fallback_last_step_change_ms = now_ms
+0741:         session.fallback_step_change_history_ms = session.fallback_step_change_history_ms + (now_ms,)
+0742:         session.state = SessionState.DEGRADED
+0743:         self._record_fallback_event(
+0744:             session=session,
+0745:             caller=caller,
+0746:             ladder_step=next_step.value,
+0747:             telemetry_reason=self._telemetry_reason_for_step(next_step),
+0748:             reason_code=decision.reason_code,
+0749:             now_ms=now_ms,
+0750:         )
+0751:         return {
+0752:             "should_advance": True,
+0753:             "next_step": next_step.value,
+0754:             "enter_stability_mode": session.fallback_stability_mode,
+0755:             "reason_code": decision.reason_code,
+0756:         }
+0757: 
+0758:     def _apply_deterministic_fallback(
+0759:         self,
+0760:         session: _Session,
+0761:         next_step: FallbackStep,
+0762:         *,
+0763:         caller: CallerIdentity | None = None,
+0764:     ) -> None:
+0765:         """Apply a deterministic fallback action to the highest-residency tensor."""
+0766: 
+0767:         tensor = self._select_tensor_for_fallback(session)
+0768:         if tensor is None:
+0769:             return
+0770: 
+0771:         if next_step is FallbackStep.KV_CONTEXT_REDUCTION:
+0772:             destination = self._fallback_destination(tensor.residency, preferred=ResidencyState.PINNED_RAM)
+0773:         elif next_step is FallbackStep.BATCH_REDUCTION:
+0774:             destination = self._fallback_destination(tensor.residency, preferred=ResidencyState.PAGEABLE_RAM)
+0775:         elif next_step is FallbackStep.PRECISION_REDUCTION:
+0776:             destination = self._fallback_destination(tensor.residency, preferred=ResidencyState.PAGEABLE_RAM)
+0777:         elif next_step is FallbackStep.SELECTIVE_CPU_OFFLOAD:
+0778:             destination = ResidencyState.CPU_ONLY
+0779:         else:
+0780:             return
+0781: 
+0782:         if destination != tensor.residency:
+0783:             self._migrate_tensor(
+0784:                 session,
+0785:                 tensor,
+0786:                 destination,
+0787:                 reason_code=next_step.value,
+0788:                 telemetry_reason=self._telemetry_reason_for_step(next_step),
+0789:                 telemetry_direction="fallback",
+0790:                 telemetry_mode=next_step.value,
+0791:                 caller=caller,
+0792:             )
+0793: 
+0794:     def _select_tensor_for_fallback(self, session: _Session) -> _TensorRecord | None:
+0795:         """Select the most memory-intensive tensor deterministically."""
+0796: 
+0797:         priority = {
+0798:             ResidencyState.VRAM: 0,
+0799:             ResidencyState.PINNED_RAM: 1,
+0800:             ResidencyState.PAGEABLE_RAM: 2,
+0801:             ResidencyState.CPU_ONLY: 3,
+0802:         }
+0803:         candidates = sorted(
+0804:             session.tensors.values(),
+0805:             key=lambda tensor: (priority.get(tensor.residency, 99), tensor.name),
+0806:         )
+0807:         return candidates[0] if candidates else None
+0808: 
+0809:     @staticmethod
+0810:     def _fallback_destination(
+0811:         current: ResidencyState,
+0812:         *,
+0813:         preferred: ResidencyState,
+0814:     ) -> ResidencyState:
+0815:         if current == preferred:
+0816:             if preferred == ResidencyState.PINNED_RAM:
+0817:                 return ResidencyState.PAGEABLE_RAM
+0818:             if preferred == ResidencyState.PAGEABLE_RAM:
+0819:                 return ResidencyState.CPU_ONLY
+0820:         return preferred
+0821: 
+0822:     def _record_fallback_event(
+0823:         self,
+0824:         *,
+0825:         session: _Session,
+0826:         caller: CallerIdentity,
+0827:         ladder_step: str,
+0828:         telemetry_reason: TelemetryReasonCode,
+0829:         reason_code: str,
+0830:         now_ms: int,
+0831:     ) -> None:
+0832:         core_event = FallbackEvent(
+0833:             session_id=session.session_id,
+0834:             step=ladder_step,
+0835:             reason_code=reason_code,
+0836:             timestamp_ms=now_ms,
+0837:         )
+0838:         session.fallback_events.append(core_event)
+0839:         self._telemetry.record_event(
+0840:             TelemetryFallbackEvent(
+0841:                 reason_code=telemetry_reason,
+0842:                 session_id=session.session_id,
+0843:                 ladder_step=ladder_step,
+0844:                 trigger="pressure_high",
+0845:                 stabilization_mode=session.fallback_stability_mode,
+0846:             ),
+0847:             extra_identifiers={
+0848:                 "caller_sid": caller.user_sid,
+0849:                 "caller_pid": caller.pid,
+0850:             },
+0851:         )
+0852: 
+0853:     @staticmethod
+0854:     def _telemetry_reason_for_step(step: FallbackStep) -> TelemetryReasonCode:
+0855:         if step is FallbackStep.KV_CONTEXT_REDUCTION:
+0856:             return TelemetryReasonCode.FALLBACK_KV_REDUCTION
+0857:         if step is FallbackStep.BATCH_REDUCTION:
+0858:             return TelemetryReasonCode.FALLBACK_BATCH_REDUCTION
+0859:         if step is FallbackStep.PRECISION_REDUCTION:
+0860:             return TelemetryReasonCode.FALLBACK_PRECISION_REDUCTION
+0861:         if step is FallbackStep.SELECTIVE_CPU_OFFLOAD:
+0862:             return TelemetryReasonCode.FALLBACK_CPU_OFFLOAD
+0863:         return TelemetryReasonCode.FALLBACK_CONTROLLED_FAIL
+0864: 
+0865:     @staticmethod
+0866:     def _apply_residency_bytes(
+0867:         session: _Session,
+0868:         size_bytes: int,
+0869:         source: ResidencyState,
+0870:         destination: ResidencyState,
+0871:     ) -> None:
+0872:         def decrement(state: ResidencyState) -> None:
+0873:             if state is ResidencyState.VRAM:
+0874:                 session.vram_used_bytes = max(0, session.vram_used_bytes - size_bytes)
+0875:             elif state is ResidencyState.PINNED_RAM:
+0876:                 session.pinned_ram_used_bytes = max(0, session.pinned_ram_used_bytes - size_bytes)
+0877:             elif state is ResidencyState.PAGEABLE_RAM:
+0878:                 session.pageable_ram_used_bytes = max(0, session.pageable_ram_used_bytes - size_bytes)
+0879:             elif state is ResidencyState.CPU_ONLY:
+0880:                 session.cpu_only_used_bytes = max(0, session.cpu_only_used_bytes - size_bytes)
+0881: 
+0882:         def increment(state: ResidencyState) -> None:
+0883:             if state is ResidencyState.VRAM:
+0884:                 session.vram_used_bytes += size_bytes
+0885:             elif state is ResidencyState.PINNED_RAM:
+0886:                 session.pinned_ram_used_bytes += size_bytes
+0887:             elif state is ResidencyState.PAGEABLE_RAM:
+0888:                 session.pageable_ram_used_bytes += size_bytes
+0889:             elif state is ResidencyState.CPU_ONLY:
+0890:                 session.cpu_only_used_bytes += size_bytes
+0891: 
+0892:         decrement(source)
+0893:         increment(destination)
+0894: 
+0895:     @staticmethod
+0896:     def _estimate_transfer_latency_ms(size_bytes: int) -> float:
+0897:         """Return a deterministic latency estimate for telemetry."""
+0898: 
+0899:         return max(0.1, size_bytes / 100_000_000.0)
+0900: 
+0901:     def _resolve_runstep_mode(self) -> str:
+0902:         override = self._runstep_mode_override
+0903:         if isinstance(override, str) and override.strip():
+0904:             mode = override.strip().lower()
+0905:         else:
+0906:             mode = os.environ.get(RUNSTEP_MODE_ENV, DEFAULT_RUNSTEP_MODE).strip().lower()
+0907:             if self._env_flag_enabled(RUNSTEP_MODE_ENABLE_ENV):
+0908:                 mode = "hardware"
+0909:         if mode in {"hardware", "cuda", "cuda_transfer_poc"}:
+0910:             return "hardware"
+0911:         if mode in {"auto", "hardware_preferred", "preferred"}:
+0912:             return "auto"
+0913:         return "simulation"
+0914: 
+0915:     def _execute_hardware_runstep(self, *, session: _Session, step_name: str) -> dict[str, object]:
+0916:         size_bytes = self._resolve_hardware_transfer_bytes(session)
+0917:         device_index = self._env_int(HARDWARE_DEVICE_INDEX_ENV, default=DEFAULT_DEVICE_INDEX, minimum=0)
+0918:         hold_ms = self._env_int(HARDWARE_HOLD_MS_ENV, default=DEFAULT_HARDWARE_HOLD_MS, minimum=0)
+0919: 
+0920:         if self._hardware_executor is None:
+0921:             return self._hardware_failure_result(
+0922:                 code=ApiErrorCode.UNSUPPORTED_CAPABILITY,
+0923:                 message="hardware-preferred RunStep could not load the CUDA runtime",
+0924:                 session=session,
+0925:                 step_name=step_name,
+0926:                 size_bytes=size_bytes,
+0927:                 device_index=device_index,
+0928:                 hold_ms=hold_ms,
+0929:             )
+0930: 
+0931:         try:
+0932:             result = self._hardware_executor(
+0933:                 size_bytes=size_bytes,
+0934:                 device_index=device_index,
+0935:                 hold_ms=hold_ms,
+0936:             )
+0937:         except TypeError:
+0938:             try:
+0939:                 result = self._hardware_executor(size_bytes=size_bytes, device_index=device_index)
+0940:             except Exception as exc:  # pragma: no cover - defensive boundary
+0941:                 return self._hardware_failure_result(
+0942:                     code=ApiErrorCode.INTERNAL,
+0943:                     message=f"hardware RunStep execution failed unexpectedly: {exc}",
+0944:                     session=session,
+0945:                     step_name=step_name,
+0946:                     size_bytes=size_bytes,
+0947:                     device_index=device_index,
+0948:                     hold_ms=hold_ms,
+0949:                 )
+0950:         except Exception as exc:  # pragma: no cover - defensive boundary
+0951:             return self._hardware_failure_result(
+0952:                 code=ApiErrorCode.INTERNAL,
+0953:                 message=f"hardware RunStep execution failed unexpectedly: {exc}",
+0954:                 session=session,
+0955:                 step_name=step_name,
+0956:                 size_bytes=size_bytes,
+0957:                 device_index=device_index,
+0958:                 hold_ms=hold_ms,
+0959:             )
+0960: 
+0961:         if not isinstance(result, dict):
+0962:             return self._hardware_failure_result(
+0963:                 code=ApiErrorCode.INTERNAL,
+0964:                 message="hardware RunStep must return a JSON object",
+0965:                 session=session,
+0966:                 step_name=step_name,
+0967:                 size_bytes=size_bytes,
+0968:                 device_index=device_index,
+0969:                 hold_ms=hold_ms,
+0970:             )
+0971: 
+0972:         merged = dict(result)
+0973:         merged.setdefault("ok", False)
+0974:         merged["service_context"] = {
+0975:             "session_id": session.session_id,
+0976:             "step_name": step_name,
+0977:             "requested_transfer_bytes": size_bytes,
+0978:             "device_index": device_index,
+0979:             "hold_ms": hold_ms,
+0980:         }
+0981:         if not bool(merged.get("ok")) and "error" not in merged:
+0982:             merged["error"] = {
+0983:                 "code": ApiErrorCode.INTERNAL.value,
+0984:                 "message": "hardware RunStep reported failure without structured error details",
+0985:             }
+0986:         return merged
+0987: 
+0988:     def _resolve_hardware_transfer_bytes(self, session: _Session) -> int:
+0989:         configured = self._env_int(HARDWARE_TRANSFER_BYTES_ENV, default=0, minimum=0)
+0990:         if configured > 0:
+0991:             return configured
+0992:         if session.tensors:
+0993:             return max(DEFAULT_TRANSFER_BYTES, max(item.size_bytes for item in session.tensors.values()))
+0994:         return DEFAULT_TRANSFER_BYTES
+0995: 
+0996:     def _execute_inference_runstep(
+0997:         self,
+0998:         *,
+0999:         session: _Session,
+1000:         step_name: str,
+1001:         prompt: str,
+1002:         max_tokens: int | None,
+1003:         temperature: float | None,
+1004:         system_prompt: str | None,
+1005:         backend_options: Mapping[str, Any] | None,
+1006:     ) -> dict[str, object]:
+1007:         if not isinstance(prompt, str) or not prompt.strip():
+1008:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "prompt must be a non-empty string when provided")
+1009:         if max_tokens is not None and max_tokens <= 0:
+1010:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "max_tokens must be positive when provided")
+1011:         if temperature is not None and temperature < 0:
+1012:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "temperature must be non-negative when provided")
+1013:         if session.resolved_model_name is None:
+1014:             raise ApiError(ApiErrorCode.INVALID_STATE, "session has no resolved model binding")
+1015: 
+1016:         runtime = self._inference_runtime_factory(session.inference_backend)
+1017:         try:
+1018:             result = self._call_runtime_method(
+1019:                 runtime,
+1020:                 "generate",
+1021:                 session.resolved_model_name,
+1022:                 prompt=prompt,
+1023:                 step_name=step_name,
+1024:                 max_tokens=max_tokens,
+1025:                 temperature=temperature,
+1026:                 system_prompt=system_prompt,
+1027:                 backend_options=backend_options,
+1028:             )
+1029:         except ApiError as exc:
+1030:             return {
+1031:                 "ok": False,
+1032:                 "backend": session.inference_backend,
+1033:                 "model_name": session.resolved_model_name,
+1034:                 "error": {
+1035:                     "code": exc.code.value,
+1036:                     "message": str(exc),
+1037:                 },
+1038:             }
+1039:         except Exception as exc:  # pragma: no cover - defensive runtime boundary
+1040:             return {
+1041:                 "ok": False,
+1042:                 "backend": session.inference_backend,
+1043:                 "model_name": session.resolved_model_name,
+1044:                 "error": {
+1045:                     "code": ApiErrorCode.INTERNAL.value,
+1046:                     "message": f"inference backend execution failed unexpectedly: {exc}",
+1047:                 },
+1048:             }
+1049: 
+1050:         if not isinstance(result, dict):
+1051:             return {
+1052:                 "ok": False,
+1053:                 "backend": session.inference_backend,
+1054:                 "model_name": session.resolved_model_name,
+1055:                 "error": {
+1056:                     "code": ApiErrorCode.INTERNAL.value,
+1057:                     "message": "inference backend must return a JSON object",
+1058:                 },
+1059:             }
+1060: 
+1061:         normalized = dict(result)
+1062:         normalized.setdefault("ok", True)
+1063:         normalized.setdefault("backend", session.inference_backend)
+1064:         normalized.setdefault("model_name", session.resolved_model_name)
+1065:         return normalized
+1066: 
+1067:     @staticmethod
+1068:     def _hardware_failure_result(
+1069:         *,
+1070:         code: ApiErrorCode,
+1071:         message: str,
+1072:         session: _Session,
+1073:         step_name: str,
+1074:         size_bytes: int,
+1075:         device_index: int,
+1076:         hold_ms: int,
+1077:     ) -> dict[str, object]:
+1078:         return {
+1079:             "ok": False,
+1080:             "error": {
+1081:                 "code": code.value,
+1082:                 "message": message,
+1083:             },
+1084:             "fallback_to_simulation": True,
+1085:             "service_context": {
+1086:                 "session_id": session.session_id,
+1087:                 "step_name": step_name,
+1088:                 "requested_transfer_bytes": size_bytes,
+1089:                 "device_index": device_index,
+1090:                 "hold_ms": hold_ms,
+1091:             },
+1092:         }
+1093: 
+1094:     @staticmethod
+1095:     def _env_flag_enabled(name: str) -> bool:
+1096:         value = os.environ.get(name, "").strip().lower()
+1097:         return value in {"1", "true", "yes", "on"}
+1098: 
+1099:     @staticmethod
+1100:     def _env_int(name: str, *, default: int, minimum: int = 0) -> int:
+1101:         raw = os.environ.get(name)
+1102:         if raw is None or not raw.strip():
+1103:             return default
+1104:         try:
+1105:             value = int(raw.strip())
+1106:         except ValueError:
+1107:             return default
+1108:         if value < minimum:
+1109:             return default
+1110:         return value
+1111: 
+1112:     def _compute_pressure_level(self, session: _Session) -> float:
+1113:         if session.vram_budget_bytes <= 0:
+1114:             return 1.0
+1115:         level = session.vram_used_bytes / session.vram_budget_bytes
+1116:         return max(0.0, min(1.0, level))
+1117: 
+1118:     @staticmethod
+1119:     def _derive_primary_tier(session: _Session) -> MemoryTier:
+1120:         if any(tensor.residency is ResidencyState.VRAM for tensor in session.tensors.values()):
+1121:             return MemoryTier.HOT
+1122:         if any(tensor.residency is ResidencyState.PINNED_RAM for tensor in session.tensors.values()):
+1123:             return MemoryTier.WARM
+1124:         return MemoryTier.COLD
+1125: 
+1126:     @staticmethod
+1127:     def _now_ms() -> int:
+1128:         return time_ns() // 1_000_000
+1129: 
+1130:     @staticmethod
+1131:     def _is_valid_caller_identity(caller_identity: CallerIdentity | None) -> bool:
+1132:         if caller_identity is None:
+1133:             return False
+1134:         try:
+1135:             return (
+1136:                 bool(caller_identity.user_sid.strip())
+1137:                 and isinstance(caller_identity.pid, int)
+1138:                 and not isinstance(caller_identity.pid, bool)
+1139:                 and caller_identity.pid > 0
+1140:             )
+1141:         except AttributeError:
+1142:             return False
+1143: 
+1144:     @staticmethod
+1145:     def _call_runtime_method(runtime: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
+1146:         method = getattr(runtime, method_name)
+1147:         try:
+1148:             params = signature(method).parameters
+1149:         except (TypeError, ValueError):
+1150:             return method(*args, **kwargs)
+1151: 
+1152:         if any(param.kind == Parameter.VAR_KEYWORD for param in params.values()):
+1153:             return method(*args, **kwargs)
+1154: 
+1155:         filtered_kwargs = {key: value for key, value in kwargs.items() if key in params}
+1156:         return method(*args, **filtered_kwargs)
+1157: 
+1158:     @staticmethod
+1159:     def _build_inference_metadata(
+1160:         binding_metadata: Any,
+1161:         *,
+1162:         requested_model_name: str,
+1163:         runtime_profile: str,
+1164:         model_size_billion: float | None,
+1165:         model_size_label: str | None,
+1166:         backend_options: Mapping[str, Any],
+1167:     ) -> dict[str, Any]:
+1168:         metadata = dict(binding_metadata) if isinstance(binding_metadata, Mapping) else {}
+1169:         metadata["requested_model_name"] = requested_model_name
+1170:         metadata["runtime_profile"] = runtime_profile
+1171:         metadata["backend_options"] = dict(backend_options)
+1172:         if model_size_billion is not None:
+1173:             metadata["model_size_billion"] = model_size_billion
+1174:         if model_size_label is not None:
+1175:             metadata["model_size_label"] = model_size_label
+1176:         return metadata
+1177: 
+1178:     @staticmethod
+1179:     def _resolve_effective_backend_options(
+1180:         *,
+1181:         session: _Session,
+1182:         runtime_profile_override: str | None,
+1183:         runtime_backend_options_override: Mapping[str, Any] | None,
+1184:         backend_options: Mapping[str, Any] | None,
+1185:     ) -> dict[str, Any]:
+1186:         stored_options = session.inference_metadata.get("backend_options")
+1187:         if not isinstance(stored_options, Mapping):
+1188:             stored_options = {}
+1189:         profile_options: Mapping[str, Any] | None = None
+1190:         if runtime_profile_override is not None:
+1191:             resolved_model_name = session.resolved_model_name
+1192:             if not isinstance(resolved_model_name, str) or not resolved_model_name.strip():
+1193:                 raise ApiError(ApiErrorCode.INVALID_STATE, "session has no resolved model binding")
+1194:             override_tuning = resolve_runtime_tuning(
+1195:                 resolved_model_name,
+1196:                 runtime_profile=runtime_profile_override,
+1197:             )
+1198:             profile_options = override_tuning.backend_options
+1199:         return merge_backend_options(
+1200:             stored_options,
+1201:             profile_options,
+1202:             runtime_backend_options_override,
+1203:             backend_options,
+1204:         )
+1205: 
+1206: 
+1207: __all__ = ["AstraWeaveService"]

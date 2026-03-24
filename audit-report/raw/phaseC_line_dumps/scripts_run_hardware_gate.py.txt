@@ -1,0 +1,212 @@
+﻿0001: """Run hardware execution gate checks for service-triggered CUDA RunStep mode."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import argparse
+0006: import json
+0007: import sys
+0008: from datetime import datetime, timezone
+0009: from pathlib import Path
+0010: from typing import Any
+0011: 
+0012: REPO_ROOT = Path(__file__).resolve().parent.parent
+0013: if str(REPO_ROOT) not in sys.path:
+0014:     sys.path.insert(0, str(REPO_ROOT))
+0015: 
+0016: from astrawave.hardware_probe import collect_hardware_probe
+0017: from astrawave.security import CallerIdentity
+0018: from astrawave.service import DEFAULT_SERVICE_OWNER_SID, AstraWeaveService
+0019: from astrawave.types import MemoryTier
+0020: 
+0021: 
+0022: def _utc_now_iso() -> str:
+0023:     return datetime.now(timezone.utc).isoformat()
+0024: 
+0025: 
+0026: def _write_markdown(path: Path, payload: dict[str, Any]) -> None:
+0027:     lines = [
+0028:         "# Hardware Gate Report",
+0029:         "",
+0030:         f"- Run id: `{payload['run_id']}`",
+0031:         f"- Generated at: `{payload['generated_at']}`",
+0032:         f"- Verdict: `{payload['verdict']}`",
+0033:         "",
+0034:         "| Gate | Result | Note |",
+0035:         "| --- | --- | --- |",
+0036:     ]
+0037:     for gate, check in payload.get("gate_checks", {}).items():
+0038:         lines.append(f"| `{gate}` | `{'pass' if check.get('passed') else 'fail'}` | {check.get('note', 'n/a')} |")
+0039:     lines.extend(
+0040:         [
+0041:             "",
+0042:             "## Runtime Result",
+0043:             "",
+0044:             "```json",
+0045:             json.dumps(payload.get("runtime_result", {}), indent=2, sort_keys=True),
+0046:             "```",
+0047:             "",
+0048:         ]
+0049:     )
+0050:     path.write_text("\n".join(lines), encoding="utf-8")
+0051: 
+0052: 
+0053: def _probe_used_bytes(probe: dict[str, Any], *, device_index: int) -> int | None:
+0054:     nvml = probe.get("nvml")
+0055:     if isinstance(nvml, dict):
+0056:         devices = nvml.get("devices")
+0057:         if isinstance(devices, list):
+0058:             for device in devices:
+0059:                 if isinstance(device, dict) and int(device.get("index", -1)) == device_index:
+0060:                     value = device.get("memory_used_bytes")
+0061:                     if isinstance(value, int):
+0062:                         return value
+0063:     nvidia_smi = probe.get("nvidia_smi")
+0064:     if isinstance(nvidia_smi, dict):
+0065:         devices = nvidia_smi.get("devices")
+0066:         if isinstance(devices, list):
+0067:             for device in devices:
+0068:                 if isinstance(device, dict) and int(device.get("index", -1)) == device_index:
+0069:                     value = device.get("memory_used_bytes")
+0070:                     if isinstance(value, int):
+0071:                         return value
+0072:     return None
+0073: 
+0074: 
+0075: def run_hardware_gate(*, run_id: str, transfer_bytes: int, device_index: int, hold_ms: int) -> dict[str, Any]:
+0076:     owner = CallerIdentity(user_sid=DEFAULT_SERVICE_OWNER_SID, pid=3301)
+0077:     service = AstraWeaveService(runstep_mode="hardware")
+0078: 
+0079:     before_probe = collect_hardware_probe()
+0080:     before_used = _probe_used_bytes(before_probe, device_index=device_index)
+0081: 
+0082:     session_id = service.CreateSession(caller_identity=owner)
+0083:     service.LoadModel(session_id, "hardware-gate-model", caller_identity=owner)
+0084:     service.RegisterTensor(session_id, "gate_tensor", max(transfer_bytes, 1), caller_identity=owner)
+0085:     service.SetTierHint(session_id, "gate_tensor", MemoryTier.HOT, caller_identity=owner)
+0086: 
+0087:     # Ensure service request context mirrors this gate run regardless of environment defaults.
+0088:     previous_bytes = None
+0089:     previous_device = None
+0090:     previous_hold = None
+0091:     try:
+0092:         import os
+0093: 
+0094:         previous_bytes = os.environ.get("ASTRAWEAVE_HARDWARE_TRANSFER_BYTES")
+0095:         previous_device = os.environ.get("ASTRAWEAVE_HARDWARE_DEVICE_INDEX")
+0096:         previous_hold = os.environ.get("ASTRAWEAVE_HARDWARE_HOLD_MS")
+0097:         os.environ["ASTRAWEAVE_HARDWARE_TRANSFER_BYTES"] = str(max(transfer_bytes, 1))
+0098:         os.environ["ASTRAWEAVE_HARDWARE_DEVICE_INDEX"] = str(max(device_index, 0))
+0099:         os.environ["ASTRAWEAVE_HARDWARE_HOLD_MS"] = str(max(hold_ms, 0))
+0100:         runtime_result = service.RunStep(session_id, step_name="hardware_gate", caller_identity=owner)
+0101:     finally:
+0102:         import os
+0103: 
+0104:         if previous_bytes is None:
+0105:             os.environ.pop("ASTRAWEAVE_HARDWARE_TRANSFER_BYTES", None)
+0106:         else:
+0107:             os.environ["ASTRAWEAVE_HARDWARE_TRANSFER_BYTES"] = previous_bytes
+0108:         if previous_device is None:
+0109:             os.environ.pop("ASTRAWEAVE_HARDWARE_DEVICE_INDEX", None)
+0110:         else:
+0111:             os.environ["ASTRAWEAVE_HARDWARE_DEVICE_INDEX"] = previous_device
+0112:         if previous_hold is None:
+0113:             os.environ.pop("ASTRAWEAVE_HARDWARE_HOLD_MS", None)
+0114:         else:
+0115:             os.environ["ASTRAWEAVE_HARDWARE_HOLD_MS"] = previous_hold
+0116: 
+0117:     after_probe = collect_hardware_probe()
+0118:     after_used = _probe_used_bytes(after_probe, device_index=device_index)
+0119: 
+0120:     hardware_result = runtime_result.get("hardware_result")
+0121:     if not isinstance(hardware_result, dict):
+0122:         hardware_result = {}
+0123:     nvml_observation = hardware_result.get("nvml_observation")
+0124:     if not isinstance(nvml_observation, dict):
+0125:         nvml_observation = {}
+0126: 
+0127:     run_mode_ok = runtime_result.get("run_mode") == "hardware"
+0128:     transfer_ok = bool(hardware_result.get("ok"))
+0129:     observed_delta = nvml_observation.get("observed_delta_bytes")
+0130:     delta_observed = bool(nvml_observation.get("observed"))
+0131:     probe_delta = None
+0132:     if isinstance(before_used, int) and isinstance(after_used, int):
+0133:         probe_delta = after_used - before_used
+0134: 
+0135:     gate_checks = {
+0136:         "service_hardware_mode_active": {
+0137:             "passed": run_mode_ok,
+0138:             "note": f"run_mode={runtime_result.get('run_mode')}",
+0139:         },
+0140:         "service_hardware_transfer_ok": {
+0141:             "passed": transfer_ok,
+0142:             "note": f"hardware_result.ok={hardware_result.get('ok')}",
+0143:         },
+0144:         "service_triggered_nvml_delta_observed": {
+0145:             "passed": delta_observed,
+0146:             "note": f"observed_delta_bytes={observed_delta}",
+0147:         },
+0148:     }
+0149:     verdict = "pass" if all(item["passed"] for item in gate_checks.values()) else "fail"
+0150: 
+0151:     return {
+0152:         "run_id": run_id,
+0153:         "generated_at": _utc_now_iso(),
+0154:         "verdict": verdict,
+0155:         "config": {
+0156:             "transfer_bytes": transfer_bytes,
+0157:             "device_index": device_index,
+0158:             "hold_ms": hold_ms,
+0159:         },
+0160:         "gate_checks": gate_checks,
+0161:         "runtime_result": runtime_result,
+0162:         "probe_snapshot": {
+0163:             "before_used_bytes": before_used,
+0164:             "after_used_bytes": after_used,
+0165:             "after_minus_before_bytes": probe_delta,
+0166:         },
+0167:         "artifacts": {
+0168:             "before_probe": before_probe,
+0169:             "after_probe": after_probe,
+0170:         },
+0171:     }
+0172: 
+0173: 
+0174: def main() -> int:
+0175:     parser = argparse.ArgumentParser(description="Run hardware release-gate checks.")
+0176:     parser.add_argument("--run-id", default=datetime.now().strftime("%Y-%m-%d"))
+0177:     parser.add_argument("--out-dir", default="reports/release_gate")
+0178:     parser.add_argument("--transfer-bytes", type=int, default=64 * 1024 * 1024)
+0179:     parser.add_argument("--device-index", type=int, default=0)
+0180:     parser.add_argument("--hold-ms", type=int, default=250)
+0181:     args = parser.parse_args()
+0182: 
+0183:     out_dir = (REPO_ROOT / args.out_dir).resolve()
+0184:     out_dir.mkdir(parents=True, exist_ok=True)
+0185:     report = run_hardware_gate(
+0186:         run_id=args.run_id,
+0187:         transfer_bytes=max(args.transfer_bytes, 1),
+0188:         device_index=max(args.device_index, 0),
+0189:         hold_ms=max(args.hold_ms, 0),
+0190:     )
+0191: 
+0192:     json_path = out_dir / f"hardware_gate_{args.run_id}.json"
+0193:     md_path = out_dir / f"hardware_gate_{args.run_id}.md"
+0194:     json_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+0195:     _write_markdown(md_path, report)
+0196: 
+0197:     print(
+0198:         json.dumps(
+0199:             {
+0200:                 "ok": True,
+0201:                 "json_report": str(json_path),
+0202:                 "md_report": str(md_path),
+0203:                 "verdict": report["verdict"],
+0204:             },
+0205:             sort_keys=True,
+0206:         )
+0207:     )
+0208:     return 0 if report["verdict"] == "pass" else 1
+0209: 
+0210: 
+0211: if __name__ == "__main__":
+0212:     raise SystemExit(main())

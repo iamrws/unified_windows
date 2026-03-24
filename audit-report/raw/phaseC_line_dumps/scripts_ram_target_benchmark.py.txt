@@ -1,0 +1,655 @@
+﻿0001: """RAM-target benchmark and tuning sweep for local Ollama inference.
+0002: 
+0003: This script helps operators target very high host-RAM usage (for example 90 GB)
+0004: while keeping the service path reproducible and measurable.
+0005: 
+0006: It executes multiple live-inference smoke runs with compression-aware runtime
+0007: option candidates, samples Ollama process memory, and scores the candidates by:
+0008: 1) closeness to the RAM target and
+0009: 2) decode throughput (tokens/sec).
+0010: """
+0011: 
+0012: from __future__ import annotations
+0013: 
+0014: import argparse
+0015: from dataclasses import asdict, dataclass
+0016: from datetime import datetime, timezone
+0017: import json
+0018: import os
+0019: from pathlib import Path
+0020: import subprocess
+0021: from time import sleep
+0022: from typing import Any, Mapping, Sequence
+0023: from urllib import error, request
+0024: 
+0025: REPO_ROOT = Path(__file__).resolve().parent.parent
+0026: if str(REPO_ROOT) not in os.sys.path:
+0027:     os.sys.path.insert(0, str(REPO_ROOT))
+0028: 
+0029: from astrawave.runtime_tuning import infer_model_size_billion
+0030: from scripts.live_inference_smoke import run_live_inference_smoke
+0031: 
+0032: DEFAULT_TARGET_RAM_GB = 90.0
+0033: DEFAULT_RUNTIME_PROFILE = "vram_constrained"
+0034: DEFAULT_RUNTIME_BACKEND = "ollama"
+0035: DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+0036: DEFAULT_PROMPT = "Explain in simple terms how host RAM is being used for this inference run."
+0037: DEFAULT_MAX_TOKENS = 128
+0038: DEFAULT_TEMPERATURE = 0.2
+0039: DEFAULT_IPC_TIMEOUT_SECONDS = 900.0
+0040: DEFAULT_COOLDOWN_SECONDS = 2.0
+0041: DEFAULT_ITERATIONS = 2
+0042: 
+0043: 
+0044: @dataclass(frozen=True, slots=True)
+0045: class CandidateConfig:
+0046:     candidate_id: str
+0047:     compression_hint: str
+0048:     notes: str
+0049:     runtime_options: dict[str, Any]
+0050: 
+0051: 
+0052: @dataclass(frozen=True, slots=True)
+0053: class CandidateRun:
+0054:     candidate_id: str
+0055:     iteration: int
+0056:     ok: bool
+0057:     error: str | None
+0058:     memory_before: dict[str, Any]
+0059:     memory_after: dict[str, Any]
+0060:     ollama_ps_before: dict[str, Any]
+0061:     ollama_ps_after: dict[str, Any]
+0062:     metrics: dict[str, Any]
+0063: 
+0064: 
+0065: @dataclass(frozen=True, slots=True)
+0066: class CandidateSummary:
+0067:     candidate_id: str
+0068:     compression_hint: str
+0069:     notes: str
+0070:     runtime_options: dict[str, Any]
+0071:     runs: list[dict[str, Any]]
+0072:     success_count: int
+0073:     run_count: int
+0074:     success_rate: float
+0075:     avg_eval_tokens_per_second: float | None
+0076:     avg_end_to_end_tokens_per_second: float | None
+0077:     avg_total_seconds: float | None
+0078:     peak_private_gb: float | None
+0079:     peak_working_set_gb: float | None
+0080:     ram_target_delta_gb: float | None
+0081: 
+0082: 
+0083: def _utc_now_iso() -> str:
+0084:     return datetime.now(timezone.utc).isoformat()
+0085: 
+0086: 
+0087: def _safe_float(value: Any) -> float | None:
+0088:     if isinstance(value, (int, float)) and not isinstance(value, bool):
+0089:         return float(value)
+0090:     return None
+0091: 
+0092: 
+0093: def _to_gb(value_bytes: int | float | None) -> float | None:
+0094:     if value_bytes is None:
+0095:         return None
+0096:     return float(value_bytes) / float(1024**3)
+0097: 
+0098: 
+0099: def _ns_to_seconds(value_ns: Any) -> float | None:
+0100:     numeric = _safe_float(value_ns)
+0101:     if numeric is None:
+0102:         return None
+0103:     return numeric / 1_000_000_000.0
+0104: 
+0105: 
+0106: def _extract_metrics(smoke_result: Mapping[str, Any]) -> dict[str, Any]:
+0107:     inference = smoke_result.get("inference")
+0108:     if not isinstance(inference, Mapping):
+0109:         return {"error": "missing inference envelope"}
+0110:     result = inference.get("result")
+0111:     if not isinstance(result, Mapping):
+0112:         return {"error": "missing inference result"}
+0113:     usage = result.get("usage")
+0114:     if not isinstance(usage, Mapping):
+0115:         usage = {}
+0116:     raw = result.get("raw")
+0117:     if not isinstance(raw, Mapping):
+0118:         raw = {}
+0119: 
+0120:     eval_count = _safe_float(usage.get("eval_count", raw.get("eval_count")))
+0121:     eval_duration_s = _ns_to_seconds(usage.get("eval_duration", raw.get("eval_duration")))
+0122:     total_duration_s = _ns_to_seconds(usage.get("total_duration", raw.get("total_duration")))
+0123:     load_duration_s = _ns_to_seconds(usage.get("load_duration", raw.get("load_duration")))
+0124:     prompt_eval_count = _safe_float(usage.get("prompt_eval_count", raw.get("prompt_eval_count")))
+0125:     prompt_eval_duration_s = _ns_to_seconds(usage.get("prompt_eval_duration", raw.get("prompt_eval_duration")))
+0126: 
+0127:     eval_tps = None
+0128:     if eval_count is not None and eval_duration_s is not None and eval_duration_s > 0:
+0129:         eval_tps = eval_count / eval_duration_s
+0130: 
+0131:     end_to_end_tps = None
+0132:     if eval_count is not None and total_duration_s is not None and total_duration_s > 0:
+0133:         end_to_end_tps = eval_count / total_duration_s
+0134: 
+0135:     return {
+0136:         "eval_count": eval_count,
+0137:         "eval_duration_seconds": eval_duration_s,
+0138:         "total_duration_seconds": total_duration_s,
+0139:         "load_duration_seconds": load_duration_s,
+0140:         "prompt_eval_count": prompt_eval_count,
+0141:         "prompt_eval_duration_seconds": prompt_eval_duration_s,
+0142:         "eval_tokens_per_second": eval_tps,
+0143:         "end_to_end_tokens_per_second": end_to_end_tps,
+0144:         "finish_reason": result.get("finish_reason"),
+0145:     }
+0146: 
+0147: 
+0148: def _run_powershell(command: str) -> str:
+0149:     completed = subprocess.run(
+0150:         ["powershell", "-NoProfile", "-Command", command],
+0151:         capture_output=True,
+0152:         text=True,
+0153:         check=False,
+0154:     )
+0155:     if completed.returncode != 0:
+0156:         raise RuntimeError(completed.stderr.strip() or f"PowerShell command failed: {command}")
+0157:     return completed.stdout.strip()
+0158: 
+0159: 
+0160: def _collect_ollama_process_memory() -> dict[str, Any]:
+0161:     cmd = (
+0162:         "$p = Get-Process ollama -ErrorAction SilentlyContinue | "
+0163:         "Sort-Object WorkingSet64 -Descending | Select-Object -First 1 "
+0164:         "Id,ProcessName,WorkingSet64,PrivateMemorySize64; "
+0165:         "if ($null -eq $p) { '{}' } else { $p | ConvertTo-Json -Compress }"
+0166:     )
+0167:     try:
+0168:         text = _run_powershell(cmd)
+0169:     except Exception as exc:
+0170:         return {"observed": False, "error": str(exc), "source": "powershell"}
+0171:     if not text:
+0172:         return {"observed": False, "source": "powershell"}
+0173:     try:
+0174:         decoded = json.loads(text)
+0175:     except json.JSONDecodeError:
+0176:         return {"observed": False, "error": "failed to parse PowerShell JSON output", "source": "powershell"}
+0177:     if not isinstance(decoded, Mapping) or not decoded:
+0178:         return {"observed": False, "source": "powershell"}
+0179: 
+0180:     working_set_bytes = decoded.get("WorkingSet64")
+0181:     private_bytes = decoded.get("PrivateMemorySize64")
+0182:     ws_float = _safe_float(working_set_bytes)
+0183:     private_float = _safe_float(private_bytes)
+0184:     return {
+0185:         "observed": True,
+0186:         "source": "powershell",
+0187:         "process_id": decoded.get("Id"),
+0188:         "process_name": decoded.get("ProcessName"),
+0189:         "working_set_bytes": int(ws_float) if ws_float is not None else None,
+0190:         "private_bytes": int(private_float) if private_float is not None else None,
+0191:         "working_set_gb": _to_gb(ws_float),
+0192:         "private_gb": _to_gb(private_float),
+0193:     }
+0194: 
+0195: 
+0196: def _collect_ollama_ps(base_url: str, timeout_seconds: float = 5.0) -> dict[str, Any]:
+0197:     url = f"{base_url.rstrip('/')}/api/ps"
+0198:     req = request.Request(url=url, method="GET")
+0199:     try:
+0200:         with request.urlopen(req, timeout=timeout_seconds) as response:
+0201:             body = response.read().decode("utf-8")
+0202:     except error.URLError as exc:
+0203:         return {"observed": False, "error": str(exc.reason), "source": "ollama_ps"}
+0204:     except Exception as exc:  # pragma: no cover - defensive boundary
+0205:         return {"observed": False, "error": str(exc), "source": "ollama_ps"}
+0206: 
+0207:     try:
+0208:         decoded = json.loads(body)
+0209:     except json.JSONDecodeError:
+0210:         return {"observed": False, "error": "invalid JSON from /api/ps", "source": "ollama_ps"}
+0211:     if not isinstance(decoded, Mapping):
+0212:         return {"observed": False, "error": "unexpected /api/ps payload", "source": "ollama_ps"}
+0213: 
+0214:     models = decoded.get("models")
+0215:     if not isinstance(models, list):
+0216:         models = []
+0217:     top_size_bytes: int | None = None
+0218:     top_size_vram_bytes: int | None = None
+0219:     if models:
+0220:         candidate_models = [item for item in models if isinstance(item, Mapping)]
+0221:         if candidate_models:
+0222:             by_size = sorted(
+0223:                 candidate_models,
+0224:                 key=lambda item: float(item.get("size", 0) or 0),
+0225:                 reverse=True,
+0226:             )
+0227:             top = by_size[0]
+0228:             top_size = _safe_float(top.get("size"))
+0229:             top_size_vram = _safe_float(top.get("size_vram"))
+0230:             top_size_bytes = int(top_size) if top_size is not None else None
+0231:             top_size_vram_bytes = int(top_size_vram) if top_size_vram is not None else None
+0232: 
+0233:     return {
+0234:         "observed": True,
+0235:         "source": "ollama_ps",
+0236:         "model_count": len(models),
+0237:         "models": decoded.get("models"),
+0238:         "top_size_bytes": top_size_bytes,
+0239:         "top_size_vram_bytes": top_size_vram_bytes,
+0240:         "top_size_gb": _to_gb(top_size_bytes),
+0241:         "top_size_vram_gb": _to_gb(top_size_vram_bytes),
+0242:     }
+0243: 
+0244: 
+0245: def build_default_candidates(model_size_billion: float | None) -> list[CandidateConfig]:
+0246:     """Return compression-aware candidate options.
+0247: 
+0248:     These are option profiles, not quantization guarantees. The quantization
+0249:     still depends on which model tag the operator has pulled.
+0250:     """
+0251: 
+0252:     if model_size_billion is None:
+0253:         size_class = "unknown"
+0254:     elif model_size_billion >= 60.0:
+0255:         size_class = "70b_class"
+0256:     elif model_size_billion >= 30.0:
+0257:         size_class = "30b_class"
+0258:     else:
+0259:         size_class = "14b_class"
+0260: 
+0261:     if size_class == "70b_class":
+0262:         return [
+0263:             CandidateConfig(
+0264:                 candidate_id="q4_fit",
+0265:                 compression_hint="Prefer Q4_K_M or equivalent",
+0266:                 notes="Safest fit-first profile for very large models.",
+0267:                 runtime_options={"num_ctx": 2048, "num_batch": 12, "num_gpu": 18, "top_p": 0.9, "repeat_penalty": 1.1},
+0268:             ),
+0269:             CandidateConfig(
+0270:                 candidate_id="q4_balance",
+0271:                 compression_hint="Prefer Q4_K_M or equivalent",
+0272:                 notes="Moderate context and throughput while preserving fit margin.",
+0273:                 runtime_options={"num_ctx": 3072, "num_batch": 16, "num_gpu": 20, "top_p": 0.9, "repeat_penalty": 1.1},
+0274:             ),
+0275:             CandidateConfig(
+0276:                 candidate_id="q6_push",
+0277:                 compression_hint="Prefer Q6_K if memory allows",
+0278:                 notes="Higher quality target; may exceed fit on tight systems.",
+0279:                 runtime_options={"num_ctx": 2048, "num_batch": 8, "num_gpu": 20, "top_p": 0.92, "repeat_penalty": 1.08},
+0280:             ),
+0281:         ]
+0282: 
+0283:     if size_class == "30b_class":
+0284:         return [
+0285:             CandidateConfig(
+0286:                 candidate_id="q4_balance",
+0287:                 compression_hint="Prefer Q4_K_M or equivalent",
+0288:                 notes="Balanced profile for 30B class models.",
+0289:                 runtime_options={"num_ctx": 4096, "num_batch": 20, "num_gpu": 20, "top_p": 0.9, "repeat_penalty": 1.1},
+0290:             ),
+0291:             CandidateConfig(
+0292:                 candidate_id="q6_balance",
+0293:                 compression_hint="Prefer Q6_K if memory allows",
+0294:                 notes="More quality, slightly heavier memory profile.",
+0295:                 runtime_options={"num_ctx": 3072, "num_batch": 16, "num_gpu": 22, "top_p": 0.92, "repeat_penalty": 1.08},
+0296:             ),
+0297:             CandidateConfig(
+0298:                 candidate_id="q8_push",
+0299:                 compression_hint="Prefer Q8_0 only when fit margin is large",
+0300:                 notes="Aggressive memory push for high-RAM hosts.",
+0301:                 runtime_options={"num_ctx": 4096, "num_batch": 24, "num_gpu": 24, "top_p": 0.95, "repeat_penalty": 1.05},
+0302:             ),
+0303:         ]
+0304: 
+0305:     return [
+0306:         CandidateConfig(
+0307:             candidate_id="q4_balance",
+0308:             compression_hint="Prefer Q4_K_M or equivalent",
+0309:             notes="Default profile for 14B class models.",
+0310:             runtime_options={"num_ctx": 4096, "num_batch": 24, "num_gpu": 24, "top_p": 0.9, "repeat_penalty": 1.1},
+0311:         ),
+0312:         CandidateConfig(
+0313:             candidate_id="q4_context_push",
+0314:             compression_hint="Prefer Q4_K_M or equivalent",
+0315:             notes="Higher context for RAM-rich hosts; slower decode expected.",
+0316:             runtime_options={"num_ctx": 6144, "num_batch": 20, "num_gpu": 24, "top_p": 0.9, "repeat_penalty": 1.1},
+0317:         ),
+0318:         CandidateConfig(
+0319:             candidate_id="q6_balance",
+0320:             compression_hint="Prefer Q6_K if memory allows",
+0321:             notes="Quality-oriented profile with tighter context.",
+0322:             runtime_options={"num_ctx": 3072, "num_batch": 16, "num_gpu": 24, "top_p": 0.92, "repeat_penalty": 1.08},
+0323:         ),
+0324:     ]
+0325: 
+0326: 
+0327: def _distance_to_target_bytes(summary: CandidateSummary, target_ram_bytes: float) -> float:
+0328:     peak_private_gb = summary.peak_private_gb
+0329:     peak_working_set_gb = summary.peak_working_set_gb
+0330:     observed_gb = peak_private_gb if peak_private_gb is not None else peak_working_set_gb
+0331:     if observed_gb is None:
+0332:         return float("inf")
+0333:     return abs((observed_gb * float(1024**3)) - target_ram_bytes)
+0334: 
+0335: 
+0336: def select_best_candidate(
+0337:     summaries: Sequence[CandidateSummary],
+0338:     *,
+0339:     target_ram_gb: float,
+0340: ) -> CandidateSummary | None:
+0341:     target_ram_bytes = float(target_ram_gb) * float(1024**3)
+0342:     successful = [item for item in summaries if item.success_count > 0]
+0343:     if not successful:
+0344:         return None
+0345:     return min(
+0346:         successful,
+0347:         key=lambda item: (
+0348:             _distance_to_target_bytes(item, target_ram_bytes),
+0349:             -(item.avg_eval_tokens_per_second or 0.0),
+0350:             -(item.avg_end_to_end_tokens_per_second or 0.0),
+0351:         ),
+0352:     )
+0353: 
+0354: 
+0355: def _summarize_runs(
+0356:     candidate: CandidateConfig,
+0357:     runs: Sequence[CandidateRun],
+0358:     *,
+0359:     target_ram_gb: float,
+0360: ) -> CandidateSummary:
+0361:     run_dicts = [asdict(item) for item in runs]
+0362:     success_runs = [item for item in runs if item.ok]
+0363: 
+0364:     def _mean(values: list[float]) -> float | None:
+0365:         if not values:
+0366:             return None
+0367:         return sum(values) / len(values)
+0368: 
+0369:     eval_tps_values = [
+0370:         float(item.metrics.get("eval_tokens_per_second"))
+0371:         for item in success_runs
+0372:         if _safe_float(item.metrics.get("eval_tokens_per_second")) is not None
+0373:     ]
+0374:     end_to_end_tps_values = [
+0375:         float(item.metrics.get("end_to_end_tokens_per_second"))
+0376:         for item in success_runs
+0377:         if _safe_float(item.metrics.get("end_to_end_tokens_per_second")) is not None
+0378:     ]
+0379:     total_seconds_values = [
+0380:         float(item.metrics.get("total_duration_seconds"))
+0381:         for item in success_runs
+0382:         if _safe_float(item.metrics.get("total_duration_seconds")) is not None
+0383:     ]
+0384: 
+0385:     peak_private_gb = None
+0386:     peak_working_set_gb = None
+0387:     for item in success_runs:
+0388:         private_gb = _safe_float(item.memory_after.get("private_gb"))
+0389:         ws_gb = _safe_float(item.memory_after.get("working_set_gb"))
+0390:         if private_gb is not None:
+0391:             peak_private_gb = private_gb if peak_private_gb is None else max(peak_private_gb, private_gb)
+0392:         if ws_gb is not None:
+0393:             peak_working_set_gb = ws_gb if peak_working_set_gb is None else max(peak_working_set_gb, ws_gb)
+0394: 
+0395:     observed_gb = peak_private_gb if peak_private_gb is not None else peak_working_set_gb
+0396:     ram_target_delta_gb = None
+0397:     if observed_gb is not None:
+0398:         ram_target_delta_gb = observed_gb - float(target_ram_gb)
+0399: 
+0400:     run_count = len(runs)
+0401:     success_count = len(success_runs)
+0402:     success_rate = (float(success_count) / float(run_count)) if run_count > 0 else 0.0
+0403: 
+0404:     return CandidateSummary(
+0405:         candidate_id=candidate.candidate_id,
+0406:         compression_hint=candidate.compression_hint,
+0407:         notes=candidate.notes,
+0408:         runtime_options=dict(candidate.runtime_options),
+0409:         runs=run_dicts,
+0410:         success_count=success_count,
+0411:         run_count=run_count,
+0412:         success_rate=success_rate,
+0413:         avg_eval_tokens_per_second=_mean(eval_tps_values),
+0414:         avg_end_to_end_tokens_per_second=_mean(end_to_end_tps_values),
+0415:         avg_total_seconds=_mean(total_seconds_values),
+0416:         peak_private_gb=peak_private_gb,
+0417:         peak_working_set_gb=peak_working_set_gb,
+0418:         ram_target_delta_gb=ram_target_delta_gb,
+0419:     )
+0420: 
+0421: 
+0422: def _default_output_paths(run_id: str) -> tuple[Path, Path]:
+0423:     target_dir = REPO_ROOT / "reports" / "benchmarks"
+0424:     target_dir.mkdir(parents=True, exist_ok=True)
+0425:     base = target_dir / f"ram_target_{run_id}"
+0426:     return base.with_suffix(".json"), base.with_suffix(".md")
+0427: 
+0428: 
+0429: def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
+0430:     path.parent.mkdir(parents=True, exist_ok=True)
+0431:     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True), encoding="utf-8")
+0432: 
+0433: 
+0434: def _write_markdown(path: Path, payload: Mapping[str, Any]) -> None:
+0435:     path.parent.mkdir(parents=True, exist_ok=True)
+0436:     lines: list[str] = []
+0437:     lines.append("# RAM Target Benchmark Report")
+0438:     lines.append("")
+0439:     lines.append(f"- Generated at: `{payload.get('generated_at')}`")
+0440:     lines.append(f"- Run ID: `{payload.get('run_id')}`")
+0441:     lines.append(f"- Model: `{payload.get('model_name')}`")
+0442:     lines.append(f"- Target RAM (GB): `{payload.get('target_ram_gb')}`")
+0443:     lines.append("")
+0444: 
+0445:     best = payload.get("best_candidate")
+0446:     if isinstance(best, Mapping):
+0447:         lines.append("## Recommended Candidate")
+0448:         lines.append("")
+0449:         lines.append(f"- Candidate ID: `{best.get('candidate_id')}`")
+0450:         lines.append(f"- Compression Hint: `{best.get('compression_hint')}`")
+0451:         lines.append(f"- Success Rate: `{best.get('success_rate')}`")
+0452:         lines.append(f"- Avg Eval Tokens/Sec: `{best.get('avg_eval_tokens_per_second')}`")
+0453:         lines.append(f"- Peak Private GB: `{best.get('peak_private_gb')}`")
+0454:         lines.append(f"- Peak Working Set GB: `{best.get('peak_working_set_gb')}`")
+0455:         lines.append(f"- RAM Delta GB (observed - target): `{best.get('ram_target_delta_gb')}`")
+0456:         lines.append(f"- Runtime Options: `{best.get('runtime_options')}`")
+0457:         lines.append("")
+0458: 
+0459:     summaries = payload.get("candidate_summaries")
+0460:     if isinstance(summaries, list):
+0461:         lines.append("## All Candidates")
+0462:         lines.append("")
+0463:         for item in summaries:
+0464:             if not isinstance(item, Mapping):
+0465:                 continue
+0466:             lines.append(f"### `{item.get('candidate_id')}`")
+0467:             lines.append(f"- Compression Hint: `{item.get('compression_hint')}`")
+0468:             lines.append(f"- Success Rate: `{item.get('success_rate')}`")
+0469:             lines.append(f"- Avg Eval Tokens/Sec: `{item.get('avg_eval_tokens_per_second')}`")
+0470:             lines.append(f"- Peak Private GB: `{item.get('peak_private_gb')}`")
+0471:             lines.append(f"- Peak Working Set GB: `{item.get('peak_working_set_gb')}`")
+0472:             lines.append(f"- RAM Delta GB: `{item.get('ram_target_delta_gb')}`")
+0473:             lines.append(f"- Runtime Options: `{item.get('runtime_options')}`")
+0474:             lines.append("")
+0475: 
+0476:     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+0477: 
+0478: 
+0479: def _run_candidate_iteration(
+0480:     *,
+0481:     candidate: CandidateConfig,
+0482:     iteration: int,
+0483:     model_name: str,
+0484:     prompt: str,
+0485:     runtime_backend: str,
+0486:     runtime_profile: str,
+0487:     ollama_base_url: str,
+0488:     temperature: float,
+0489:     max_tokens: int,
+0490:     service_runstep_mode: str,
+0491:     ipc_timeout_seconds: float,
+0492: ) -> CandidateRun:
+0493:     memory_before = _collect_ollama_process_memory()
+0494:     ollama_ps_before = _collect_ollama_ps(ollama_base_url)
+0495:     try:
+0496:         smoke_result = run_live_inference_smoke(
+0497:             model_name=model_name,
+0498:             prompt=prompt,
+0499:             runtime_backend=runtime_backend,
+0500:             runtime_profile=runtime_profile,
+0501:             runtime_backend_options=candidate.runtime_options,
+0502:             runtime_profile_override=None,
+0503:             runtime_backend_options_override=None,
+0504:             ollama_base_url=ollama_base_url,
+0505:             temperature=temperature,
+0506:             max_tokens=max_tokens,
+0507:             service_runstep_mode=service_runstep_mode,
+0508:             ipc_timeout_seconds=ipc_timeout_seconds,
+0509:         )
+0510:         metrics = _extract_metrics(smoke_result)
+0511:         ok = True
+0512:         error_text = None
+0513:     except Exception as exc:
+0514:         metrics = {"error": str(exc)}
+0515:         ok = False
+0516:         error_text = str(exc)
+0517: 
+0518:     memory_after = _collect_ollama_process_memory()
+0519:     ollama_ps_after = _collect_ollama_ps(ollama_base_url)
+0520: 
+0521:     return CandidateRun(
+0522:         candidate_id=candidate.candidate_id,
+0523:         iteration=iteration,
+0524:         ok=ok,
+0525:         error=error_text,
+0526:         memory_before=memory_before,
+0527:         memory_after=memory_after,
+0528:         ollama_ps_before=ollama_ps_before,
+0529:         ollama_ps_after=ollama_ps_after,
+0530:         metrics=metrics,
+0531:     )
+0532: 
+0533: 
+0534: def run_ram_target_benchmark(
+0535:     *,
+0536:     model_name: str,
+0537:     target_ram_gb: float,
+0538:     runtime_profile: str,
+0539:     runtime_backend: str,
+0540:     prompt: str,
+0541:     ollama_base_url: str,
+0542:     temperature: float,
+0543:     max_tokens: int,
+0544:     service_runstep_mode: str,
+0545:     ipc_timeout_seconds: float,
+0546:     iterations: int,
+0547:     cooldown_seconds: float,
+0548: ) -> dict[str, Any]:
+0549:     model_size_billion = infer_model_size_billion(model_name)
+0550:     candidates = build_default_candidates(model_size_billion)
+0551:     summaries: list[CandidateSummary] = []
+0552: 
+0553:     for candidate in candidates:
+0554:         runs: list[CandidateRun] = []
+0555:         for iteration in range(1, iterations + 1):
+0556:             run = _run_candidate_iteration(
+0557:                 candidate=candidate,
+0558:                 iteration=iteration,
+0559:                 model_name=model_name,
+0560:                 prompt=prompt,
+0561:                 runtime_backend=runtime_backend,
+0562:                 runtime_profile=runtime_profile,
+0563:                 ollama_base_url=ollama_base_url,
+0564:                 temperature=temperature,
+0565:                 max_tokens=max_tokens,
+0566:                 service_runstep_mode=service_runstep_mode,
+0567:                 ipc_timeout_seconds=ipc_timeout_seconds,
+0568:             )
+0569:             runs.append(run)
+0570:             if cooldown_seconds > 0 and iteration < iterations:
+0571:                 sleep(cooldown_seconds)
+0572:         summaries.append(_summarize_runs(candidate, runs, target_ram_gb=target_ram_gb))
+0573: 
+0574:     best = select_best_candidate(summaries, target_ram_gb=target_ram_gb)
+0575:     report: dict[str, Any] = {
+0576:         "generated_at": _utc_now_iso(),
+0577:         "model_name": model_name,
+0578:         "model_size_billion": model_size_billion,
+0579:         "target_ram_gb": target_ram_gb,
+0580:         "runtime_profile": runtime_profile,
+0581:         "runtime_backend": runtime_backend,
+0582:         "prompt_length": len(prompt),
+0583:         "iterations_per_candidate": iterations,
+0584:         "cooldown_seconds": cooldown_seconds,
+0585:         "candidate_summaries": [asdict(item) for item in summaries],
+0586:         "best_candidate": asdict(best) if best is not None else None,
+0587:     }
+0588:     return report
+0589: 
+0590: 
+0591: def _build_parser() -> argparse.ArgumentParser:
+0592:     parser = argparse.ArgumentParser(
+0593:         description="Run a compression-aware RAM-target benchmark sweep for local Ollama inference."
+0594:     )
+0595:     parser.add_argument("--model", required=True, help="Model tag to benchmark (for example: qwen2.5:14b).")
+0596:     parser.add_argument("--target-ram-gb", type=float, default=DEFAULT_TARGET_RAM_GB, help="Target host RAM usage in GB.")
+0597:     parser.add_argument("--runtime-profile", default=DEFAULT_RUNTIME_PROFILE, help="Runtime profile to use for all candidates.")
+0598:     parser.add_argument("--runtime-backend", default=DEFAULT_RUNTIME_BACKEND, choices=["ollama", "simulation"])
+0599:     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Prompt used for each benchmark run.")
+0600:     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL, help="Ollama base URL.")
+0601:     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+0602:     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+0603:     parser.add_argument("--service-runstep-mode", choices=["simulation", "auto", "hardware"], default="simulation")
+0604:     parser.add_argument("--ipc-timeout-seconds", type=float, default=DEFAULT_IPC_TIMEOUT_SECONDS)
+0605:     parser.add_argument("--iterations", type=int, default=DEFAULT_ITERATIONS, help="Runs per candidate option profile.")
+0606:     parser.add_argument("--cooldown-seconds", type=float, default=DEFAULT_COOLDOWN_SECONDS, help="Sleep between iterations.")
+0607:     parser.add_argument("--run-id", default=None, help="Optional run identifier for report filenames.")
+0608:     parser.add_argument("--output-json", default=None, help="Optional explicit JSON report path.")
+0609:     parser.add_argument("--output-md", default=None, help="Optional explicit Markdown report path.")
+0610:     return parser
+0611: 
+0612: 
+0613: def main(argv: Sequence[str] | None = None) -> int:
+0614:     parser = _build_parser()
+0615:     args = parser.parse_args(argv)
+0616:     run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+0617: 
+0618:     report = run_ram_target_benchmark(
+0619:         model_name=args.model,
+0620:         target_ram_gb=float(args.target_ram_gb),
+0621:         runtime_profile=args.runtime_profile,
+0622:         runtime_backend=args.runtime_backend,
+0623:         prompt=args.prompt,
+0624:         ollama_base_url=args.ollama_url,
+0625:         temperature=float(args.temperature),
+0626:         max_tokens=int(args.max_tokens),
+0627:         service_runstep_mode=args.service_runstep_mode,
+0628:         ipc_timeout_seconds=float(args.ipc_timeout_seconds),
+0629:         iterations=max(int(args.iterations), 1),
+0630:         cooldown_seconds=max(float(args.cooldown_seconds), 0.0),
+0631:     )
+0632:     report["run_id"] = run_id
+0633: 
+0634:     default_json_path, default_md_path = _default_output_paths(run_id)
+0635:     json_path = Path(args.output_json) if args.output_json else default_json_path
+0636:     md_path = Path(args.output_md) if args.output_md else default_md_path
+0637: 
+0638:     _write_json(json_path, report)
+0639:     _write_markdown(md_path, report)
+0640: 
+0641:     output = {
+0642:         "ok": True,
+0643:         "result": {
+0644:             "run_id": run_id,
+0645:             "json_report": str(json_path),
+0646:             "markdown_report": str(md_path),
+0647:             "best_candidate": report.get("best_candidate"),
+0648:         },
+0649:     }
+0650:     print(json.dumps(output, ensure_ascii=True, indent=2, sort_keys=True))
+0651:     return 0
+0652: 
+0653: 
+0654: if __name__ == "__main__":  # pragma: no cover
+0655:     raise SystemExit(main())

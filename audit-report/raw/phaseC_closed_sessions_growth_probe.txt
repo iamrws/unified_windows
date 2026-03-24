@@ -1,0 +1,4 @@
+﻿iterations 500
+closed_sessions_count 500
+active_sessions_count 0
+elapsed_ms 55.557900021085516

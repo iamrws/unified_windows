@@ -1,0 +1,2 @@
+﻿transport named_pipe
+endpoint \\.\pipe\astrawave

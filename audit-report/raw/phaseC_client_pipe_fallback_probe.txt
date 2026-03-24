@@ -1,0 +1,3 @@
+﻿host_started localhost ('127.0.0.1', 8765)
+client_connected pipe://\\.\pipe\definitely_missing_pipe
+create_session_ok True 7a0f58fa-abd8-4b47-9af7-96fe014c3e49

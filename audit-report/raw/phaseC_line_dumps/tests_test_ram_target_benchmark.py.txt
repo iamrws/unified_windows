@@ -1,0 +1,105 @@
+﻿0001: """Contract tests for RAM-target benchmark/autotune script."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import unittest
+0006: 
+0007: from scripts.ram_target_benchmark import (
+0008:     CandidateSummary,
+0009:     _extract_metrics,
+0010:     build_default_candidates,
+0011:     select_best_candidate,
+0012: )
+0013: 
+0014: 
+0015: class RamTargetBenchmarkContractTests(unittest.TestCase):
+0016:     def test_build_default_candidates_for_70b_class_prefers_fit_profiles(self) -> None:
+0017:         candidates = build_default_candidates(72.0)
+0018:         ids = [item.candidate_id for item in candidates]
+0019:         self.assertEqual(ids[0], "q4_fit")
+0020:         self.assertIn("q4_balance", ids)
+0021:         self.assertIn("q6_push", ids)
+0022:         self.assertEqual(candidates[0].runtime_options["num_ctx"], 2048)
+0023: 
+0024:     def test_extract_metrics_computes_decode_and_end_to_end_throughput(self) -> None:
+0025:         smoke_result = {
+0026:             "inference": {
+0027:                 "result": {
+0028:                     "usage": {
+0029:                         "eval_count": 120,
+0030:                         "eval_duration": 6_000_000_000,
+0031:                         "total_duration": 10_000_000_000,
+0032:                         "load_duration": 1_000_000_000,
+0033:                         "prompt_eval_count": 40,
+0034:                         "prompt_eval_duration": 2_000_000_000,
+0035:                     },
+0036:                     "finish_reason": "stop",
+0037:                 }
+0038:             }
+0039:         }
+0040:         metrics = _extract_metrics(smoke_result)
+0041:         self.assertAlmostEqual(metrics["eval_tokens_per_second"], 20.0)
+0042:         self.assertAlmostEqual(metrics["end_to_end_tokens_per_second"], 12.0)
+0043:         self.assertAlmostEqual(metrics["total_duration_seconds"], 10.0)
+0044:         self.assertEqual(metrics["finish_reason"], "stop")
+0045: 
+0046:     def test_select_best_candidate_prefers_ram_target_proximity_then_speed(self) -> None:
+0047:         summaries = [
+0048:             CandidateSummary(
+0049:                 candidate_id="A",
+0050:                 compression_hint="q4",
+0051:                 notes="a",
+0052:                 runtime_options={},
+0053:                 runs=[],
+0054:                 success_count=1,
+0055:                 run_count=1,
+0056:                 success_rate=1.0,
+0057:                 avg_eval_tokens_per_second=9.0,
+0058:                 avg_end_to_end_tokens_per_second=5.0,
+0059:                 avg_total_seconds=20.0,
+0060:                 peak_private_gb=70.0,
+0061:                 peak_working_set_gb=72.0,
+0062:                 ram_target_delta_gb=-20.0,
+0063:             ),
+0064:             CandidateSummary(
+0065:                 candidate_id="B",
+0066:                 compression_hint="q6",
+0067:                 notes="b",
+0068:                 runtime_options={},
+0069:                 runs=[],
+0070:                 success_count=1,
+0071:                 run_count=1,
+0072:                 success_rate=1.0,
+0073:                 avg_eval_tokens_per_second=7.0,
+0074:                 avg_end_to_end_tokens_per_second=4.0,
+0075:                 avg_total_seconds=25.0,
+0076:                 peak_private_gb=88.0,
+0077:                 peak_working_set_gb=90.0,
+0078:                 ram_target_delta_gb=-2.0,
+0079:             ),
+0080:             CandidateSummary(
+0081:                 candidate_id="C",
+0082:                 compression_hint="q8",
+0083:                 notes="c",
+0084:                 runtime_options={},
+0085:                 runs=[],
+0086:                 success_count=1,
+0087:                 run_count=1,
+0088:                 success_rate=1.0,
+0089:                 avg_eval_tokens_per_second=8.5,
+0090:                 avg_end_to_end_tokens_per_second=4.8,
+0091:                 avg_total_seconds=22.0,
+0092:                 peak_private_gb=88.0,
+0093:                 peak_working_set_gb=90.0,
+0094:                 ram_target_delta_gb=-2.0,
+0095:             ),
+0096:         ]
+0097:         best = select_best_candidate(summaries, target_ram_gb=90.0)
+0098:         self.assertIsNotNone(best)
+0099:         assert best is not None
+0100:         # B and C are equally close to target RAM, so throughput tie-breaker picks C.
+0101:         self.assertEqual(best.candidate_id, "C")
+0102: 
+0103: 
+0104: if __name__ == "__main__":
+0105:     unittest.main()

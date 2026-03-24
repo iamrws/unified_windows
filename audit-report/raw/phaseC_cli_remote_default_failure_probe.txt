@@ -1,0 +1,4 @@
+﻿host_started localhost ('127.0.0.1', 8765)
+returncode 1
+stdout 
+stderr {"error":{"code":"AW_ERR_AUTH_DENIED","message":"caller PID is not active on this host"},"ok":false}

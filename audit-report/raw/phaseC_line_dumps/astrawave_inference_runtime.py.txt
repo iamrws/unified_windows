@@ -1,0 +1,306 @@
+﻿0001: """Inference runtime adapters for local model execution."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: from dataclasses import dataclass
+0006: import json
+0007: import os
+0008: from typing import Any, Callable, Mapping, Protocol
+0009: from urllib import error, request
+0010: 
+0011: from .errors import ApiError, ApiErrorCode
+0012: from .runtime_tuning import merge_backend_options, resolve_runtime_tuning
+0013: 
+0014: DEFAULT_OLLAMA_BASE_URL = os.environ.get("ASTRAWEAVE_OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+0015: DEFAULT_OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("ASTRAWEAVE_OLLAMA_TIMEOUT_SECONDS", "120"))
+0016: 
+0017: InferenceTransport = Callable[[str, dict[str, Any], float], dict[str, Any]]
+0018: 
+0019: 
+0020: @dataclass(frozen=True, slots=True)
+0021: class InferenceModelBinding:
+0022:     """Structured model binding returned by a runtime backend."""
+0023: 
+0024:     backend: str
+0025:     requested_model_name: str
+0026:     resolved_model_name: str
+0027:     metadata: dict[str, Any]
+0028: 
+0029: 
+0030: class InferenceRuntime(Protocol):
+0031:     """Minimal runtime adapter contract used by the service."""
+0032: 
+0033:     backend_name: str
+0034: 
+0035:     def load_model(
+0036:         self,
+0037:         model_name: str,
+0038:         *,
+0039:         runtime_profile: str | None = None,
+0040:         backend_options: Mapping[str, Any] | None = None,
+0041:     ) -> InferenceModelBinding:
+0042:         """Prepare or bind a model name for later generation."""
+0043: 
+0044:     def generate(
+0045:         self,
+0046:         model_name: str,
+0047:         *,
+0048:         prompt: str,
+0049:         step_name: str,
+0050:         max_tokens: int | None = None,
+0051:         temperature: float | None = None,
+0052:         system_prompt: str | None = None,
+0053:         backend_options: Mapping[str, Any] | None = None,
+0054:     ) -> dict[str, Any]:
+0055:         """Generate output for one step."""
+0056: 
+0057: 
+0058: class SimulationInferenceRuntime:
+0059:     """Deterministic fallback backend used when no real runtime is configured."""
+0060: 
+0061:     backend_name = "simulation"
+0062: 
+0063:     def load_model(
+0064:         self,
+0065:         model_name: str,
+0066:         *,
+0067:         runtime_profile: str | None = None,
+0068:         backend_options: Mapping[str, Any] | None = None,
+0069:     ) -> InferenceModelBinding:
+0070:         tuning = resolve_runtime_tuning(
+0071:             model_name,
+0072:             runtime_profile=runtime_profile,
+0073:             backend_options=backend_options,
+0074:         )
+0075:         return InferenceModelBinding(
+0076:             backend=self.backend_name,
+0077:             requested_model_name=model_name,
+0078:             resolved_model_name=model_name,
+0079:             metadata={
+0080:                 "supports_prompt_generation": True,
+0081:                 "transport": "in-process",
+0082:                 "runtime_profile": tuning.profile_name,
+0083:                 "model_size_billion": tuning.model_size_billion,
+0084:                 "model_size_label": tuning.model_size_label,
+0085:                 "backend_options": tuning.backend_options,
+0086:             },
+0087:         )
+0088: 
+0089:     def generate(
+0090:         self,
+0091:         model_name: str,
+0092:         *,
+0093:         prompt: str,
+0094:         step_name: str,
+0095:         max_tokens: int | None = None,
+0096:         temperature: float | None = None,
+0097:         system_prompt: str | None = None,
+0098:         backend_options: Mapping[str, Any] | None = None,
+0099:     ) -> dict[str, Any]:
+0100:         del system_prompt
+0101:         output_text = (
+0102:             f"Simulated response from {model_name} for step '{step_name}' "
+0103:             f"using {len(prompt)} prompt chars."
+0104:         )
+0105:         return {
+0106:             "ok": True,
+0107:             "backend": self.backend_name,
+0108:             "model_name": model_name,
+0109:             "output_text": output_text,
+0110:             "finish_reason": "stop",
+0111:             "usage": {
+0112:                 "prompt_chars": len(prompt),
+0113:                 "completion_chars": len(output_text),
+0114:                 "max_tokens": max_tokens,
+0115:                 "temperature": temperature,
+0116:             },
+0117:         }
+0118: 
+0119: 
+0120: class OllamaInferenceRuntime:
+0121:     """HTTP adapter for a local Ollama daemon."""
+0122: 
+0123:     backend_name = "ollama"
+0124: 
+0125:     def __init__(
+0126:         self,
+0127:         *,
+0128:         base_url: str = DEFAULT_OLLAMA_BASE_URL,
+0129:         timeout_seconds: float = DEFAULT_OLLAMA_TIMEOUT_SECONDS,
+0130:         transport: InferenceTransport | None = None,
+0131:     ) -> None:
+0132:         self._base_url = base_url.rstrip("/")
+0133:         self._timeout_seconds = timeout_seconds
+0134:         self._transport = transport or _post_json
+0135: 
+0136:     def load_model(
+0137:         self,
+0138:         model_name: str,
+0139:         *,
+0140:         runtime_profile: str | None = None,
+0141:         backend_options: Mapping[str, Any] | None = None,
+0142:     ) -> InferenceModelBinding:
+0143:         tuning = resolve_runtime_tuning(
+0144:             model_name,
+0145:             runtime_profile=runtime_profile,
+0146:             backend_options=backend_options,
+0147:         )
+0148:         return InferenceModelBinding(
+0149:             backend=self.backend_name,
+0150:             requested_model_name=model_name,
+0151:             resolved_model_name=model_name,
+0152:             metadata={
+0153:                 "base_url": self._base_url,
+0154:                 "supports_prompt_generation": True,
+0155:                 "transport": "http",
+0156:                 "runtime_profile": tuning.profile_name,
+0157:                 "model_size_billion": tuning.model_size_billion,
+0158:                 "model_size_label": tuning.model_size_label,
+0159:                 "backend_options": tuning.backend_options,
+0160:             },
+0161:         )
+0162: 
+0163:     def generate(
+0164:         self,
+0165:         model_name: str,
+0166:         *,
+0167:         prompt: str,
+0168:         step_name: str,
+0169:         max_tokens: int | None = None,
+0170:         temperature: float | None = None,
+0171:         system_prompt: str | None = None,
+0172:         backend_options: Mapping[str, Any] | None = None,
+0173:     ) -> dict[str, Any]:
+0174:         payload: dict[str, Any] = {
+0175:             "model": model_name,
+0176:             "prompt": prompt,
+0177:             "stream": False,
+0178:         }
+0179:         if system_prompt:
+0180:             payload["system"] = system_prompt
+0181:         options = merge_backend_options(backend_options)
+0182:         if max_tokens is not None:
+0183:             options["num_predict"] = max_tokens
+0184:         if temperature is not None:
+0185:             options["temperature"] = temperature
+0186:         if options:
+0187:             payload["options"] = options
+0188: 
+0189:         raw = self._transport(f"{self._base_url}/api/generate", payload, self._timeout_seconds)
+0190:         output_text = str(raw.get("response", ""))
+0191:         return {
+0192:             "ok": True,
+0193:             "backend": self.backend_name,
+0194:             "model_name": model_name,
+0195:             "output_text": output_text,
+0196:             "finish_reason": raw.get("done_reason") or ("stop" if raw.get("done") else "unknown"),
+0197:             "usage": {
+0198:                 "prompt_eval_count": raw.get("prompt_eval_count"),
+0199:                 "eval_count": raw.get("eval_count"),
+0200:                 "total_duration": raw.get("total_duration"),
+0201:                 "load_duration": raw.get("load_duration"),
+0202:                 "eval_duration": raw.get("eval_duration"),
+0203:                 "step_name": step_name,
+0204:             },
+0205:             "raw": {
+0206:                 key: value
+0207:                 for key, value in raw.items()
+0208:                 if key not in {"prompt", "context"}
+0209:             },
+0210:         }
+0211: 
+0212: 
+0213: def create_inference_runtime(backend_name: str) -> InferenceRuntime:
+0214:     """Create a runtime adapter by stable backend name."""
+0215: 
+0216:     normalized = (backend_name or "").strip().lower()
+0217:     if normalized in {"", "simulation", "sim"}:
+0218:         return SimulationInferenceRuntime()
+0219:     if normalized in {"ollama", "ollama_local"}:
+0220:         return OllamaInferenceRuntime()
+0221:     raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported inference backend: {backend_name}")
+0222: 
+0223: 
+0224: def resolve_backend_and_model_name(
+0225:     model_name: str,
+0226:     runtime_backend: str | None = None,
+0227: ) -> tuple[str, str]:
+0228:     """Resolve backend + model from explicit selector and/or model-name prefix.
+0229: 
+0230:     Resolution rules:
+0231:     - Explicit runtime backend wins when provided (except `auto`).
+0232:     - Otherwise model-name prefix (`ollama:` / `simulation:`) decides.
+0233:     - If nothing is specified, default backend is `simulation`.
+0234:     """
+0235: 
+0236:     if not model_name or not model_name.strip():
+0237:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "model_name must not be empty")
+0238: 
+0239:     normalized_model = model_name.strip()
+0240:     prefixed_backend: str | None = None
+0241:     resolved_model = normalized_model
+0242:     for prefix, backend in (("ollama:", "ollama"), ("simulation:", "simulation")):
+0243:         if normalized_model.lower().startswith(prefix):
+0244:             candidate = normalized_model[len(prefix):].strip()
+0245:             if not candidate:
+0246:                 raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "model_name prefix must include a model identifier")
+0247:             prefixed_backend = backend
+0248:             resolved_model = candidate
+0249:             break
+0250: 
+0251:     backend_override = None
+0252:     if runtime_backend is not None:
+0253:         backend_override = runtime_backend.strip().lower()
+0254:         if backend_override in {"", "auto"}:
+0255:             backend_override = None
+0256:         elif backend_override not in {"simulation", "sim", "ollama", "ollama_local"}:
+0257:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported runtime_backend: {runtime_backend}")
+0258: 
+0259:     if backend_override is not None:
+0260:         if backend_override in {"sim", "simulation"}:
+0261:             return "simulation", resolved_model
+0262:         return "ollama", resolved_model
+0263:     if prefixed_backend is not None:
+0264:         return prefixed_backend, resolved_model
+0265:     return "simulation", resolved_model
+0266: 
+0267: 
+0268: def _post_json(url: str, payload: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+0269:     data = json.dumps(payload).encode("utf-8")
+0270:     req = request.Request(
+0271:         url,
+0272:         data=data,
+0273:         headers={"Content-Type": "application/json"},
+0274:         method="POST",
+0275:     )
+0276:     try:
+0277:         with request.urlopen(req, timeout=timeout_seconds) as response:
+0278:             body = response.read().decode("utf-8")
+0279:     except error.HTTPError as exc:  # pragma: no cover - network boundary
+0280:         detail = exc.read().decode("utf-8", errors="replace")
+0281:         raise ApiError(ApiErrorCode.INTERNAL, f"Ollama request failed with HTTP {exc.code}: {detail}") from exc
+0282:     except error.URLError as exc:  # pragma: no cover - network boundary
+0283:         raise ApiError(ApiErrorCode.INTERNAL, f"Ollama endpoint is unavailable: {exc.reason}") from exc
+0284:     except TimeoutError as exc:  # pragma: no cover - network boundary
+0285:         raise ApiError(ApiErrorCode.TIMEOUT, "Ollama request timed out") from exc
+0286: 
+0287:     try:
+0288:         decoded = json.loads(body)
+0289:     except json.JSONDecodeError as exc:  # pragma: no cover - network boundary
+0290:         raise ApiError(ApiErrorCode.INTERNAL, "Ollama returned invalid JSON") from exc
+0291:     if not isinstance(decoded, dict):
+0292:         raise ApiError(ApiErrorCode.INTERNAL, "Ollama response must be a JSON object")
+0293:     return decoded
+0294: 
+0295: 
+0296: __all__ = [
+0297:     "DEFAULT_OLLAMA_BASE_URL",
+0298:     "DEFAULT_OLLAMA_TIMEOUT_SECONDS",
+0299:     "InferenceModelBinding",
+0300:     "InferenceRuntime",
+0301:     "InferenceTransport",
+0302:     "OllamaInferenceRuntime",
+0303:     "SimulationInferenceRuntime",
+0304:     "create_inference_runtime",
+0305:     "resolve_backend_and_model_name",
+0306: ]

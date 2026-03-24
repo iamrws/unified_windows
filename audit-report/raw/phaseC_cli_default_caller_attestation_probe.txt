@@ -1,0 +1,6 @@
+﻿default_service_owner_sid S-1-5-21-2355809060-3684030834-485744656-1006
+current_sid S-1-5-21-2355809060-3684030834-485744656-1006
+attestation_allowed False
+attestation_error AW_ERR_AUTH_DENIED
+attestation_message caller PID is not active on this host
+current_pid 29928

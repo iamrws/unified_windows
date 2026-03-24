@@ -1,0 +1,231 @@
+﻿0001: """Runtime tuning helpers for local inference backends."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: from dataclasses import dataclass
+0006: from math import isfinite
+0007: import re
+0008: from typing import Any, Mapping
+0009: 
+0010: from .errors import ApiError, ApiErrorCode
+0011: 
+0012: DEFAULT_RUNTIME_PROFILE = "default"
+0013: AUTO_RUNTIME_PROFILE = "auto"
+0014: VRAM_CONSTRAINED_RUNTIME_PROFILE = "vram_constrained"
+0015: 
+0016: _PROFILE_ALIASES = {
+0017:     "": AUTO_RUNTIME_PROFILE,
+0018:     "adaptive": AUTO_RUNTIME_PROFILE,
+0019:     "auto": AUTO_RUNTIME_PROFILE,
+0020:     "balanced": DEFAULT_RUNTIME_PROFILE,
+0021:     "constrained": VRAM_CONSTRAINED_RUNTIME_PROFILE,
+0022:     "default": DEFAULT_RUNTIME_PROFILE,
+0023:     "memory_saver": VRAM_CONSTRAINED_RUNTIME_PROFILE,
+0024:     "low_vram": VRAM_CONSTRAINED_RUNTIME_PROFILE,
+0025:     "offload": VRAM_CONSTRAINED_RUNTIME_PROFILE,
+0026:     "ram_offload": VRAM_CONSTRAINED_RUNTIME_PROFILE,
+0027:     "standard": DEFAULT_RUNTIME_PROFILE,
+0028:     "vram_constrained": VRAM_CONSTRAINED_RUNTIME_PROFILE,
+0029: }
+0030: 
+0031: 
+0032: @dataclass(frozen=True, slots=True)
+0033: class RuntimeTuning:
+0034:     """Resolved tuning metadata for a model binding."""
+0035: 
+0036:     profile_name: str
+0037:     model_size_billion: float | None
+0038:     model_size_label: str | None
+0039:     backend_options: dict[str, Any]
+0040: 
+0041: 
+0042: def infer_model_size_billion(model_name: str) -> float | None:
+0043:     """Infer an approximate model scale from a model tag."""
+0044: 
+0045:     if not isinstance(model_name, str):
+0046:         return None
+0047: 
+0048:     normalized = model_name.strip().lower()
+0049:     if not normalized:
+0050:         return None
+0051: 
+0052:     candidates: list[float] = []
+0053: 
+0054:     for match in re.finditer(r"(?<!\d)(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)\s*[bB](?!\w)", normalized):
+0055:         lhs = float(match.group(1))
+0056:         rhs = float(match.group(2))
+0057:         candidates.append(lhs * rhs)
+0058: 
+0059:     for match in re.finditer(r"(?<!\d)(\d+(?:\.\d+)?)\s*[bB](?!\w)", normalized):
+0060:         candidates.append(float(match.group(1)))
+0061: 
+0062:     return max(candidates) if candidates else None
+0063: 
+0064: 
+0065: def format_model_size_label(model_size_billion: float | None) -> str | None:
+0066:     """Render a compact human-readable size label."""
+0067: 
+0068:     if model_size_billion is None:
+0069:         return None
+0070:     if float(model_size_billion).is_integer():
+0071:         return f"{int(model_size_billion)}b"
+0072:     return f"{model_size_billion:g}b"
+0073: 
+0074: 
+0075: def normalize_runtime_profile_name(profile_name: str | None) -> str:
+0076:     """Normalize a user-supplied runtime profile name."""
+0077: 
+0078:     normalized = "auto" if profile_name is None else profile_name.strip().lower().replace("-", "_")
+0079:     if normalized in _PROFILE_ALIASES:
+0080:         return _PROFILE_ALIASES[normalized]
+0081:     raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported runtime profile: {profile_name}")
+0082: 
+0083: 
+0084: def is_large_model(model_size_billion: float | None) -> bool:
+0085:     """Return whether a model is in the constrained-VRAM class."""
+0086: 
+0087:     return model_size_billion is not None and model_size_billion >= 14.0
+0088: 
+0089: 
+0090: def default_runtime_profile_for_model(model_size_billion: float | None) -> str:
+0091:     """Select the default runtime profile for a model scale."""
+0092: 
+0093:     return VRAM_CONSTRAINED_RUNTIME_PROFILE if is_large_model(model_size_billion) else DEFAULT_RUNTIME_PROFILE
+0094: 
+0095: 
+0096: def profile_backend_options(profile_name: str, model_size_billion: float | None) -> dict[str, Any]:
+0097:     """Return deterministic backend options for a runtime profile."""
+0098: 
+0099:     profile = normalize_runtime_profile_name(profile_name)
+0100:     if profile == AUTO_RUNTIME_PROFILE:
+0101:         profile = default_runtime_profile_for_model(model_size_billion)
+0102:     if profile == DEFAULT_RUNTIME_PROFILE:
+0103:         return {}
+0104:     if profile != VRAM_CONSTRAINED_RUNTIME_PROFILE:
+0105:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported runtime profile: {profile_name}")
+0106:     return _vram_constrained_backend_options(model_size_billion)
+0107: 
+0108: 
+0109: def resolve_runtime_tuning(
+0110:     model_name: str,
+0111:     *,
+0112:     runtime_profile: str | None = None,
+0113:     backend_options: Mapping[str, Any] | None = None,
+0114: ) -> RuntimeTuning:
+0115:     """Resolve a stable runtime profile and effective backend option payload."""
+0116: 
+0117:     model_size_billion = infer_model_size_billion(model_name)
+0118:     requested_profile = normalize_runtime_profile_name(runtime_profile)
+0119:     resolved_profile = (
+0120:         default_runtime_profile_for_model(model_size_billion)
+0121:         if requested_profile == AUTO_RUNTIME_PROFILE
+0122:         else requested_profile
+0123:     )
+0124:     profile_options = profile_backend_options(resolved_profile, model_size_billion)
+0125:     merged_backend_options = merge_backend_options(profile_options, backend_options)
+0126:     return RuntimeTuning(
+0127:         profile_name=resolved_profile,
+0128:         model_size_billion=model_size_billion,
+0129:         model_size_label=format_model_size_label(model_size_billion),
+0130:         backend_options=merged_backend_options,
+0131:     )
+0132: 
+0133: 
+0134: def normalize_backend_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
+0135:     """Validate and normalize backend options to JSON-friendly values."""
+0136: 
+0137:     if options is None:
+0138:         return {}
+0139:     if not isinstance(options, Mapping):
+0140:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "backend_options must be a mapping or null")
+0141: 
+0142:     normalized: dict[str, Any] = {}
+0143:     for raw_key, value in options.items():
+0144:         if not isinstance(raw_key, str) or not raw_key.strip():
+0145:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "backend_options keys must be non-empty strings")
+0146:         key = raw_key.strip()
+0147:         normalized[key] = _normalize_backend_option_value(value, key)
+0148:     return normalized
+0149: 
+0150: 
+0151: def merge_backend_options(*options: Mapping[str, Any] | None) -> dict[str, Any]:
+0152:     """Merge backend option mappings with later entries taking precedence."""
+0153: 
+0154:     merged: dict[str, Any] = {}
+0155:     for option_map in options:
+0156:         if option_map is None:
+0157:             continue
+0158:         merged.update(normalize_backend_options(option_map))
+0159:     return merged
+0160: 
+0161: 
+0162: def _normalize_backend_option_value(value: Any, key_path: str) -> Any:
+0163:     if value is None:
+0164:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"backend option '{key_path}' cannot be null")
+0165:     if isinstance(value, bool):
+0166:         return value
+0167:     if isinstance(value, int):
+0168:         return value
+0169:     if isinstance(value, float):
+0170:         if not isfinite(value):
+0171:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"backend option '{key_path}' must be finite")
+0172:         return value
+0173:     if isinstance(value, str):
+0174:         return value
+0175:     if isinstance(value, Mapping):
+0176:         normalized: dict[str, Any] = {}
+0177:         for raw_key, nested_value in value.items():
+0178:             if not isinstance(raw_key, str) or not raw_key.strip():
+0179:                 raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"backend option '{key_path}' has invalid nested key")
+0180:             nested_key = raw_key.strip()
+0181:             normalized[nested_key] = _normalize_backend_option_value(nested_value, f"{key_path}.{nested_key}")
+0182:         return normalized
+0183:     if isinstance(value, tuple):
+0184:         return [_normalize_backend_option_value(item, f"{key_path}[]") for item in value]
+0185:     if isinstance(value, list):
+0186:         return [_normalize_backend_option_value(item, f"{key_path}[]") for item in value]
+0187:     raise ApiError(
+0188:         ApiErrorCode.INVALID_ARGUMENT,
+0189:         f"backend option '{key_path}' has unsupported type: {type(value).__name__}",
+0190:     )
+0191: 
+0192: 
+0193: def _vram_constrained_backend_options(model_size_billion: float | None) -> dict[str, Any]:
+0194:     if model_size_billion is None or model_size_billion < 14.0:
+0195:         num_ctx = 2048
+0196:         num_batch = 32
+0197:     elif model_size_billion < 30.0:
+0198:         num_ctx = 2048
+0199:         num_batch = 24
+0200:     elif model_size_billion < 70.0:
+0201:         num_ctx = 1536
+0202:         num_batch = 16
+0203:     else:
+0204:         num_ctx = 1024
+0205:         num_batch = 8
+0206: 
+0207:     num_keep = max(16, num_ctx // 64)
+0208:     return {
+0209:         "f16_kv": True,
+0210:         "low_vram": True,
+0211:         "num_batch": num_batch,
+0212:         "num_ctx": num_ctx,
+0213:         "num_keep": num_keep,
+0214:     }
+0215: 
+0216: 
+0217: __all__ = [
+0218:     "AUTO_RUNTIME_PROFILE",
+0219:     "DEFAULT_RUNTIME_PROFILE",
+0220:     "RuntimeTuning",
+0221:     "VRAM_CONSTRAINED_RUNTIME_PROFILE",
+0222:     "default_runtime_profile_for_model",
+0223:     "format_model_size_label",
+0224:     "infer_model_size_billion",
+0225:     "is_large_model",
+0226:     "merge_backend_options",
+0227:     "normalize_backend_options",
+0228:     "normalize_runtime_profile_name",
+0229:     "profile_backend_options",
+0230:     "resolve_runtime_tuning",
+0231: ]

@@ -1,0 +1,67 @@
+﻿0001: """Contract tests for telemetry defaults, privacy, and export controls."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import importlib
+0006: from inspect import signature
+0007: import unittest
+0008: 
+0009: from astrawave.errors import ApiError, ApiErrorCode
+0010: 
+0011: 
+0012: class TelemetryContractTests(unittest.TestCase):
+0013:     @classmethod
+0014:     def setUpClass(cls) -> None:
+0015:         try:
+0016:             cls.telemetry = importlib.import_module("astrawave.telemetry")
+0017:         except ModuleNotFoundError as exc:  # pragma: no cover
+0018:             raise AssertionError("astrawave.telemetry is required for the telemetry contract tests") from exc
+0019: 
+0020:         try:
+0021:             cls.TelemetryPolicy = getattr(cls.telemetry, "TelemetryPolicy")
+0022:             cls.TelemetryPipeline = getattr(cls.telemetry, "TelemetryPipeline")
+0023:         except AttributeError as exc:  # pragma: no cover
+0024:             raise AssertionError(
+0025:                 "astrawave.telemetry must expose TelemetryPolicy and TelemetryPipeline"
+0026:             ) from exc
+0027: 
+0028:     def _make_policy(self, **overrides):
+0029:         params = signature(self.TelemetryPolicy).parameters
+0030:         filtered = {name: value for name, value in overrides.items() if name in params}
+0031:         return self.TelemetryPolicy(**filtered)
+0032: 
+0033:     def test_local_only_is_default_and_export_is_disabled(self) -> None:
+0034:         policy = self.TelemetryPolicy()
+0035: 
+0036:         self.assertTrue(getattr(policy, "local_only", False))
+0037:         self.assertFalse(getattr(policy, "export_opt_in", True))
+0038: 
+0039:         pipeline = self.TelemetryPipeline(policy)
+0040:         recorded_policy = getattr(pipeline, "policy", policy)
+0041: 
+0042:         self.assertTrue(getattr(recorded_policy, "local_only", False))
+0043:         self.assertFalse(getattr(recorded_policy, "export_opt_in", True))
+0044: 
+0045:     def test_export_requires_explicit_opt_in(self) -> None:
+0046:         policy = self._make_policy(local_only=True, export_opt_in=False)
+0047:         pipeline = self.TelemetryPipeline(policy)
+0048: 
+0049:         with self.assertRaises(ApiError) as cm:
+0050:             pipeline.build_export_bundle()
+0051:         self.assertEqual(cm.exception.code, ApiErrorCode.INVALID_STATE)
+0052: 
+0053:         opt_in_policy = self._make_policy(local_only=True, export_opt_in=True)
+0054:         opt_in_pipeline = self.TelemetryPipeline(opt_in_policy)
+0055:         event = self.telemetry.TelemetryEvent(
+0056:             reason_code=self.telemetry.TelemetryReasonCode.POLICY_CHANGED,
+0057:             session_id="session-1",
+0058:         )
+0059:         opt_in_pipeline.record_event(event)
+0060:         bundle = opt_in_pipeline.build_export_bundle()
+0061:         self.assertIsNotNone(bundle)
+0062:         self.assertTrue(bundle.to_dict()["policy"]["local_only"])
+0063:         self.assertTrue(bundle.to_dict()["policy"]["export_opt_in"])
+0064: 
+0065: 
+0066: if __name__ == "__main__":
+0067:     unittest.main()

@@ -1,0 +1,486 @@
+﻿0001: """Contract tests for the core AstraWeave service lifecycle."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import json
+0006: import os
+0007: import unittest
+0008: from unittest.mock import patch
+0009: 
+0010: from astrawave import AstraWeaveService
+0011: from astrawave.errors import ApiError, ApiErrorCode
+0012: from astrawave.types import MemoryTier
+0013: 
+0014: 
+0015: class AstraWeaveServiceLifecycleTests(unittest.TestCase):
+0016:     def setUp(self) -> None:
+0017:         self.service = AstraWeaveService(runstep_mode="simulation")
+0018:         self.session_id = self.service.CreateSession()
+0019: 
+0020:     def assertApiErrorCode(self, exc: Exception, expected: ApiErrorCode) -> None:
+0021:         self.assertIsInstance(exc, ApiError)
+0022:         self.assertEqual(exc.code, expected)
+0023: 
+0024:     def test_invalid_order_rejection_blocks_out_of_sequence_calls(self) -> None:
+0025:         with self.assertRaises(ApiError) as cm:
+0026:             self.service.RunStep(self.session_id)
+0027:         self.assertApiErrorCode(cm.exception, ApiErrorCode.INVALID_STATE)
+0028: 
+0029:         with self.assertRaises(ApiError) as cm:
+0030:             self.service.RegisterTensor(self.session_id, "kv", 1024)
+0031:         self.assertApiErrorCode(cm.exception, ApiErrorCode.INVALID_STATE)
+0032: 
+0033:         with self.assertRaises(ApiError) as cm:
+0034:             self.service.SetTierHint(self.session_id, "kv", MemoryTier.HOT)
+0035:         self.assertApiErrorCode(cm.exception, ApiErrorCode.INVALID_STATE)
+0036: 
+0037:         with self.assertRaises(ApiError) as cm:
+0038:             self.service.PrefetchPlan(self.session_id)
+0039:         self.assertApiErrorCode(cm.exception, ApiErrorCode.INVALID_STATE)
+0040: 
+0041:         self.service.LoadModel(self.session_id, "demo-model")
+0042:         self.service.RegisterTensor(self.session_id, "kv", 1024)
+0043:         self.service.SetTierHint(self.session_id, "kv", MemoryTier.WARM)
+0044: 
+0045:         result = self.service.RunStep(self.session_id, step_name="decode")
+0046:         self.assertEqual(result["session_id"], self.session_id)
+0047:         self.assertEqual(result["step_name"], "decode")
+0048: 
+0049:     def test_close_session_is_idempotent(self) -> None:
+0050:         self.service.LoadModel(self.session_id, "demo-model")
+0051:         self.service.CloseSession(self.session_id)
+0052: 
+0053:         # Second close must be a no-op, not an exception.
+0054:         self.service.CloseSession(self.session_id)
+0055: 
+0056:         with self.assertRaises(ApiError) as cm:
+0057:             self.service.LoadModel(self.session_id, "another-model")
+0058:         self.assertIn(cm.exception.code, {ApiErrorCode.INVALID_STATE, ApiErrorCode.NOT_FOUND})
+0059: 
+0060:     def test_register_tensor_after_load_is_allowed(self) -> None:
+0061:         self.service.LoadModel(self.session_id, "demo-model")
+0062:         self.service.RegisterTensor(self.session_id, "weights", 4096)
+0063: 
+0064:         residency = self.service.GetResidency(self.session_id)
+0065:         self.assertEqual(residency.session_id, self.session_id)
+0066:         self.assertGreaterEqual(residency.pinned_ram_bytes, 4096)
+0067: 
+0068:     def test_run_step_rejects_second_active_execution(self) -> None:
+0069:         self.service.LoadModel(self.session_id, "demo-model")
+0070:         self.service.RegisterTensor(self.session_id, "kv", 1024)
+0071:         session = self.service._get_session(self.session_id)  # contract-level active-run guard check
+0072:         with session.lock:
+0073:             session.active_run = True
+0074:         try:
+0075:             with self.assertRaises(ApiError) as cm:
+0076:                 self.service.RunStep(self.session_id, step_name="decode")
+0077:             self.assertApiErrorCode(cm.exception, ApiErrorCode.CONFLICT_RUN_IN_PROGRESS)
+0078:         finally:
+0079:             with session.lock:
+0080:                 session.active_run = False
+0081: 
+0082:     def test_run_step_hardware_mode_invokes_executor_and_returns_hardware_payload(self) -> None:
+0083:         calls: list[dict[str, int]] = []
+0084: 
+0085:         def fake_executor(*, size_bytes: int, device_index: int, hold_ms: int) -> dict[str, object]:
+0086:             calls.append(
+0087:                 {
+0088:                     "size_bytes": size_bytes,
+0089:                     "device_index": device_index,
+0090:                     "hold_ms": hold_ms,
+0091:                 }
+0092:             )
+0093:             return {
+0094:                 "ok": True,
+0095:                 "nvml_observation": {
+0096:                     "observed": True,
+0097:                     "observed_delta_bytes": 4096,
+0098:                 },
+0099:             }
+0100: 
+0101:         service = AstraWeaveService(runstep_mode="hardware", hardware_executor=fake_executor)
+0102:         session_id = service.CreateSession()
+0103:         service.LoadModel(session_id, "demo-model")
+0104:         service.RegisterTensor(session_id, "kv", 1024)
+0105: 
+0106:         result = service.RunStep(session_id, step_name="decode")
+0107:         self.assertEqual(result["requested_run_mode"], "hardware")
+0108:         self.assertEqual(result["run_mode"], "hardware")
+0109:         self.assertIsInstance(result["hardware_result"], dict)
+0110:         self.assertTrue(result["hardware_result"]["ok"])
+0111:         self.assertEqual(len(calls), 1)
+0112:         self.assertGreaterEqual(calls[0]["size_bytes"], 1024)
+0113: 
+0114:     def test_run_step_hardware_mode_marks_session_degraded_on_runtime_failure(self) -> None:
+0115:         def failing_executor(*, size_bytes: int, device_index: int, hold_ms: int) -> dict[str, object]:
+0116:             return {
+0117:                 "ok": False,
+0118:                 "error": {"code": "CUDA_POC_DRIVER_MISSING", "message": "nvcuda.dll was not found"},
+0119:             }
+0120: 
+0121:         service = AstraWeaveService(runstep_mode="hardware", hardware_executor=failing_executor)
+0122:         session_id = service.CreateSession()
+0123:         service.LoadModel(session_id, "demo-model")
+0124:         service.RegisterTensor(session_id, "kv", 2048)
+0125: 
+0126:         result = service.RunStep(session_id, step_name="decode")
+0127:         self.assertEqual(result["requested_run_mode"], "hardware")
+0128:         self.assertEqual(result["run_mode"], "simulation")
+0129:         self.assertIsInstance(result["hardware_result"], dict)
+0130:         self.assertFalse(result["hardware_result"]["ok"])
+0131:         self.assertTrue(result["hardware_result"]["fallback_to_simulation"])
+0132:         self.assertEqual(result["state"].value, "DEGRADED")
+0133: 
+0134:     def test_env_flag_can_enable_hardware_mode_without_constructor_override(self) -> None:
+0135:         def fake_executor(*, size_bytes: int, device_index: int, hold_ms: int) -> dict[str, object]:
+0136:             return {"ok": True}
+0137: 
+0138:         with patch.dict(os.environ, {"ASTRAWEAVE_ENABLE_HARDWARE_RUNSTEP": "1"}, clear=False):
+0139:             service = AstraWeaveService(hardware_executor=fake_executor)
+0140:             session_id = service.CreateSession()
+0141:             service.LoadModel(session_id, "demo-model")
+0142:             service.RegisterTensor(session_id, "kv", 4096)
+0143:             result = service.RunStep(session_id, step_name="decode")
+0144:             self.assertEqual(result["requested_run_mode"], "hardware")
+0145:             self.assertEqual(result["run_mode"], "hardware")
+0146: 
+0147:     def test_auto_mode_prefers_hardware_and_falls_back_cleanly(self) -> None:
+0148:         def failing_executor(*, size_bytes: int, device_index: int, hold_ms: int) -> dict[str, object]:
+0149:             return {
+0150:                 "ok": False,
+0151:                 "error": {"code": "CUDA_POC_DRIVER_MISSING", "message": "nvcuda.dll was not found"},
+0152:             }
+0153: 
+0154:         service = AstraWeaveService(hardware_executor=failing_executor)
+0155:         session_id = service.CreateSession()
+0156:         service.LoadModel(session_id, "demo-model")
+0157:         service.RegisterTensor(session_id, "kv", 2048)
+0158: 
+0159:         result = service.RunStep(session_id, step_name="decode")
+0160:         self.assertEqual(result["requested_run_mode"], "auto")
+0161:         self.assertEqual(result["run_mode"], "simulation")
+0162:         self.assertFalse(result["hardware_result"]["ok"])
+0163:         self.assertTrue(result["hardware_result"]["fallback_to_simulation"])
+0164:         self.assertEqual(result["state"].value, "DEGRADED")
+0165: 
+0166:     def test_run_step_with_prompt_uses_simulation_inference_without_telemetry_leakage(self) -> None:
+0167:         self.service.LoadModel(self.session_id, "demo-model")
+0168:         result = self.service.RunStep(
+0169:             self.session_id,
+0170:             step_name="decode",
+0171:             prompt="Tell me a secret about penguins.",
+0172:             max_tokens=32,
+0173:             temperature=0.1,
+0174:         )
+0175: 
+0176:         self.assertIn("inference_result", result)
+0177:         inference = result["inference_result"]
+0178:         self.assertTrue(inference["ok"])
+0179:         self.assertEqual(inference["backend"], "simulation")
+0180:         self.assertEqual(inference["model_name"], "demo-model")
+0181:         self.assertIn("output_text", inference)
+0182:         telemetry_blob = json.dumps([record.to_dict() for record in self.service.telemetry.records], sort_keys=True)
+0183:         self.assertNotIn("Tell me a secret about penguins.", telemetry_blob)
+0184: 
+0185:     def test_load_model_with_ollama_prefix_routes_to_injected_runtime(self) -> None:
+0186:         calls: list[dict[str, object]] = []
+0187: 
+0188:         class FakeOllamaRuntime:
+0189:             backend_name = "ollama"
+0190: 
+0191:             def load_model(self, model_name: str):
+0192:                 calls.append({"phase": "load_model", "model_name": model_name})
+0193:                 from astrawave.inference_runtime import InferenceModelBinding
+0194: 
+0195:                 return InferenceModelBinding(
+0196:                     backend="ollama",
+0197:                     requested_model_name=model_name,
+0198:                     resolved_model_name=model_name,
+0199:                     metadata={"transport": "fake-http"},
+0200:                 )
+0201: 
+0202:             def generate(
+0203:                 self,
+0204:                 model_name: str,
+0205:                 *,
+0206:                 prompt: str,
+0207:                 step_name: str,
+0208:                 max_tokens: int | None = None,
+0209:                 temperature: float | None = None,
+0210:                 system_prompt: str | None = None,
+0211:             ) -> dict[str, object]:
+0212:                 calls.append(
+0213:                     {
+0214:                         "phase": "generate",
+0215:                         "model_name": model_name,
+0216:                         "prompt": prompt,
+0217:                         "step_name": step_name,
+0218:                         "max_tokens": max_tokens,
+0219:                         "temperature": temperature,
+0220:                         "system_prompt": system_prompt,
+0221:                     }
+0222:                 )
+0223:                 return {
+0224:                     "ok": True,
+0225:                     "backend": "ollama",
+0226:                     "model_name": model_name,
+0227:                     "output_text": "hello from ollama",
+0228:                     "finish_reason": "stop",
+0229:                 }
+0230: 
+0231:         def runtime_factory(backend_name: str):
+0232:             if backend_name == "ollama":
+0233:                 return FakeOllamaRuntime()
+0234:             raise AssertionError(f"unexpected backend requested: {backend_name}")
+0235: 
+0236:         service = AstraWeaveService(
+0237:             runstep_mode="simulation",
+0238:             inference_runtime_factory=runtime_factory,
+0239:         )
+0240:         session_id = service.CreateSession()
+0241:         service.LoadModel(session_id, "ollama:qwen2.5:7b")
+0242:         result = service.RunStep(
+0243:             session_id,
+0244:             step_name="decode",
+0245:             prompt="Write one short line.",
+0246:             max_tokens=24,
+0247:             temperature=0.3,
+0248:         )
+0249: 
+0250:         session = service._get_session(session_id)
+0251:         self.assertEqual(session.inference_backend, "ollama")
+0252:         self.assertEqual(session.resolved_model_name, "qwen2.5:7b")
+0253:         self.assertEqual(calls[0], {"phase": "load_model", "model_name": "qwen2.5:7b"})
+0254:         self.assertEqual(calls[1]["phase"], "generate")
+0255:         self.assertEqual(calls[1]["model_name"], "qwen2.5:7b")
+0256:         self.assertEqual(calls[1]["step_name"], "decode")
+0257:         self.assertEqual(result["inference_result"]["backend"], "ollama")
+0258:         self.assertEqual(result["inference_result"]["output_text"], "hello from ollama")
+0259: 
+0260:     def test_load_model_runtime_backend_override_routes_without_prefix(self) -> None:
+0261:         class FakeOllamaRuntime:
+0262:             backend_name = "ollama"
+0263: 
+0264:             def load_model(self, model_name: str):
+0265:                 from astrawave.inference_runtime import InferenceModelBinding
+0266: 
+0267:                 return InferenceModelBinding(
+0268:                     backend="ollama",
+0269:                     requested_model_name=model_name,
+0270:                     resolved_model_name=model_name,
+0271:                     metadata={},
+0272:                 )
+0273: 
+0274:             def generate(
+0275:                 self,
+0276:                 model_name: str,
+0277:                 *,
+0278:                 prompt: str,
+0279:                 step_name: str,
+0280:                 max_tokens: int | None = None,
+0281:                 temperature: float | None = None,
+0282:                 system_prompt: str | None = None,
+0283:             ) -> dict[str, object]:
+0284:                 return {
+0285:                     "ok": True,
+0286:                     "backend": "ollama",
+0287:                     "model_name": model_name,
+0288:                     "output_text": f"mock:{prompt}",
+0289:                 }
+0290: 
+0291:         def runtime_factory(backend_name: str):
+0292:             if backend_name == "ollama":
+0293:                 return FakeOllamaRuntime()
+0294:             raise AssertionError(f"unexpected backend requested: {backend_name}")
+0295: 
+0296:         service = AstraWeaveService(runstep_mode="simulation", inference_runtime_factory=runtime_factory)
+0297:         session_id = service.CreateSession()
+0298:         service.LoadModel(session_id, "qwen2.5:7b", runtime_backend="ollama")
+0299:         result = service.RunStep(session_id, step_name="decode", prompt="hello")
+0300: 
+0301:         session = service._get_session(session_id)
+0302:         self.assertEqual(session.inference_backend, "ollama")
+0303:         self.assertEqual(session.resolved_model_name, "qwen2.5:7b")
+0304:         self.assertEqual(result["inference_result"]["backend"], "ollama")
+0305: 
+0306:     def test_large_model_load_applies_vram_constrained_profile_and_merges_prompt_options(self) -> None:
+0307:         calls: list[dict[str, object]] = []
+0308: 
+0309:         class FakeOllamaRuntime:
+0310:             backend_name = "ollama"
+0311: 
+0312:             def load_model(
+0313:                 self,
+0314:                 model_name: str,
+0315:                 *,
+0316:                 runtime_profile: str | None = None,
+0317:                 backend_options: dict[str, object] | None = None,
+0318:             ):
+0319:                 calls.append(
+0320:                     {
+0321:                         "phase": "load_model",
+0322:                         "model_name": model_name,
+0323:                         "runtime_profile": runtime_profile,
+0324:                         "backend_options": backend_options,
+0325:                     }
+0326:                 )
+0327:                 from astrawave.inference_runtime import InferenceModelBinding
+0328: 
+0329:                 return InferenceModelBinding(
+0330:                     backend="ollama",
+0331:                     requested_model_name=model_name,
+0332:                     resolved_model_name=model_name,
+0333:                     metadata={"transport": "fake-http"},
+0334:                 )
+0335: 
+0336:             def generate(
+0337:                 self,
+0338:                 model_name: str,
+0339:                 *,
+0340:                 prompt: str,
+0341:                 step_name: str,
+0342:                 max_tokens: int | None = None,
+0343:                 temperature: float | None = None,
+0344:                 system_prompt: str | None = None,
+0345:                 backend_options: dict[str, object] | None = None,
+0346:             ) -> dict[str, object]:
+0347:                 calls.append(
+0348:                     {
+0349:                         "phase": "generate",
+0350:                         "model_name": model_name,
+0351:                         "prompt": prompt,
+0352:                         "step_name": step_name,
+0353:                         "max_tokens": max_tokens,
+0354:                         "temperature": temperature,
+0355:                         "system_prompt": system_prompt,
+0356:                         "backend_options": backend_options,
+0357:                     }
+0358:                 )
+0359:                 return {
+0360:                     "ok": True,
+0361:                     "backend": "ollama",
+0362:                     "model_name": model_name,
+0363:                     "output_text": "large model response",
+0364:                     "finish_reason": "stop",
+0365:                 }
+0366: 
+0367:         def runtime_factory(backend_name: str):
+0368:             if backend_name == "ollama":
+0369:                 return FakeOllamaRuntime()
+0370:             raise AssertionError(f"unexpected backend requested: {backend_name}")
+0371: 
+0372:         service = AstraWeaveService(
+0373:             runstep_mode="simulation",
+0374:             inference_runtime_factory=runtime_factory,
+0375:         )
+0376:         session_id = service.CreateSession()
+0377:         service.LoadModel(session_id, "ollama:qwen2.5:14b")
+0378: 
+0379:         session = service._get_session(session_id)
+0380:         self.assertEqual(session.inference_metadata["runtime_profile"], "vram_constrained")
+0381:         self.assertEqual(session.inference_metadata["model_size_billion"], 14.0)
+0382:         self.assertTrue(session.inference_metadata["backend_options"]["low_vram"])
+0383: 
+0384:         self.assertEqual(calls[0]["phase"], "load_model")
+0385:         self.assertEqual(calls[0]["runtime_profile"], "vram_constrained")
+0386:         self.assertTrue(calls[0]["backend_options"]["low_vram"])
+0387:         self.assertEqual(calls[0]["backend_options"]["num_ctx"], 2048)
+0388: 
+0389:         result = service.RunStep(
+0390:             session_id,
+0391:             step_name="decode",
+0392:             prompt="Write one short line.",
+0393:             max_tokens=24,
+0394:             backend_options={"num_ctx": 3072, "repeat_penalty": 1.05},
+0395:         )
+0396: 
+0397:         self.assertEqual(result["inference_result"]["backend"], "ollama")
+0398:         self.assertEqual(calls[1]["phase"], "generate")
+0399:         self.assertEqual(calls[1]["model_name"], "qwen2.5:14b")
+0400:         self.assertEqual(calls[1]["max_tokens"], 24)
+0401:         self.assertEqual(calls[1]["backend_options"]["num_ctx"], 3072)
+0402:         self.assertEqual(calls[1]["backend_options"]["num_batch"], 24)
+0403:         self.assertTrue(calls[1]["backend_options"]["low_vram"])
+0404:         self.assertAlmostEqual(calls[1]["backend_options"]["repeat_penalty"], 1.05)
+0405: 
+0406:     def test_run_step_runtime_profile_override_applies_constrained_defaults(self) -> None:
+0407:         calls: list[dict[str, object]] = []
+0408: 
+0409:         class FakeOllamaRuntime:
+0410:             backend_name = "ollama"
+0411: 
+0412:             def load_model(
+0413:                 self,
+0414:                 model_name: str,
+0415:                 *,
+0416:                 runtime_profile: str | None = None,
+0417:                 backend_options: dict[str, object] | None = None,
+0418:             ):
+0419:                 calls.append(
+0420:                     {
+0421:                         "phase": "load_model",
+0422:                         "model_name": model_name,
+0423:                         "runtime_profile": runtime_profile,
+0424:                         "backend_options": backend_options,
+0425:                     }
+0426:                 )
+0427:                 from astrawave.inference_runtime import InferenceModelBinding
+0428: 
+0429:                 return InferenceModelBinding(
+0430:                     backend="ollama",
+0431:                     requested_model_name=model_name,
+0432:                     resolved_model_name=model_name,
+0433:                     metadata={},
+0434:                 )
+0435: 
+0436:             def generate(
+0437:                 self,
+0438:                 model_name: str,
+0439:                 *,
+0440:                 prompt: str,
+0441:                 step_name: str,
+0442:                 max_tokens: int | None = None,
+0443:                 temperature: float | None = None,
+0444:                 system_prompt: str | None = None,
+0445:                 backend_options: dict[str, object] | None = None,
+0446:             ) -> dict[str, object]:
+0447:                 calls.append(
+0448:                     {
+0449:                         "phase": "generate",
+0450:                         "model_name": model_name,
+0451:                         "step_name": step_name,
+0452:                         "backend_options": backend_options,
+0453:                     }
+0454:                 )
+0455:                 return {
+0456:                     "ok": True,
+0457:                     "backend": "ollama",
+0458:                     "model_name": model_name,
+0459:                     "output_text": "override-response",
+0460:                 }
+0461: 
+0462:         def runtime_factory(backend_name: str):
+0463:             if backend_name == "ollama":
+0464:                 return FakeOllamaRuntime()
+0465:             raise AssertionError(f"unexpected backend requested: {backend_name}")
+0466: 
+0467:         service = AstraWeaveService(runstep_mode="simulation", inference_runtime_factory=runtime_factory)
+0468:         session_id = service.CreateSession()
+0469:         service.LoadModel(session_id, "qwen2.5:7b", runtime_backend="ollama")
+0470:         service.RunStep(
+0471:             session_id,
+0472:             step_name="decode",
+0473:             prompt="hello",
+0474:             runtime_profile_override="memory_saver",
+0475:             runtime_backend_options_override={"num_ctx": 1024},
+0476:         )
+0477: 
+0478:         self.assertEqual(calls[0]["phase"], "load_model")
+0479:         self.assertEqual(calls[0]["runtime_profile"], "default")
+0480:         self.assertEqual(calls[1]["phase"], "generate")
+0481:         self.assertEqual(calls[1]["backend_options"]["num_ctx"], 1024)
+0482:         self.assertTrue(calls[1]["backend_options"]["low_vram"])
+0483: 
+0484: 
+0485: if __name__ == "__main__":
+0486:     unittest.main()

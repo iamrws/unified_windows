@@ -1,0 +1,14 @@
+﻿# Repo Metrics
+total_files=133
+python_files=43
+markdown_files=27
+
+## file_extension_counts
+.json	11
+.md	27
+.ps1	1
+.py	43
+.txt	51
+
+## python_loc
+python_total_loc=13908

@@ -1,0 +1,1124 @@
+﻿0001: """AstraWeave CLI."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import argparse
+0006: from dataclasses import asdict, is_dataclass
+0007: from contextlib import suppress
+0008: import hashlib
+0009: from ipaddress import ip_address
+0010: import json
+0011: import os
+0012: import sys
+0013: import tempfile
+0014: from pathlib import Path
+0015: from time import monotonic, sleep, time_ns
+0016: from typing import Any, Mapping, Sequence
+0017: from uuid import uuid4
+0018: 
+0019: from .errors import ApiError, ApiErrorCode
+0020: from .fallback import FallbackController, FallbackState, FallbackStep
+0021: from .security import CallerIdentity
+0022: from .types import MemoryTier, PolicyProfile, PressureSnapshot, ResidencySnapshot, ResidencyState, SessionState
+0023: 
+0024: try:
+0025:     from .sdk import AstraWeaveSDK
+0026: except Exception:  # pragma: no cover - optional transport stack
+0027:     AstraWeaveSDK = None
+0028: 
+0029: try:
+0030:     from .ipc_server import AstraWeaveIpcServer
+0031: except Exception:  # pragma: no cover - optional phase-3 transport stack
+0032:     AstraWeaveIpcServer = None
+0033: 
+0034: try:
+0035:     from .service_host import AstraWeaveServiceHost, ServiceHostConfig
+0036: except Exception:  # pragma: no cover - optional phase-3 host wrapper
+0037:     AstraWeaveServiceHost = None
+0038:     ServiceHostConfig = None
+0039: 
+0040: try:
+0041:     from .hardware_probe import collect_hardware_probe as _collect_hardware_probe_impl
+0042: except Exception:  # pragma: no cover - optional hardware probe module
+0043:     _collect_hardware_probe_impl = None
+0044: 
+0045: try:
+0046:     from .service import DEFAULT_SERVICE_OWNER_SID
+0047: except Exception:  # pragma: no cover - future-proof fallback
+0048:     DEFAULT_SERVICE_OWNER_SID = "S-1-5-21-AstraWeave-Owner"
+0049: 
+0050: STATE_DIR = Path(tempfile.gettempdir()) / "astrawave_cli_state"
+0051: STATE_VERSION = 1
+0052: DEFAULT_ENDPOINT = "auto"
+0053: HIGH_PRESSURE_THRESHOLD = 0.75
+0054: DEFAULT_SERVE_ENDPOINT = "auto"
+0055: DEFAULT_SERVE_DURATION_SECONDS: float | None = None
+0056: _POSITIVE_INT_OPTION_KEYS = {"num_ctx", "num_batch", "num_predict", "num_keep", "top_k"}
+0057: _NONNEGATIVE_INT_OPTION_KEYS = {"gpu_layers", "num_gpu"}
+0058: _NONNEGATIVE_FLOAT_OPTION_KEYS = {"temperature"}
+0059: _OPEN_INTERVAL_FLOAT_OPTION_KEYS = {"top_p", "repeat_penalty"}
+0060: 
+0061: 
+0062: def _now_ms() -> int:
+0063:     return time_ns() // 1_000_000
+0064: 
+0065: 
+0066: def _caller_key(caller: CallerIdentity) -> str:
+0067:     return f"{caller.user_sid}:{caller.pid}"
+0068: 
+0069: 
+0070: def _endpoint_path(endpoint: str) -> Path:
+0071:     digest = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()
+0072:     return STATE_DIR / f"{digest}.json"
+0073: 
+0074: 
+0075: def _valid_caller(caller: CallerIdentity | None) -> bool:
+0076:     return bool(caller and caller.user_sid.strip() and caller.pid > 0)
+0077: 
+0078: 
+0079: def _to_memory_tier(value: str | MemoryTier) -> MemoryTier:
+0080:     return value if isinstance(value, MemoryTier) else MemoryTier(value)
+0081: 
+0082: 
+0083: def _to_policy_profile(value: str | PolicyProfile) -> PolicyProfile:
+0084:     return value if isinstance(value, PolicyProfile) else PolicyProfile(value)
+0085: 
+0086: 
+0087: def _residency_for_tier(tier: MemoryTier) -> ResidencyState:
+0088:     if tier is MemoryTier.HOT:
+0089:         return ResidencyState.VRAM
+0090:     if tier is MemoryTier.WARM:
+0091:         return ResidencyState.PINNED_RAM
+0092:     return ResidencyState.PAGEABLE_RAM
+0093: 
+0094: 
+0095: def _json_safe(value: Any) -> Any:
+0096:     if value is None or isinstance(value, (str, int, float, bool)):
+0097:         return value
+0098:     if isinstance(value, (MemoryTier, PolicyProfile, ResidencyState, SessionState, FallbackStep)):
+0099:         return value.value
+0100:     if is_dataclass(value):
+0101:         return _json_safe(asdict(value))
+0102:     if isinstance(value, Mapping):
+0103:         return {str(key): _json_safe(item) for key, item in value.items()}
+0104:     if isinstance(value, tuple | list):
+0105:         return [_json_safe(item) for item in value]
+0106:     return value
+0107: 
+0108: 
+0109: def _write_json(payload: Mapping[str, Any], *, stream: str = "stdout") -> None:
+0110:     text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+0111:     if stream == "stderr":
+0112:         print(text, file=sys.stderr)
+0113:     else:
+0114:         print(text)
+0115: 
+0116: 
+0117: def _emit_ok(result: Mapping[str, Any]) -> None:
+0118:     _write_json({"ok": True, "result": result})
+0119: 
+0120: 
+0121: def _emit_error(error: ApiError, *, stream: str = "stderr") -> None:
+0122:     _write_json({"ok": False, "error": {"code": error.code.value, "message": error.message}}, stream=stream)
+0123: 
+0124: 
+0125: def _default_state() -> dict[str, Any]:
+0126:     return {
+0127:         "version": STATE_VERSION,
+0128:         "service_owner_sid": DEFAULT_SERVICE_OWNER_SID,
+0129:         "create_session_attempts": {},
+0130:         "active_sessions": {},
+0131:         "sessions": {},
+0132:     }
+0133: 
+0134: 
+0135: def _normalize_endpoint_hint(endpoint: str | None) -> str:
+0136:     value = (endpoint or "").strip()
+0137:     if value in {"", DEFAULT_ENDPOINT, "local://default"}:
+0138:         return DEFAULT_SERVE_ENDPOINT
+0139:     return value
+0140: 
+0141: 
+0142: def _describe_endpoint(endpoint: Any) -> str:
+0143:     if isinstance(endpoint, tuple) and len(endpoint) == 2:
+0144:         host, port = endpoint
+0145:         return f"tcp://{host}:{port}"
+0146:     if isinstance(endpoint, str):
+0147:         if endpoint.startswith("\\\\.\\pipe\\"):
+0148:             return f"pipe://{endpoint}"
+0149:         return endpoint
+0150:     return str(endpoint)
+0151: 
+0152: 
+0153: def _is_loopback_host(host: str) -> bool:
+0154:     normalized = host.strip().lower()
+0155:     if normalized == "localhost":
+0156:         return True
+0157:     try:
+0158:         return ip_address(normalized).is_loopback
+0159:     except ValueError:
+0160:         return False
+0161: 
+0162: 
+0163: def _require_loopback_host(host: str) -> str:
+0164:     normalized = host.strip() or "127.0.0.1"
+0165:     if not _is_loopback_host(normalized):
+0166:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "host must be localhost or loopback in v1")
+0167:     return normalized
+0168: 
+0169: 
+0170: def _parse_port_value(text: str, *, allow_zero: bool) -> int:
+0171:     try:
+0172:         port = int(text)
+0173:     except ValueError as exc:
+0174:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"invalid TCP port: {text}") from exc
+0175:     minimum = 0 if allow_zero else 1
+0176:     if port < minimum or port > 65535:
+0177:         bound = "0-65535" if allow_zero else "1-65535"
+0178:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"TCP port must be in range {bound}")
+0179:     return port
+0180: 
+0181: 
+0182: def _parse_runtime_option_pairs(
+0183:     raw_options: Sequence[str] | None,
+0184:     *,
+0185:     field_name: str,
+0186: ) -> dict[str, Any] | None:
+0187:     if raw_options is None:
+0188:         return None
+0189:     parsed: dict[str, Any] = {}
+0190:     for raw_item in raw_options:
+0191:         if "=" not in raw_item:
+0192:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name} entries must use key=value syntax")
+0193:         key_text, raw_value = raw_item.split("=", 1)
+0194:         key = key_text.strip()
+0195:         if not key:
+0196:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name} keys must be non-empty strings")
+0197:         parsed[key] = _parse_runtime_option_value(field_name, key, raw_value.strip())
+0198:     return parsed
+0199: 
+0200: 
+0201: def _parse_runtime_option_value(field_name: str, key: str, raw_value: str) -> Any:
+0202:     try:
+0203:         value = json.loads(raw_value)
+0204:     except json.JSONDecodeError:
+0205:         value = raw_value
+0206: 
+0207:     if key in _POSITIVE_INT_OPTION_KEYS:
+0208:         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+0209:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be a positive integer")
+0210:         return value
+0211:     if key in _NONNEGATIVE_INT_OPTION_KEYS:
+0212:         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+0213:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be a non-negative integer")
+0214:         return value
+0215:     if key in _NONNEGATIVE_FLOAT_OPTION_KEYS:
+0216:         if not isinstance(value, (int, float)) or isinstance(value, bool) or float(value) < 0.0:
+0217:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be a non-negative number")
+0218:         return float(value)
+0219:     if key == "top_p":
+0220:         if not isinstance(value, (int, float)) or isinstance(value, bool):
+0221:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be a number")
+0222:         numeric_value = float(value)
+0223:         if numeric_value <= 0.0 or numeric_value > 1.0:
+0224:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be between 0 and 1")
+0225:         return numeric_value
+0226:     if key in _OPEN_INTERVAL_FLOAT_OPTION_KEYS:
+0227:         if not isinstance(value, (int, float)) or isinstance(value, bool):
+0228:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be a number")
+0229:         numeric_value = float(value)
+0230:         if numeric_value <= 0.0:
+0231:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be greater than 0")
+0232:         return numeric_value
+0233:     return value
+0234: 
+0235: 
+0236: def _normalize_runtime_profile(field_name: str, value: str | None) -> str | None:
+0237:     if value is None:
+0238:         return None
+0239:     if not isinstance(value, str) or not value.strip():
+0240:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name} must be a non-empty string")
+0241:     return value.strip()
+0242: 
+0243: 
+0244: def _parse_serve_endpoint(endpoint: str, transport: str) -> dict[str, Any]:
+0245:     endpoint_hint = _normalize_endpoint_hint(endpoint)
+0246:     transport_hint = transport.strip().lower()
+0247:     if transport_hint not in {"auto", "tcp", "pipe"}:
+0248:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "transport must be one of: auto, tcp, pipe")
+0249: 
+0250:     if endpoint_hint.startswith("pipe://"):
+0251:         pipe_name = endpoint_hint.removeprefix("pipe://") or r"\\.\pipe\astrawave"
+0252:         return {
+0253:             "prefer_named_pipe": True,
+0254:             "pipe_name": pipe_name,
+0255:         }
+0256:     if endpoint_hint.startswith("\\\\.\\pipe\\"):
+0257:         return {
+0258:             "prefer_named_pipe": True,
+0259:             "pipe_name": endpoint_hint,
+0260:         }
+0261:     if endpoint_hint.startswith("tcp://"):
+0262:         host, port = _parse_tcp_endpoint(endpoint_hint.removeprefix("tcp://"))
+0263:         return {
+0264:             "prefer_named_pipe": False,
+0265:             "host": host,
+0266:             "port": port,
+0267:         }
+0268: 
+0269:     if transport_hint == "pipe":
+0270:         return {
+0271:             "prefer_named_pipe": True,
+0272:             "pipe_name": r"\\.\pipe\astrawave",
+0273:         }
+0274:     if transport_hint == "tcp":
+0275:         host, port = _parse_tcp_endpoint(endpoint_hint)
+0276:         return {
+0277:             "prefer_named_pipe": False,
+0278:             "host": host,
+0279:             "port": port,
+0280:         }
+0281: 
+0282:     if os.name == "nt":
+0283:         return {
+0284:             "prefer_named_pipe": True,
+0285:             "pipe_name": r"\\.\pipe\astrawave",
+0286:         }
+0287:     return {
+0288:         "prefer_named_pipe": False,
+0289:         "host": "127.0.0.1",
+0290:         "port": 0,
+0291:     }
+0292: 
+0293: 
+0294: def _parse_tcp_endpoint(value: str) -> tuple[str, int]:
+0295:     hint = value.strip()
+0296:     if not hint or hint == DEFAULT_SERVE_ENDPOINT:
+0297:         return "127.0.0.1", 0
+0298:     if hint == "auto":
+0299:         return "127.0.0.1", 0
+0300:     if ":" in hint:
+0301:         host, _, port_text = hint.rpartition(":")
+0302:         if not host:
+0303:             host = "127.0.0.1"
+0304:         host = _require_loopback_host(host)
+0305:         return host, _parse_port_value(port_text, allow_zero=True)
+0306:     return _require_loopback_host(hint), 0
+0307: 
+0308: 
+0309: def _hardware_probe_result() -> dict[str, Any]:
+0310:     if _collect_hardware_probe_impl is not None:
+0311:         try:
+0312:             probe = _collect_hardware_probe_impl()
+0313:         except Exception as exc:  # pragma: no cover - defensive fallback
+0314:             raise ApiError(ApiErrorCode.INTERNAL, "hardware probe failed unexpectedly") from exc
+0315:         if isinstance(probe, Mapping):
+0316:             return dict(probe)
+0317:         raise ApiError(ApiErrorCode.INTERNAL, "hardware probe returned an invalid payload")
+0318: 
+0319:     warning = "hardware probe module is unavailable in this build"
+0320:     return {
+0321:         "timestamp_ms": _now_ms(),
+0322:         "nvidia_smi": {
+0323:             "available": False,
+0324:             "status": "unavailable",
+0325:             "devices": [],
+0326:             "error": {
+0327:                 "code": "HARDWARE_PROBE_MODULE_MISSING",
+0328:                 "message": warning,
+0329:             },
+0330:         },
+0331:         "nvml": {
+0332:             "available": False,
+0333:             "status": "unavailable",
+0334:             "devices": [],
+0335:             "error": {
+0336:                 "code": "HARDWARE_PROBE_MODULE_MISSING",
+0337:                 "message": warning,
+0338:             },
+0339:         },
+0340:         "effective": {
+0341:             "source": "none",
+0342:             "device_count": 0,
+0343:             "driver_version": None,
+0344:             "devices": [],
+0345:             "has_nvidia_gpu": False,
+0346:         },
+0347:         "warnings": [warning],
+0348:     }
+0349: 
+0350: 
+0351: class LocalBackend:
+0352:     def __init__(self, endpoint: str) -> None:
+0353:         self.endpoint = endpoint
+0354:         self.path = _endpoint_path(endpoint)
+0355:         self.state = self._load()
+0356:         self.fallback = FallbackController()
+0357: 
+0358:     def create_session(self, caller: CallerIdentity) -> dict[str, Any]:
+0359:         self._authorize(caller)
+0360:         now_ms = _now_ms()
+0361:         self._record_attempt(caller, now_ms)
+0362:         self._enforce_rate_limit(caller, now_ms)
+0363:         self._enforce_session_cap(caller)
+0364:         session_id = str(uuid4())
+0365:         self.state["sessions"][session_id] = {
+0366:             "session_id": session_id,
+0367:             "owner_sid": caller.user_sid,
+0368:             "owner_pid": caller.pid,
+0369:         "state": SessionState.SESSION_CREATED.value,
+0370:         "model_name": None,
+0371:         "runtime_backend": None,
+0372:         "policy_profile": PolicyProfile.STABILITY.value,
+0373:         "tensors": {},
+0374:         "active_run": False,
+0375:             "closed": False,
+0376:             "fallback_current_step": None,
+0377:             "fallback_last_step_change_ms": None,
+0378:             "fallback_step_change_history_ms": [],
+0379:             "fallback_stability_mode": False,
+0380:             "vram_budget_bytes": 8 * 1024**3,
+0381:             "vram_used_bytes": 0,
+0382:             "pinned_ram_used_bytes": 0,
+0383:             "pageable_ram_used_bytes": 0,
+0384:             "cpu_only_used_bytes": 0,
+0385:         }
+0386:         self.state["active_sessions"][_caller_key(caller)] = self.state["active_sessions"].get(_caller_key(caller), 0) + 1
+0387:         self._save()
+0388:         return {"session_id": session_id, "owner_sid": caller.user_sid, "owner_pid": caller.pid}
+0389: 
+0390:     def load_model(
+0391:         self,
+0392:         session_id: str,
+0393:         model_name: str,
+0394:         caller: CallerIdentity,
+0395:         runtime_backend: str | None = None,
+0396:         runtime_profile: str | None = None,
+0397:         runtime_backend_options: dict[str, Any] | None = None,
+0398:     ) -> dict[str, Any]:
+0399:         session = self._get_owned_session(session_id, caller, "LoadModel")
+0400:         self._require_state(session, {SessionState.SESSION_CREATED}, "LoadModel")
+0401:         if not model_name:
+0402:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "model_name must not be empty")
+0403:         normalized_profile = _normalize_runtime_profile("runtime_profile", runtime_profile)
+0404:         session["model_name"] = model_name
+0405:         session["runtime_backend"] = runtime_backend
+0406:         session["runtime_profile"] = normalized_profile
+0407:         session["runtime_backend_options"] = runtime_backend_options or {}
+0408:         session["state"] = SessionState.READY.value
+0409:         self._save()
+0410:         result = {"session_id": session_id, "model_name": model_name, "state": session["state"]}
+0411:         if runtime_backend is not None:
+0412:             result["runtime_backend"] = runtime_backend
+0413:         if normalized_profile is not None:
+0414:             result["runtime_profile"] = normalized_profile
+0415:         if runtime_backend_options is not None:
+0416:             result["runtime_backend_options"] = runtime_backend_options
+0417:         return result
+0418: 
+0419:     def register_tensor(self, session_id: str, tensor_name: str, size_bytes: int, caller: CallerIdentity) -> dict[str, Any]:
+0420:         session = self._get_owned_session(session_id, caller, "RegisterTensor")
+0421:         self._require_state(session, {SessionState.MODEL_LOADED, SessionState.READY, SessionState.DEGRADED}, "RegisterTensor")
+0422:         if not tensor_name:
+0423:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "tensor_name must not be empty")
+0424:         if size_bytes <= 0:
+0425:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "size_bytes must be positive")
+0426:         tensors = session["tensors"]
+0427:         if tensor_name in tensors:
+0428:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "tensor already registered")
+0429:         tensors[tensor_name] = {"name": tensor_name, "size_bytes": size_bytes, "tier_hint": MemoryTier.WARM.value, "residency": ResidencyState.PINNED_RAM.value}
+0430:         session["pinned_ram_used_bytes"] += size_bytes
+0431:         session["state"] = SessionState.READY.value
+0432:         self._save()
+0433:         return {"session_id": session_id, "tensor_name": tensor_name, "size_bytes": size_bytes}
+0434: 
+0435:     def set_tier_hint(self, session_id: str, tensor_name: str, tier: MemoryTier, caller: CallerIdentity) -> dict[str, Any]:
+0436:         session = self._get_owned_session(session_id, caller, "SetTierHint")
+0437:         self._require_state(session, {SessionState.MODEL_LOADED, SessionState.READY, SessionState.DEGRADED}, "SetTierHint")
+0438:         tensor = self._get_tensor(session, tensor_name)
+0439:         tensor["tier_hint"] = _to_memory_tier(tier).value
+0440:         self._save()
+0441:         return {"session_id": session_id, "tensor_name": tensor_name, "tier_hint": tensor["tier_hint"]}
+0442: 
+0443:     def prefetch_plan(self, session_id: str, caller: CallerIdentity) -> dict[str, Any]:
+0444:         session = self._get_owned_session(session_id, caller, "PrefetchPlan")
+0445:         self._require_state(session, {SessionState.READY, SessionState.DEGRADED}, "PrefetchPlan")
+0446:         migrations = []
+0447:         for name in sorted(session["tensors"]):
+0448:             tensor = session["tensors"][name]
+0449:             destination = _residency_for_tier(MemoryTier(tensor["tier_hint"]))
+0450:             if tensor["residency"] != destination.value:
+0451:                 migrations.append(self._migrate_tensor(session, tensor, destination, reason_code="prefetch"))
+0452:         self._save()
+0453:         return {"session_id": session_id, "migrations": migrations}
+0454: 
+0455:     def run_step(
+0456:         self,
+0457:         session_id: str,
+0458:         step_name: str,
+0459:         caller: CallerIdentity,
+0460:         prompt: str | None = None,
+0461:         max_tokens: int | None = None,
+0462:         temperature: float | None = None,
+0463:         runtime_profile_override: str | None = None,
+0464:         runtime_backend_options_override: dict[str, Any] | None = None,
+0465:     ) -> dict[str, Any]:
+0466:         session = self._get_owned_session(session_id, caller, "RunStep")
+0467:         self._require_state(session, {SessionState.READY, SessionState.DEGRADED}, "RunStep")
+0468:         if not step_name:
+0469:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "step_name must not be empty")
+0470:         normalized_profile_override = _normalize_runtime_profile(
+0471:             "runtime_profile_override",
+0472:             runtime_profile_override,
+0473:         )
+0474:         if session["active_run"]:
+0475:             raise ApiError(ApiErrorCode.CONFLICT_RUN_IN_PROGRESS, "a RunStep is already active")
+0476:         session["active_run"] = True
+0477:         session["state"] = SessionState.RUNNING.value
+0478:         try:
+0479:             pressure = self._compute_pressure(session)
+0480:             fallback_result = None
+0481:             if pressure >= HIGH_PRESSURE_THRESHOLD or session["fallback_stability_mode"]:
+0482:                 fallback_result = self._advance_fallback(session, caller)
+0483:             if session["state"] != SessionState.FAILED.value:
+0484:                 session["state"] = SessionState.DEGRADED.value if (
+0485:                     session["fallback_stability_mode"] or session["fallback_current_step"] or pressure >= HIGH_PRESSURE_THRESHOLD
+0486:                 ) else SessionState.READY.value
+0487:             result = {
+0488:                 "session_id": session_id,
+0489:                 "step_name": step_name,
+0490:                 "correlation_id": f"{session_id}:{step_name}:run-{uuid4()}",
+0491:                 "state": session["state"],
+0492:                 "policy_profile": session["policy_profile"],
+0493:                 "pressure_level": pressure,
+0494:                 "fallback_step": session["fallback_current_step"],
+0495:                 "fallback_result": fallback_result,
+0496:             }
+0497:             if prompt is not None:
+0498:                 result["prompt"] = prompt
+0499:                 result["generation"] = {
+0500:                     "max_tokens": max_tokens,
+0501:                     "temperature": temperature,
+0502:                     "runtime_backend": session.get("runtime_backend"),
+0503:                     "runtime_profile": session.get("runtime_profile"),
+0504:                     "runtime_backend_options": session.get("runtime_backend_options", {}),
+0505:                     "runtime_profile_override": normalized_profile_override,
+0506:                     "runtime_backend_options_override": runtime_backend_options_override,
+0507:                 }
+0508:                 result["inference_result"] = {
+0509:                     "backend": session.get("runtime_backend") or "simulation",
+0510:                     "prompt": prompt,
+0511:                     "max_tokens": max_tokens,
+0512:                     "temperature": temperature,
+0513:                     "runtime_profile": session.get("runtime_profile"),
+0514:                     "runtime_backend_options": session.get("runtime_backend_options", {}),
+0515:                     "runtime_profile_override": normalized_profile_override,
+0516:                     "runtime_backend_options_override": runtime_backend_options_override,
+0517:                     "text": f"[simulated:{session.get('runtime_backend') or 'default'}] {prompt}",
+0518:                 }
+0519:             if normalized_profile_override is not None:
+0520:                 result["runtime_profile_override"] = normalized_profile_override
+0521:             if runtime_backend_options_override is not None:
+0522:                 result["runtime_backend_options_override"] = runtime_backend_options_override
+0523:             self._save()
+0524:             return result
+0525:         finally:
+0526:             session["active_run"] = False
+0527: 
+0528:     def get_residency(self, session_id: str, caller: CallerIdentity) -> dict[str, Any]:
+0529:         session = self._get_owned_session(session_id, caller, "GetResidency")
+0530:         snap = ResidencySnapshot(
+0531:             session_id=session_id,
+0532:             session_state=SessionState(session["state"]),
+0533:             primary_tier=self._derive_primary_tier(session),
+0534:             tensor_residency={name: ResidencyState(tensor["residency"]) for name, tensor in session["tensors"].items()},
+0535:             vram_bytes=session["vram_used_bytes"],
+0536:             pinned_ram_bytes=session["pinned_ram_used_bytes"],
+0537:             pageable_ram_bytes=session["pageable_ram_used_bytes"],
+0538:             cpu_only_bytes=session["cpu_only_used_bytes"],
+0539:             active_run_in_progress=session["active_run"],
+0540:         )
+0541:         return _json_safe(snap)
+0542: 
+0543:     def get_pressure(self, session_id: str, caller: CallerIdentity) -> dict[str, Any]:
+0544:         session = self._get_owned_session(session_id, caller, "GetPressure")
+0545:         snap = PressureSnapshot(
+0546:             session_id=session_id,
+0547:             vram_budget_bytes=session["vram_budget_bytes"],
+0548:             vram_used_bytes=session["vram_used_bytes"],
+0549:             pinned_ram_used_bytes=session["pinned_ram_used_bytes"],
+0550:             pressure_level=self._compute_pressure(session),
+0551:             policy_profile=PolicyProfile(session["policy_profile"]),
+0552:             timestamp_ms=_now_ms(),
+0553:         )
+0554:         return _json_safe(snap)
+0555: 
+0556:     def set_policy(self, session_id: str, policy: PolicyProfile, caller: CallerIdentity) -> dict[str, Any]:
+0557:         session = self._get_owned_session(session_id, caller, "SetPolicy")
+0558:         if session["active_run"]:
+0559:             raise ApiError(ApiErrorCode.INVALID_STATE, "cannot change policy during RunStep")
+0560:         session["policy_profile"] = _to_policy_profile(policy).value
+0561:         self._save()
+0562:         return {"session_id": session_id, "policy_profile": session["policy_profile"]}
+0563: 
+0564:     def close_session(self, session_id: str, caller: CallerIdentity) -> dict[str, Any]:
+0565:         session = self._get_session(session_id)
+0566:         if session["closed"] or session["state"] == SessionState.CLOSED.value:
+0567:             self._save()
+0568:             return {"session_id": session_id, "closed": True, "idempotent": True}
+0569:         self._authorize(caller)
+0570:         if caller.user_sid != session["owner_sid"]:
+0571:             raise ApiError(ApiErrorCode.AUTH_DENIED, "CloseSession caller does not own the session")
+0572:         session["closed"] = True
+0573:         session["state"] = SessionState.CLOSED.value
+0574:         session["active_run"] = False
+0575:         key = _caller_key(caller)
+0576:         self.state["active_sessions"][key] = max(0, self.state["active_sessions"].get(key, 0) - 1)
+0577:         if self.state["active_sessions"][key] <= 0:
+0578:             self.state["active_sessions"].pop(key, None)
+0579:         self._save()
+0580:         return {"session_id": session_id, "closed": True, "idempotent": False}
+0581: 
+0582:     def _advance_fallback(self, session: dict[str, Any], caller: CallerIdentity) -> dict[str, Any]:
+0583:         state = FallbackState(
+0584:             current_step=FallbackStep(session["fallback_current_step"]) if session["fallback_current_step"] else None,
+0585:             last_step_change_ms=session["fallback_last_step_change_ms"],
+0586:             step_change_history_ms=tuple(session["fallback_step_change_history_ms"]),
+0587:             stability_mode=session["fallback_stability_mode"],
+0588:         )
+0589:         decision = self.fallback.evaluate(state, _now_ms())
+0590:         if decision.enter_stability_mode:
+0591:             session["fallback_stability_mode"] = True
+0592:         if not decision.should_advance:
+0593:             session["state"] = SessionState.DEGRADED.value
+0594:             return {
+0595:                 "should_advance": False,
+0596:                 "next_step": session["fallback_current_step"],
+0597:                 "enter_stability_mode": session["fallback_stability_mode"],
+0598:                 "reason_code": decision.reason_code,
+0599:             }
+0600:         next_step = decision.next_step
+0601:         if next_step is None or next_step is FallbackStep.CONTROLLED_FAIL:
+0602:             session["fallback_current_step"] = FallbackStep.CONTROLLED_FAIL.value
+0603:             session["fallback_last_step_change_ms"] = _now_ms()
+0604:             session["fallback_step_change_history_ms"].append(session["fallback_last_step_change_ms"])
+0605:             session["state"] = SessionState.FAILED.value
+0606:             return {"should_advance": True, "next_step": FallbackStep.CONTROLLED_FAIL.value, "enter_stability_mode": session["fallback_stability_mode"], "reason_code": decision.reason_code}
+0607:         self._apply_fallback(session, next_step)
+0608:         session["fallback_current_step"] = next_step.value
+0609:         session["fallback_last_step_change_ms"] = _now_ms()
+0610:         session["fallback_step_change_history_ms"].append(session["fallback_last_step_change_ms"])
+0611:         session["state"] = SessionState.DEGRADED.value
+0612:         return {"should_advance": True, "next_step": next_step.value, "enter_stability_mode": session["fallback_stability_mode"], "reason_code": decision.reason_code}
+0613: 
+0614:     def _apply_fallback(self, session: dict[str, Any], next_step: FallbackStep) -> None:
+0615:         tensor = self._select_tensor(session)
+0616:         if tensor is None:
+0617:             return
+0618:         if next_step is FallbackStep.KV_CONTEXT_REDUCTION:
+0619:             destination = ResidencyState.PINNED_RAM
+0620:         elif next_step is FallbackStep.BATCH_REDUCTION:
+0621:             destination = ResidencyState.PAGEABLE_RAM
+0622:         elif next_step is FallbackStep.PRECISION_REDUCTION:
+0623:             destination = ResidencyState.PAGEABLE_RAM
+0624:         elif next_step is FallbackStep.SELECTIVE_CPU_OFFLOAD:
+0625:             destination = ResidencyState.CPU_ONLY
+0626:         else:
+0627:             return
+0628:         self._migrate_tensor(session, tensor, destination, reason_code=next_step.value)
+0629: 
+0630:     def _migrate_tensor(self, session: dict[str, Any], tensor: dict[str, Any], destination: ResidencyState, *, reason_code: str) -> dict[str, Any]:
+0631:         source = ResidencyState(tensor["residency"])
+0632:         tensor["residency"] = destination.value
+0633:         self._apply_bytes(session, tensor["size_bytes"], source, destination)
+0634:         return {"tensor_name": tensor["name"], "source": source.value, "destination": destination.value, "bytes_moved": tensor["size_bytes"], "reason_code": reason_code, "timestamp_ms": _now_ms()}
+0635: 
+0636:     def _select_tensor(self, session: dict[str, Any]) -> dict[str, Any] | None:
+0637:         order = {ResidencyState.VRAM.value: 0, ResidencyState.PINNED_RAM.value: 1, ResidencyState.PAGEABLE_RAM.value: 2, ResidencyState.CPU_ONLY.value: 3}
+0638:         tensors = sorted(session["tensors"].values(), key=lambda tensor: (order.get(tensor["residency"], 99), tensor["name"]))
+0639:         return tensors[0] if tensors else None
+0640: 
+0641:     @staticmethod
+0642:     def _apply_bytes(session: dict[str, Any], size_bytes: int, source: ResidencyState, destination: ResidencyState) -> None:
+0643:         def dec(state: ResidencyState) -> None:
+0644:             key = {
+0645:                 ResidencyState.VRAM: "vram_used_bytes",
+0646:                 ResidencyState.PINNED_RAM: "pinned_ram_used_bytes",
+0647:                 ResidencyState.PAGEABLE_RAM: "pageable_ram_used_bytes",
+0648:                 ResidencyState.CPU_ONLY: "cpu_only_used_bytes",
+0649:             }[state]
+0650:             session[key] = max(0, session[key] - size_bytes)
+0651:         def inc(state: ResidencyState) -> None:
+0652:             key = {
+0653:                 ResidencyState.VRAM: "vram_used_bytes",
+0654:                 ResidencyState.PINNED_RAM: "pinned_ram_used_bytes",
+0655:                 ResidencyState.PAGEABLE_RAM: "pageable_ram_used_bytes",
+0656:                 ResidencyState.CPU_ONLY: "cpu_only_used_bytes",
+0657:             }[state]
+0658:             session[key] += size_bytes
+0659:         dec(source); inc(destination)
+0660: 
+0661:     @staticmethod
+0662:     def _derive_primary_tier(session: dict[str, Any]) -> MemoryTier:
+0663:         if any(t["residency"] == ResidencyState.VRAM.value for t in session["tensors"].values()):
+0664:             return MemoryTier.HOT
+0665:         if any(t["residency"] == ResidencyState.PINNED_RAM.value for t in session["tensors"].values()):
+0666:             return MemoryTier.WARM
+0667:         return MemoryTier.COLD
+0668: 
+0669:     @staticmethod
+0670:     def _compute_pressure(session: dict[str, Any]) -> float:
+0671:         return 1.0 if session["vram_budget_bytes"] <= 0 else max(0.0, min(1.0, session["vram_used_bytes"] / session["vram_budget_bytes"]))
+0672: 
+0673:     def _authorize(self, caller: CallerIdentity) -> None:
+0674:         if not _valid_caller(caller):
+0675:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "caller identity is malformed")
+0676:         if caller.user_sid != self.state["service_owner_sid"]:
+0677:             raise ApiError(ApiErrorCode.AUTH_DENIED, "caller is not authorized for this local endpoint")
+0678: 
+0679:     def _record_attempt(self, caller: CallerIdentity, now_ms: int) -> None:
+0680:         key = _caller_key(caller)
+0681:         self.state["create_session_attempts"].setdefault(key, []).append(now_ms)
+0682: 
+0683:     def _enforce_rate_limit(self, caller: CallerIdentity, now_ms: int) -> None:
+0684:         key = _caller_key(caller)
+0685:         attempts = self.state["create_session_attempts"].setdefault(key, [])
+0686:         cutoff = now_ms - 60_000
+0687:         while attempts and attempts[0] < cutoff:
+0688:             attempts.pop(0)
+0689:         if len(attempts) > 6:
+0690:             raise ApiError(ApiErrorCode.RATE_LIMITED, "CreateSession rate limit exceeded")
+0691: 
+0692:     def _enforce_session_cap(self, caller: CallerIdentity) -> None:
+0693:         if self.state["active_sessions"].get(_caller_key(caller), 0) >= 8:
+0694:             raise ApiError(ApiErrorCode.RESOURCE_EXHAUSTED, "maximum concurrent sessions reached for caller")
+0695: 
+0696:     def _get_session(self, session_id: str) -> dict[str, Any]:
+0697:         session = self.state["sessions"].get(session_id)
+0698:         if session is None:
+0699:             raise ApiError(ApiErrorCode.NOT_FOUND, "session not found")
+0700:         return session
+0701: 
+0702:     def _get_owned_session(self, session_id: str, caller: CallerIdentity, api_name: str) -> dict[str, Any]:
+0703:         session = self._get_session(session_id)
+0704:         if session["closed"] or session["state"] == SessionState.CLOSED.value:
+0705:             raise ApiError(ApiErrorCode.INVALID_STATE, "session is closed")
+0706:         self._authorize(caller)
+0707:         if caller.user_sid != session["owner_sid"]:
+0708:             raise ApiError(ApiErrorCode.AUTH_DENIED, f"{api_name} caller does not own the session")
+0709:         return session
+0710: 
+0711:     @staticmethod
+0712:     def _require_state(session: dict[str, Any], allowed: set[SessionState], api_name: str) -> None:
+0713:         if SessionState(session["state"]) not in allowed:
+0714:             allowed_states = ", ".join(state.value for state in allowed)
+0715:             raise ApiError(ApiErrorCode.INVALID_STATE, f"{api_name} requires one of: {allowed_states}; current state={session['state']}")
+0716: 
+0717:     def _get_tensor(self, session: dict[str, Any], tensor_name: str) -> dict[str, Any]:
+0718:         tensors = session["tensors"]
+0719:         if tensor_name not in tensors:
+0720:             raise ApiError(ApiErrorCode.NOT_FOUND, "tensor not registered")
+0721:         return tensors[tensor_name]
+0722: 
+0723:     def _load(self) -> dict[str, Any]:
+0724:         if not self.path.exists():
+0725:             return _default_state()
+0726:         with self.path.open("r", encoding="utf-8") as f:
+0727:             payload = json.load(f)
+0728:         if int(payload.get("version", 0)) != STATE_VERSION:
+0729:             raise ApiError(ApiErrorCode.INTERNAL, "unsupported CLI state version")
+0730:         return payload
+0731: 
+0732:     def _save(self) -> None:
+0733:         self.path.parent.mkdir(parents=True, exist_ok=True)
+0734:         tmp = self.path.with_suffix(".tmp")
+0735:         with tmp.open("w", encoding="utf-8") as f:
+0736:             json.dump(self.state, f, ensure_ascii=True, indent=2, sort_keys=True)
+0737:         tmp.replace(self.path)
+0738: 
+0739: 
+0740: class RemoteBackend:
+0741:     """Thin adapter over the SDK when an IPC endpoint is available."""
+0742: 
+0743:     def __init__(self, endpoint: str, caller: CallerIdentity) -> None:
+0744:         if AstraWeaveSDK is None:
+0745:             raise ApiError(ApiErrorCode.INTERNAL, "AstraWeaveSDK transport is unavailable")
+0746:         self.sdk = AstraWeaveSDK(endpoint=endpoint, default_caller_identity=caller)
+0747: 
+0748:     def create_session(self, caller: CallerIdentity) -> dict[str, Any]:
+0749:         return {"session_id": self.sdk.CreateSession(caller_identity=caller)}
+0750: 
+0751:     def load_model(
+0752:         self,
+0753:         session_id: str,
+0754:         model_name: str,
+0755:         caller: CallerIdentity,
+0756:         runtime_backend: str | None = None,
+0757:         runtime_profile: str | None = None,
+0758:         runtime_backend_options: dict[str, Any] | None = None,
+0759:     ) -> dict[str, Any]:
+0760:         self.sdk.LoadModel(
+0761:             session_id,
+0762:             model_name,
+0763:             runtime_backend=runtime_backend,
+0764:             runtime_profile=runtime_profile,
+0765:             runtime_backend_options=runtime_backend_options,
+0766:             caller_identity=caller,
+0767:         )
+0768:         result = {"session_id": session_id, "model_name": model_name}
+0769:         if runtime_backend is not None:
+0770:             result["runtime_backend"] = runtime_backend
+0771:         if runtime_profile is not None:
+0772:             result["runtime_profile"] = runtime_profile
+0773:         if runtime_backend_options is not None:
+0774:             result["runtime_backend_options"] = runtime_backend_options
+0775:         return result
+0776: 
+0777:     def register_tensor(self, session_id: str, tensor_name: str, size_bytes: int, caller: CallerIdentity) -> dict[str, Any]:
+0778:         self.sdk.RegisterTensor(session_id, tensor_name, size_bytes, caller_identity=caller)
+0779:         return {"session_id": session_id, "tensor_name": tensor_name, "size_bytes": size_bytes}
+0780: 
+0781:     def set_tier_hint(self, session_id: str, tensor_name: str, tier: MemoryTier, caller: CallerIdentity) -> dict[str, Any]:
+0782:         self.sdk.SetTierHint(session_id, tensor_name, tier, caller_identity=caller)
+0783:         return {"session_id": session_id, "tensor_name": tensor_name, "tier_hint": tier.value}
+0784: 
+0785:     def prefetch_plan(self, session_id: str, caller: CallerIdentity) -> Any:
+0786:         return self.sdk.PrefetchPlan(session_id, caller_identity=caller)
+0787: 
+0788:     def run_step(
+0789:         self,
+0790:         session_id: str,
+0791:         step_name: str,
+0792:         caller: CallerIdentity,
+0793:         prompt: str | None = None,
+0794:         max_tokens: int | None = None,
+0795:         temperature: float | None = None,
+0796:         runtime_profile_override: str | None = None,
+0797:         runtime_backend_options_override: dict[str, Any] | None = None,
+0798:     ) -> Any:
+0799:         return self.sdk.RunStep(
+0800:             session_id,
+0801:             step_name=step_name,
+0802:             prompt=prompt,
+0803:             max_tokens=max_tokens,
+0804:             temperature=temperature,
+0805:             runtime_profile_override=runtime_profile_override,
+0806:             runtime_backend_options_override=runtime_backend_options_override,
+0807:             caller_identity=caller,
+0808:         )
+0809: 
+0810:     def get_residency(self, session_id: str, caller: CallerIdentity) -> Any:
+0811:         return self.sdk.GetResidency(session_id, caller_identity=caller)
+0812: 
+0813:     def get_pressure(self, session_id: str, caller: CallerIdentity) -> Any:
+0814:         return self.sdk.GetPressure(session_id, caller_identity=caller)
+0815: 
+0816:     def set_policy(self, session_id: str, policy: PolicyProfile, caller: CallerIdentity) -> dict[str, Any]:
+0817:         self.sdk.SetPolicy(session_id, policy, caller_identity=caller)
+0818:         return {"session_id": session_id, "policy_profile": policy.value}
+0819: 
+0820:     def close_session(self, session_id: str, caller: CallerIdentity) -> dict[str, Any]:
+0821:         self.sdk.CloseSession(session_id, caller_identity=caller)
+0822:         return {"session_id": session_id, "closed": True, "idempotent": False}
+0823: 
+0824: 
+0825: def _build_parser() -> argparse.ArgumentParser:
+0826:     common = argparse.ArgumentParser(add_help=False)
+0827:     common.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
+0828:     common.add_argument("--backend", choices=["auto", "remote", "local"], default="auto")
+0829:     common.add_argument("--caller-sid", default=DEFAULT_SERVICE_OWNER_SID)
+0830:     common.add_argument("--caller-pid", type=int, default=1)
+0831: 
+0832:     parser = argparse.ArgumentParser(prog="astrawave", description="AstraWeave CLI", parents=[common])
+0833:     sub = parser.add_subparsers(dest="command", required=True)
+0834: 
+0835:     sub.add_parser("create-session")
+0836: 
+0837:     p = sub.add_parser("load-model")
+0838:     p.add_argument("session_id")
+0839:     p.add_argument("model_name")
+0840:     p.add_argument(
+0841:         "--runtime-backend",
+0842:         default=None,
+0843:         help="Optional runtime backend selector for the loaded model (for example: auto, simulation, ollama).",
+0844:     )
+0845:     p.add_argument(
+0846:         "--runtime-profile",
+0847:         default=None,
+0848:         help="Optional load-time tuning profile (for example: auto or vram_constrained).",
+0849:     )
+0850:     p.add_argument(
+0851:         "--runtime-option",
+0852:         dest="runtime_options",
+0853:         action="append",
+0854:         default=None,
+0855:         metavar="KEY=VALUE",
+0856:         help="Optional load-time backend tuning option; may be repeated.",
+0857:     )
+0858: 
+0859:     p = sub.add_parser("register-tensor")
+0860:     p.add_argument("session_id")
+0861:     p.add_argument("tensor_name")
+0862:     p.add_argument("size_bytes", type=int)
+0863: 
+0864:     p = sub.add_parser("set-tier-hint")
+0865:     p.add_argument("session_id")
+0866:     p.add_argument("tensor_name")
+0867:     p.add_argument("tier", choices=[item.value for item in MemoryTier])
+0868: 
+0869:     p = sub.add_parser("prefetch-plan")
+0870:     p.add_argument("session_id")
+0871: 
+0872:     p = sub.add_parser("run-step")
+0873:     p.add_argument("session_id")
+0874:     p.add_argument("--step-name", default="run")
+0875:     p.add_argument("--prompt", default=None)
+0876:     p.add_argument("--max-tokens", type=int, default=None)
+0877:     p.add_argument("--temperature", type=float, default=None)
+0878:     p.add_argument(
+0879:         "--runtime-profile-override",
+0880:         default=None,
+0881:         help="Optional per-step tuning profile override.",
+0882:     )
+0883:     p.add_argument(
+0884:         "--runtime-option-override",
+0885:         dest="runtime_option_overrides",
+0886:         action="append",
+0887:         default=None,
+0888:         metavar="KEY=VALUE",
+0889:         help="Optional per-step backend tuning option override; may be repeated.",
+0890:     )
+0891: 
+0892:     p = sub.add_parser("get-residency")
+0893:     p.add_argument("session_id")
+0894: 
+0895:     p = sub.add_parser("get-pressure")
+0896:     p.add_argument("session_id")
+0897: 
+0898:     p = sub.add_parser("set-policy")
+0899:     p.add_argument("session_id")
+0900:     p.add_argument("policy", choices=[item.value for item in PolicyProfile])
+0901: 
+0902:     p = sub.add_parser("close-session")
+0903:     p.add_argument("session_id")
+0904: 
+0905:     sub.add_parser("hardware-probe")
+0906: 
+0907:     serve = sub.add_parser("serve")
+0908:     serve.add_argument(
+0909:         "--endpoint",
+0910:         "--serve-endpoint",
+0911:         dest="serve_endpoint",
+0912:         default=DEFAULT_SERVE_ENDPOINT,
+0913:     )
+0914:     serve.add_argument("--transport", choices=["auto", "tcp", "pipe"], default="auto")
+0915:     serve.add_argument("--duration-seconds", type=float, default=None)
+0916:     return parser
+0917: 
+0918: 
+0919: def _dispatch(backend: LocalBackend, args: argparse.Namespace, caller: CallerIdentity) -> Any:
+0920:     if args.command == "create-session":
+0921:         return backend.create_session(caller)
+0922:     if args.command == "load-model":
+0923:         runtime_backend_options = _parse_runtime_option_pairs(args.runtime_options, field_name="runtime_options")
+0924:         return backend.load_model(
+0925:             args.session_id,
+0926:             args.model_name,
+0927:             caller,
+0928:             args.runtime_backend,
+0929:             args.runtime_profile,
+0930:             runtime_backend_options,
+0931:         )
+0932:     if args.command == "register-tensor":
+0933:         return backend.register_tensor(args.session_id, args.tensor_name, args.size_bytes, caller)
+0934:     if args.command == "set-tier-hint":
+0935:         return backend.set_tier_hint(args.session_id, args.tensor_name, _to_memory_tier(args.tier), caller)
+0936:     if args.command == "prefetch-plan":
+0937:         return backend.prefetch_plan(args.session_id, caller)
+0938:     if args.command == "run-step":
+0939:         runtime_backend_options_override = _parse_runtime_option_pairs(
+0940:             args.runtime_option_overrides,
+0941:             field_name="runtime_option_overrides",
+0942:         )
+0943:         return backend.run_step(
+0944:             args.session_id,
+0945:             args.step_name,
+0946:             caller,
+0947:             args.prompt,
+0948:             args.max_tokens,
+0949:             args.temperature,
+0950:             args.runtime_profile_override,
+0951:             runtime_backend_options_override,
+0952:         )
+0953:     if args.command == "get-residency":
+0954:         return backend.get_residency(args.session_id, caller)
+0955:     if args.command == "get-pressure":
+0956:         return backend.get_pressure(args.session_id, caller)
+0957:     if args.command == "set-policy":
+0958:         return backend.set_policy(args.session_id, _to_policy_profile(args.policy), caller)
+0959:     if args.command == "close-session":
+0960:         return backend.close_session(args.session_id, caller)
+0961:     raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unknown command {args.command}")
+0962: 
+0963: 
+0964: def _serve(args: argparse.Namespace) -> int:
+0965:     duration_seconds = args.duration_seconds
+0966:     if AstraWeaveServiceHost is not None and ServiceHostConfig is not None:
+0967:         transport_config = _parse_serve_endpoint(args.serve_endpoint, args.transport)
+0968:         config = ServiceHostConfig(
+0969:             endpoint=None,
+0970:             prefer_named_pipe=bool(transport_config.get("prefer_named_pipe", False)),
+0971:             pipe_name=str(transport_config.get("pipe_name", r"\\.\pipe\astrawave")),
+0972:             host=str(transport_config.get("host", "127.0.0.1")),
+0973:             port=int(transport_config.get("port", 0)),
+0974:         )
+0975:         host = AstraWeaveServiceHost(config)
+0976:         started = False
+0977:         try:
+0978:             status = host.start()
+0979:             started = True
+0980:             _emit_ok(
+0981:                 {
+0982:                     "stage": "started",
+0983:                     "requested_endpoint": args.serve_endpoint,
+0984:                     "requested_transport": args.transport,
+0985:                     "endpoint": _describe_endpoint(status.endpoint),
+0986:                     "transport": status.transport,
+0987:                     "pid": os.getpid(),
+0988:                     "duration_seconds": duration_seconds,
+0989:                 }
+0990:             )
+0991: 
+0992:             if duration_seconds is None:
+0993:                 while host.is_running:
+0994:                     sleep(0.2)
+0995:             else:
+0996:                 host.run_for(max(duration_seconds, 0.0))
+0997:         except KeyboardInterrupt:
+0998:             return 130
+0999:         except ApiError:
+1000:             raise
+1001:         except Exception as exc:
+1002:             raise ApiError(ApiErrorCode.INTERNAL, "failed to start AstraWeave service host") from exc
+1003:         finally:
+1004:             if started:
+1005:                 stopped = host.stop()
+1006:                 _emit_ok(
+1007:                     {
+1008:                         "stage": "stopped",
+1009:                         "endpoint": _describe_endpoint(stopped.endpoint),
+1010:                         "transport": stopped.transport,
+1011:                         "duration_seconds": duration_seconds,
+1012:                     }
+1013:                 )
+1014:         return 0
+1015: 
+1016:     if AstraWeaveIpcServer is None:
+1017:         raise ApiError(ApiErrorCode.INTERNAL, "AstraWeaveIpcServer transport is unavailable")
+1018: 
+1019:     config = _parse_serve_endpoint(args.serve_endpoint, args.transport)
+1020:     server = AstraWeaveIpcServer(**config)
+1021:     started = False
+1022:     exit_code = 0
+1023:     try:
+1024:         server.start()
+1025:         started = True
+1026:         _emit_ok(
+1027:             {
+1028:                 "stage": "started",
+1029:                 "requested_endpoint": args.serve_endpoint,
+1030:                 "requested_transport": args.transport,
+1031:                 "endpoint": _describe_endpoint(server.endpoint),
+1032:                 "transport": server.transport,
+1033:                 "pid": os.getpid(),
+1034:                 "duration_seconds": duration_seconds,
+1035:             }
+1036:         )
+1037: 
+1038:         if duration_seconds is None:
+1039:             while True:
+1040:                 sleep(0.2)
+1041:         else:
+1042:             deadline = monotonic() + max(duration_seconds, 0.0)
+1043:             while True:
+1044:                 remaining = deadline - monotonic()
+1045:                 if remaining <= 0:
+1046:                     break
+1047:                 sleep(min(0.2, remaining))
+1048:     except KeyboardInterrupt:
+1049:         exit_code = 130
+1050:     except ApiError:
+1051:         raise
+1052:     except Exception as exc:
+1053:         raise ApiError(ApiErrorCode.INTERNAL, "failed to start AstraWeave service host") from exc
+1054:     finally:
+1055:         if started:
+1056:             with suppress(Exception):
+1057:                 server.stop()
+1058:             _emit_ok(
+1059:                 {
+1060:                     "stage": "stopped",
+1061:                     "endpoint": _describe_endpoint(server.endpoint),
+1062:                     "transport": server.transport,
+1063:                     "duration_seconds": duration_seconds,
+1064:                 }
+1065:             )
+1066:     return exit_code
+1067: 
+1068: 
+1069: def main(argv: Sequence[str] | None = None) -> int:
+1070:     parser = _build_parser()
+1071:     args = parser.parse_args(argv)
+1072:     if args.command == "serve":
+1073:         try:
+1074:             return _serve(args)
+1075:         except ApiError as exc:
+1076:             _emit_error(exc)
+1077:             return 1
+1078:     if args.command == "hardware-probe":
+1079:         try:
+1080:             _emit_ok(_json_safe(_hardware_probe_result()))
+1081:             return 0
+1082:         except ApiError as exc:
+1083:             _emit_error(exc)
+1084:             return 1
+1085:     caller = CallerIdentity(user_sid=args.caller_sid, pid=args.caller_pid)
+1086:     try:
+1087:         backend = _resolve_backend(args.endpoint, caller, args.backend)
+1088:         result = _dispatch(backend, args, caller)
+1089:         _emit_ok(_json_safe(result))
+1090:         return 0
+1091:     except ApiError as exc:
+1092:         _emit_error(exc)
+1093:         return 1
+1094: 
+1095: 
+1096: def _resolve_backend(endpoint: str, caller: CallerIdentity, mode: str = "auto") -> Any:
+1097:     endpoint = (endpoint or "").strip()
+1098:     mode = (mode or "auto").strip().lower()
+1099:     if mode not in {"auto", "remote", "local"}:
+1100:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "backend must be one of: auto, remote, local")
+1101: 
+1102:     if mode == "local":
+1103:         return LocalBackend(endpoint or "local://default")
+1104:     if mode == "remote":
+1105:         return RemoteBackend(endpoint or "auto", caller)
+1106: 
+1107:     remote_hint = endpoint.startswith(("tcp://", "pipe://", "\\\\.\\pipe\\"))
+1108:     local_hint = endpoint.startswith("local://")
+1109:     if local_hint:
+1110:         return LocalBackend(endpoint)
+1111: 
+1112:     if endpoint == "auto" or remote_hint or endpoint == "":
+1113:         try:
+1114:             return RemoteBackend(endpoint or "auto", caller)
+1115:         except ApiError:
+1116:             if endpoint in {"", "auto", DEFAULT_ENDPOINT}:
+1117:                 raise
+1118:             if remote_hint:
+1119:                 raise
+1120:     return LocalBackend(endpoint or DEFAULT_ENDPOINT)
+1121: 
+1122: 
+1123: if __name__ == "__main__":  # pragma: no cover
+1124:     raise SystemExit(main())

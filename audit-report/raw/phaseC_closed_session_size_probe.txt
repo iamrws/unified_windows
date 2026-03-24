@@ -1,0 +1,2 @@
+﻿closed_sessions_count 1
+single_closed_session_approx_bytes 11154

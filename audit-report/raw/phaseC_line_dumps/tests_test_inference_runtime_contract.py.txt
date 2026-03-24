@@ -1,0 +1,103 @@
+﻿0001: """Contract tests for runtime tuning and backend option synthesis."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import unittest
+0006: 
+0007: from astrawave.errors import ApiError, ApiErrorCode
+0008: from astrawave.inference_runtime import OllamaInferenceRuntime
+0009: from astrawave.runtime_tuning import infer_model_size_billion, resolve_runtime_tuning
+0010: 
+0011: 
+0012: class RuntimeTuningContractTests(unittest.TestCase):
+0013:     def test_infer_model_size_billion_detects_simple_and_moe_tags(self) -> None:
+0014:         self.assertEqual(infer_model_size_billion("qwen2.5:14b-instruct"), 14.0)
+0015:         self.assertEqual(infer_model_size_billion("mixtral-8x7b-instruct"), 56.0)
+0016:         self.assertIsNone(infer_model_size_billion("demo-model"))
+0017: 
+0018:     def test_large_models_default_to_vram_constrained_profile(self) -> None:
+0019:         tuning = resolve_runtime_tuning("qwen2.5:32b")
+0020: 
+0021:         self.assertEqual(tuning.profile_name, "vram_constrained")
+0022:         self.assertEqual(tuning.model_size_billion, 32.0)
+0023:         self.assertEqual(tuning.model_size_label, "32b")
+0024:         self.assertEqual(tuning.backend_options["num_ctx"], 1536)
+0025:         self.assertEqual(tuning.backend_options["num_batch"], 16)
+0026:         self.assertTrue(tuning.backend_options["low_vram"])
+0027:         self.assertTrue(tuning.backend_options["f16_kv"])
+0028: 
+0029:     def test_explicit_backend_options_override_profile_defaults(self) -> None:
+0030:         tuning = resolve_runtime_tuning(
+0031:             "qwen2.5:14b",
+0032:             backend_options={"num_ctx": 4096, "repeat_penalty": 1.1},
+0033:         )
+0034: 
+0035:         self.assertEqual(tuning.profile_name, "vram_constrained")
+0036:         self.assertEqual(tuning.backend_options["num_ctx"], 4096)
+0037:         self.assertEqual(tuning.backend_options["num_batch"], 24)
+0038:         self.assertTrue(tuning.backend_options["low_vram"])
+0039:         self.assertAlmostEqual(tuning.backend_options["repeat_penalty"], 1.1)
+0040: 
+0041:     def test_invalid_backend_option_types_are_rejected(self) -> None:
+0042:         with self.assertRaises(ApiError) as cm:
+0043:             resolve_runtime_tuning("qwen2.5:14b", backend_options={"num_ctx": object()})
+0044:         self.assertEqual(cm.exception.code, ApiErrorCode.INVALID_ARGUMENT)
+0045: 
+0046:     def test_ollama_runtime_merges_backend_options_before_transport(self) -> None:
+0047:         requests: list[dict[str, object]] = []
+0048: 
+0049:         def fake_transport(url: str, payload: dict[str, object], timeout_seconds: float) -> dict[str, object]:
+0050:             requests.append(
+0051:                 {
+0052:                     "url": url,
+0053:                     "payload": payload,
+0054:                     "timeout_seconds": timeout_seconds,
+0055:                 }
+0056:             )
+0057:             return {
+0058:                 "response": "hello from ollama",
+0059:                 "done": True,
+0060:                 "done_reason": "stop",
+0061:                 "prompt_eval_count": 11,
+0062:                 "eval_count": 24,
+0063:                 "total_duration": 42,
+0064:                 "load_duration": 7,
+0065:                 "eval_duration": 35,
+0066:             }
+0067: 
+0068:         runtime = OllamaInferenceRuntime(base_url="http://127.0.0.1:11434", timeout_seconds=2.5, transport=fake_transport)
+0069:         binding = runtime.load_model("qwen2.5:14b")
+0070:         effective_options = {
+0071:             **binding.metadata["backend_options"],
+0072:             "num_ctx": 4096,
+0073:             "repeat_penalty": 1.05,
+0074:         }
+0075:         result = runtime.generate(
+0076:             binding.resolved_model_name,
+0077:             prompt="Explain the fit.",
+0078:             step_name="prompt_smoke",
+0079:             max_tokens=32,
+0080:             temperature=0.2,
+0081:             backend_options=effective_options,
+0082:         )
+0083: 
+0084:         self.assertEqual(binding.metadata["runtime_profile"], "vram_constrained")
+0085:         self.assertEqual(binding.metadata["backend_options"]["num_ctx"], 2048)
+0086:         self.assertEqual(requests[0]["url"], "http://127.0.0.1:11434/api/generate")
+0087:         self.assertEqual(requests[0]["timeout_seconds"], 2.5)
+0088:         payload = requests[0]["payload"]
+0089:         self.assertEqual(payload["model"], "qwen2.5:14b")
+0090:         self.assertEqual(payload["prompt"], "Explain the fit.")
+0091:         self.assertEqual(payload["options"]["num_ctx"], 4096)
+0092:         self.assertEqual(payload["options"]["num_batch"], 24)
+0093:         self.assertTrue(payload["options"]["low_vram"])
+0094:         self.assertTrue(payload["options"]["f16_kv"])
+0095:         self.assertEqual(payload["options"]["num_predict"], 32)
+0096:         self.assertAlmostEqual(payload["options"]["temperature"], 0.2)
+0097:         self.assertAlmostEqual(payload["options"]["repeat_penalty"], 1.05)
+0098:         self.assertTrue(result["ok"])
+0099:         self.assertEqual(result["output_text"], "hello from ollama")
+0100: 
+0101: 
+0102: if __name__ == "__main__":
+0103:     unittest.main()

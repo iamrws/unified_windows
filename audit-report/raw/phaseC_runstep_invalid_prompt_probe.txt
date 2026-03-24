@@ -1,0 +1,3 @@
+﻿caught AW_ERR_INVALID_ARGUMENT prompt must be a non-empty string when provided
+state_after RUNNING
+second_run_error AW_ERR_INVALID_STATE RunStep requires one of: DEGRADED, READY; current state=RUNNING

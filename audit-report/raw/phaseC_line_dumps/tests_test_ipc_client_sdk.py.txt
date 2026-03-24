@@ -1,0 +1,497 @@
+﻿0001: """End-to-end IPC client and SDK contract tests for AstraWeave."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import os
+0006: import time
+0007: import unittest
+0008: 
+0009: from astrawave.errors import ApiError, ApiErrorCode
+0010: from astrawave.ipc_client import AstraWeaveIpcClient
+0011: from astrawave.ipc_server import AstraWeaveIpcServer
+0012: from astrawave.sdk import AstraWeaveSDK
+0013: from astrawave.security import CallerIdentity, SecurityGuard, SecurityPolicy, resolve_process_user_sid
+0014: from astrawave.service import AstraWeaveService
+0015: from astrawave.types import MemoryTier, PolicyProfile
+0016: 
+0017: 
+0018: def _endpoint_to_uri(endpoint: object) -> str:
+0019:     if isinstance(endpoint, tuple) and len(endpoint) == 2:
+0020:         host, port = endpoint
+0021:         return f"tcp://{host}:{port}"
+0022:     if isinstance(endpoint, str):
+0023:         return endpoint if endpoint.startswith(("tcp://", "pipe://")) else f"tcp://{endpoint}"
+0024:     raise AssertionError(f"Unsupported endpoint shape: {endpoint!r}")
+0025: 
+0026: 
+0027: def _connect_client(endpoint: str, caller: CallerIdentity) -> AstraWeaveIpcClient:
+0028:     client = AstraWeaveIpcClient(
+0029:         endpoint=endpoint,
+0030:         timeout=5.0,
+0031:         default_caller=caller,
+0032:         prefer_named_pipe=False,
+0033:     )
+0034:     last_error: Exception | None = None
+0035:     for _ in range(40):
+0036:         try:
+0037:             client.connect()
+0038:             return client
+0039:         except Exception as exc:  # pragma: no cover - only used during startup races
+0040:             last_error = exc
+0041:             time.sleep(0.05)
+0042:     if last_error is not None:
+0043:         raise last_error
+0044:     raise AssertionError("client failed to connect")
+0045: 
+0046: 
+0047: class _SDKBridge:
+0048:     """Adapter that lets `AstraWeaveSDK` drive a real IPC client."""
+0049: 
+0050:     def __init__(self, client: AstraWeaveIpcClient) -> None:
+0051:         self._client = client
+0052: 
+0053:     def close(self) -> None:
+0054:         self._client.close()
+0055: 
+0056:     def CreateSession(self, caller_identity: CallerIdentity | None = None) -> str:
+0057:         return self._client.CreateSession(caller_identity)
+0058: 
+0059:     def LoadModel(
+0060:         self,
+0061:         session_id: str,
+0062:         model_name: str,
+0063:         caller_identity: CallerIdentity | None = None,
+0064:         runtime_backend: str | None = None,
+0065:         runtime_profile: str | None = None,
+0066:         runtime_backend_options: dict[str, object] | None = None,
+0067:     ) -> None:
+0068:         self._client.LoadModel(
+0069:             session_id,
+0070:             model_name,
+0071:             caller_identity,
+0072:             runtime_backend=runtime_backend,
+0073:             runtime_profile=runtime_profile,
+0074:             runtime_backend_options=runtime_backend_options,
+0075:         )
+0076: 
+0077:     def RegisterTensor(
+0078:         self,
+0079:         session_id: str,
+0080:         tensor_name: str,
+0081:         size_bytes: int,
+0082:         caller_identity: CallerIdentity | None = None,
+0083:     ) -> None:
+0084:         self._client.RegisterTensor(session_id, tensor_name, size_bytes, caller_identity)
+0085: 
+0086:     def SetTierHint(
+0087:         self,
+0088:         session_id: str,
+0089:         tensor_name: str,
+0090:         tier: MemoryTier,
+0091:         caller_identity: CallerIdentity | None = None,
+0092:     ) -> None:
+0093:         self._client.SetTierHint(session_id, tensor_name, tier, caller_identity)
+0094: 
+0095:     def PrefetchPlan(self, session_id: str, caller_identity: CallerIdentity | None = None):
+0096:         return self._client.PrefetchPlan(session_id, caller_identity)
+0097: 
+0098:     def RunStep(
+0099:         self,
+0100:         session_id: str,
+0101:         step_name: str = "run",
+0102:         caller_identity: CallerIdentity | None = None,
+0103:         prompt: str | None = None,
+0104:         max_tokens: int | None = None,
+0105:         temperature: float | None = None,
+0106:         runtime_profile_override: str | None = None,
+0107:         runtime_backend_options_override: dict[str, object] | None = None,
+0108:     ):
+0109:         return self._client.RunStep(
+0110:             session_id,
+0111:             step_name,
+0112:             caller_identity,
+0113:             prompt=prompt,
+0114:             max_tokens=max_tokens,
+0115:             temperature=temperature,
+0116:             runtime_profile_override=runtime_profile_override,
+0117:             runtime_backend_options_override=runtime_backend_options_override,
+0118:         )
+0119: 
+0120:     def GetResidency(self, session_id: str, caller_identity: CallerIdentity | None = None):
+0121:         return self._client.GetResidency(session_id, caller_identity)
+0122: 
+0123:     def GetPressure(self, session_id: str, caller_identity: CallerIdentity | None = None):
+0124:         return self._client.GetPressure(session_id, caller_identity)
+0125: 
+0126:     def SetPolicy(
+0127:         self,
+0128:         session_id: str,
+0129:         policy: PolicyProfile,
+0130:         caller_identity: CallerIdentity | None = None,
+0131:     ) -> None:
+0132:         self._client.SetPolicy(session_id, policy, caller_identity)
+0133: 
+0134:     def CloseSession(self, session_id: str, caller_identity: CallerIdentity | None = None) -> None:
+0135:         self._client.CloseSession(session_id, caller_identity)
+0136: 
+0137: 
+0138: class IpcClientSdkE2ETests(unittest.TestCase):
+0139:     def setUp(self) -> None:
+0140:         current_pid = os.getpid()
+0141:         current_sid = resolve_process_user_sid(current_pid) or "S-1-5-21-1000"
+0142:         self.owner = CallerIdentity(user_sid=current_sid, pid=current_pid)
+0143:         self.foreign = CallerIdentity(user_sid="S-1-5-21-2000", pid=current_pid)
+0144: 
+0145:         service = AstraWeaveService(
+0146:             security_guard=SecurityGuard(
+0147:                 SecurityPolicy(service_owner_sid=self.owner.user_sid)
+0148:             )
+0149:         )
+0150:         self.server = AstraWeaveIpcServer(
+0151:             service=service,
+0152:             prefer_named_pipe=False,
+0153:             host="127.0.0.1",
+0154:             port=0,
+0155:         )
+0156:         self.server.start()
+0157:         self.addCleanup(self.server.stop)
+0158: 
+0159:         self.endpoint = self._wait_for_endpoint()
+0160: 
+0161:     def _wait_for_endpoint(self) -> str:
+0162:         last_endpoint: object | None = None
+0163:         for _ in range(40):
+0164:             last_endpoint = self.server.endpoint
+0165:             if last_endpoint:
+0166:                 return _endpoint_to_uri(last_endpoint)
+0167:             time.sleep(0.05)
+0168:         raise AssertionError(f"server did not expose an endpoint; last value={last_endpoint!r}")
+0169: 
+0170:     def _make_client(self, caller: CallerIdentity) -> AstraWeaveIpcClient:
+0171:         client = _connect_client(self.endpoint, caller)
+0172:         self.addCleanup(client.close)
+0173:         return client
+0174: 
+0175:     def _make_sdk(self, caller: CallerIdentity) -> AstraWeaveSDK:
+0176:         client = _connect_client(self.endpoint, caller)
+0177:         self.addCleanup(client.close)
+0178:         sdk = AstraWeaveSDK(
+0179:             client=_SDKBridge(client),
+0180:             default_caller_identity=caller,
+0181:         )
+0182:         self.addCleanup(sdk.close)
+0183:         return sdk
+0184: 
+0185:     def test_client_and_sdk_happy_path(self) -> None:
+0186:         direct_client = self._make_client(self.owner)
+0187:         session_id = direct_client.CreateSession(self.owner)
+0188:         direct_client.LoadModel(session_id, "demo-model", self.owner)
+0189:         direct_client.RegisterTensor(session_id, "kv", 1024, self.owner)
+0190:         direct_client.SetTierHint(session_id, "kv", MemoryTier.HOT, self.owner)
+0191: 
+0192:         prefetched = direct_client.PrefetchPlan(session_id, self.owner)
+0193:         self.assertIsInstance(prefetched, list)
+0194: 
+0195:         step = direct_client.RunStep(session_id, "decode", self.owner)
+0196:         self.assertEqual(step["session_id"], session_id)
+0197:         self.assertEqual(step["step_name"], "decode")
+0198: 
+0199:         residency = direct_client.GetResidency(session_id, self.owner)
+0200:         pressure = direct_client.GetPressure(session_id, self.owner)
+0201:         self.assertEqual(residency.session_id, session_id)
+0202:         self.assertEqual(pressure.session_id, session_id)
+0203: 
+0204:         direct_client.CloseSession(session_id, self.owner)
+0205:         direct_client.close()
+0206: 
+0207:         sdk = self._make_sdk(self.owner)
+0208:         sdk_session_id = sdk.CreateSession()
+0209:         sdk.LoadModel(sdk_session_id, "sdk-model")
+0210:         sdk.RegisterTensor(sdk_session_id, "weights", 2048)
+0211:         sdk.SetTierHint(sdk_session_id, "weights", MemoryTier.WARM)
+0212:         sdk_step = sdk.RunStep(sdk_session_id, "decode")
+0213:         self.assertEqual(sdk_step["session_id"], sdk_session_id)
+0214:         self.assertEqual(sdk.GetResidency(sdk_session_id).session_id, sdk_session_id)
+0215:         self.assertEqual(sdk.GetPressure(sdk_session_id).session_id, sdk_session_id)
+0216: 
+0217:         sdk.CloseSession(sdk_session_id)
+0218:         sdk.close()
+0219: 
+0220:     def test_optional_runtime_backend_and_generation_knobs_round_trip(self) -> None:
+0221:         direct_client = self._make_client(self.owner)
+0222:         session_id = direct_client.CreateSession(self.owner)
+0223:         direct_client.LoadModel(session_id, "demo-model", self.owner, runtime_backend="ollama")
+0224:         direct_client.RegisterTensor(session_id, "kv", 1024, self.owner)
+0225:         direct_client.SetTierHint(session_id, "kv", MemoryTier.HOT, self.owner)
+0226: 
+0227:         run_result = direct_client.RunStep(
+0228:             session_id,
+0229:             "decode",
+0230:             self.owner,
+0231:             prompt="hello there",
+0232:             max_tokens=16,
+0233:             temperature=0.2,
+0234:         )
+0235:         self.assertEqual(run_result["session_id"], session_id)
+0236:         self.assertEqual(run_result["step_name"], "decode")
+0237:         direct_client.close()
+0238: 
+0239:         sdk = self._make_sdk(self.owner)
+0240:         sdk_session_id = sdk.CreateSession()
+0241:         sdk.LoadModel(sdk_session_id, "sdk-model", runtime_backend="ollama")
+0242:         sdk.RegisterTensor(sdk_session_id, "weights", 2048)
+0243:         sdk.SetTierHint(sdk_session_id, "weights", MemoryTier.WARM)
+0244:         sdk_step = sdk.RunStep(
+0245:             sdk_session_id,
+0246:             "decode",
+0247:             prompt="generate a short response",
+0248:             max_tokens=12,
+0249:             temperature=0.4,
+0250:         )
+0251:         self.assertEqual(sdk_step["session_id"], sdk_session_id)
+0252:         sdk.CloseSession(sdk_session_id)
+0253:         sdk.close()
+0254: 
+0255:     def test_runtime_tuning_controls_round_trip_and_validate_inputs(self) -> None:
+0256:         class _Transport:
+0257:             def __init__(self) -> None:
+0258:                 self.payloads: list[dict[str, object]] = []
+0259: 
+0260:             def request(self, payload, timeout):
+0261:                 self.payloads.append(payload)
+0262:                 return {"id": payload["id"], "ok": True, "result": None}
+0263: 
+0264:             def close(self) -> None:
+0265:                 return None
+0266: 
+0267:         client = AstraWeaveIpcClient(endpoint="tcp://127.0.0.1:8765", timeout=5.0, default_caller=self.owner, prefer_named_pipe=False)
+0268:         transport = _Transport()
+0269:         client._transport = transport  # type: ignore[attr-defined]
+0270: 
+0271:         client.LoadModel(
+0272:             "session-1",
+0273:             "qwen2.5:14b",
+0274:             self.owner,
+0275:             runtime_backend="ollama",
+0276:             runtime_profile="vram_constrained",
+0277:             runtime_backend_options={"num_ctx": 4096, "num_batch": 1},
+0278:         )
+0279:         client.RunStep(
+0280:             "session-1",
+0281:             "decode",
+0282:             self.owner,
+0283:             prompt="hello",
+0284:             max_tokens=32,
+0285:             temperature=0.25,
+0286:             runtime_profile_override="memory_saver",
+0287:             runtime_backend_options_override={"num_predict": 64, "top_p": 0.9},
+0288:         )
+0289:         self.assertEqual(transport.payloads[0]["params"]["runtime_profile"], "vram_constrained")
+0290:         self.assertEqual(transport.payloads[0]["params"]["runtime_backend_options"], {"num_ctx": 4096, "num_batch": 1})
+0291:         self.assertEqual(transport.payloads[1]["params"]["runtime_profile_override"], "memory_saver")
+0292:         self.assertEqual(transport.payloads[1]["params"]["runtime_backend_options_override"], {"num_predict": 64, "top_p": 0.9})
+0293: 
+0294:         with self.assertRaises(ApiError) as cm:
+0295:             client.LoadModel(
+0296:                 "session-2",
+0297:                 "demo-model",
+0298:                 self.owner,
+0299:                 runtime_backend_options={"num_ctx": 0},
+0300:             )
+0301:         self.assertEqual(cm.exception.code, ApiErrorCode.INVALID_ARGUMENT)
+0302: 
+0303:         class _Bridge:
+0304:             def __init__(self) -> None:
+0305:                 self.calls: list[tuple[str, dict[str, object]]] = []
+0306: 
+0307:             def LoadModel(
+0308:                 self,
+0309:                 session_id: str,
+0310:                 model_name: str,
+0311:                 caller_identity: CallerIdentity | None = None,
+0312:                 runtime_backend: str | None = None,
+0313:                 runtime_profile: str | None = None,
+0314:                 runtime_backend_options: dict[str, object] | None = None,
+0315:             ) -> None:
+0316:                 self.calls.append(
+0317:                     (
+0318:                         "LoadModel",
+0319:                         {
+0320:                             "session_id": session_id,
+0321:                             "model_name": model_name,
+0322:                             "caller_identity": caller_identity,
+0323:                             "runtime_backend": runtime_backend,
+0324:                             "runtime_profile": runtime_profile,
+0325:                             "runtime_backend_options": runtime_backend_options,
+0326:                         },
+0327:                     )
+0328:                 )
+0329: 
+0330:             def RunStep(
+0331:                 self,
+0332:                 session_id: str,
+0333:                 step_name: str = "run",
+0334:                 caller_identity: CallerIdentity | None = None,
+0335:                 prompt: str | None = None,
+0336:                 max_tokens: int | None = None,
+0337:                 temperature: float | None = None,
+0338:                 runtime_profile_override: str | None = None,
+0339:                 runtime_backend_options_override: dict[str, object] | None = None,
+0340:             ) -> None:
+0341:                 self.calls.append(
+0342:                     (
+0343:                         "RunStep",
+0344:                         {
+0345:                             "session_id": session_id,
+0346:                             "step_name": step_name,
+0347:                             "caller_identity": caller_identity,
+0348:                             "prompt": prompt,
+0349:                             "max_tokens": max_tokens,
+0350:                             "temperature": temperature,
+0351:                             "runtime_profile_override": runtime_profile_override,
+0352:                             "runtime_backend_options_override": runtime_backend_options_override,
+0353:                         },
+0354:                     )
+0355:                 )
+0356: 
+0357:         bridge = _Bridge()
+0358:         sdk = AstraWeaveSDK(client=bridge, default_caller_identity=self.owner)
+0359:         sdk.LoadModel(
+0360:             "session-3",
+0361:             "demo-model",
+0362:             runtime_backend="ollama",
+0363:             runtime_profile="vram_constrained",
+0364:             runtime_backend_options={"num_ctx": 4096},
+0365:         )
+0366:         sdk.RunStep(
+0367:             "session-3",
+0368:             "decode",
+0369:             prompt="hello",
+0370:             runtime_profile_override="memory_saver",
+0371:             runtime_backend_options_override={"num_predict": 32},
+0372:         )
+0373:         self.assertEqual(bridge.calls[0][1]["runtime_profile"], "vram_constrained")
+0374:         self.assertEqual(bridge.calls[0][1]["runtime_backend_options"], {"num_ctx": 4096})
+0375:         self.assertEqual(bridge.calls[1][1]["runtime_profile_override"], "memory_saver")
+0376:         self.assertEqual(bridge.calls[1][1]["runtime_backend_options_override"], {"num_predict": 32})
+0377: 
+0378:     def test_runtime_tuning_controls_apply_through_real_ipc_service_path(self) -> None:
+0379:         captured: dict[str, object] = {}
+0380: 
+0381:         class _CapturingRuntime:
+0382:             backend_name = "simulation"
+0383: 
+0384:             def load_model(
+0385:                 self,
+0386:                 model_name: str,
+0387:                 *,
+0388:                 runtime_profile: str | None = None,
+0389:                 backend_options: dict[str, object] | None = None,
+0390:             ):
+0391:                 from astrawave.inference_runtime import InferenceModelBinding
+0392: 
+0393:                 captured["load_profile"] = runtime_profile
+0394:                 captured["load_options"] = dict(backend_options or {})
+0395:                 return InferenceModelBinding(
+0396:                     backend="simulation",
+0397:                     requested_model_name=model_name,
+0398:                     resolved_model_name=model_name,
+0399:                     metadata={},
+0400:                 )
+0401: 
+0402:             def generate(
+0403:                 self,
+0404:                 model_name: str,
+0405:                 *,
+0406:                 prompt: str,
+0407:                 step_name: str,
+0408:                 max_tokens: int | None = None,
+0409:                 temperature: float | None = None,
+0410:                 system_prompt: str | None = None,
+0411:                 backend_options: dict[str, object] | None = None,
+0412:             ) -> dict[str, object]:
+0413:                 captured["step_options"] = dict(backend_options or {})
+0414:                 return {
+0415:                     "ok": True,
+0416:                     "backend": "simulation",
+0417:                     "model_name": model_name,
+0418:                     "output_text": "ok",
+0419:                 }
+0420: 
+0421:         service = AstraWeaveService(
+0422:             inference_runtime_factory=lambda backend_name: _CapturingRuntime(),
+0423:             security_guard=SecurityGuard(SecurityPolicy(service_owner_sid=self.owner.user_sid)),
+0424:         )
+0425:         server = AstraWeaveIpcServer(
+0426:             service=service,
+0427:             prefer_named_pipe=False,
+0428:             host="127.0.0.1",
+0429:             port=0,
+0430:         )
+0431:         server.start()
+0432:         self.addCleanup(server.stop)
+0433:         endpoint = _endpoint_to_uri(server.endpoint)
+0434:         client = _connect_client(endpoint, self.owner)
+0435:         self.addCleanup(client.close)
+0436: 
+0437:         session_id = client.CreateSession(self.owner)
+0438:         client.LoadModel(
+0439:             session_id,
+0440:             "demo-model",
+0441:             self.owner,
+0442:             runtime_profile="vram_constrained",
+0443:             runtime_backend_options={"num_ctx": 4096, "num_batch": 2},
+0444:         )
+0445:         client.RunStep(
+0446:             session_id,
+0447:             "decode",
+0448:             self.owner,
+0449:             prompt="hello",
+0450:             runtime_profile_override="memory_saver",
+0451:             runtime_backend_options_override={"num_ctx": 1024},
+0452:         )
+0453: 
+0454:         self.assertEqual(captured["load_profile"], "vram_constrained")
+0455:         load_options = captured["load_options"]
+0456:         self.assertIsInstance(load_options, dict)
+0457:         self.assertEqual(load_options["num_ctx"], 4096)
+0458:         self.assertEqual(load_options["num_batch"], 2)
+0459:         self.assertTrue(load_options["low_vram"])
+0460:         step_options = captured["step_options"]
+0461:         self.assertIsInstance(step_options, dict)
+0462:         self.assertEqual(step_options["num_ctx"], 1024)
+0463:         self.assertTrue(step_options["low_vram"])
+0464: 
+0465:     def test_remote_errors_propagate_as_typed_api_errors(self) -> None:
+0466:         sdk = self._make_sdk(self.owner)
+0467:         session_id = sdk.CreateSession()
+0468:         sdk.close()
+0469: 
+0470:         foreign_sdk = self._make_sdk(self.foreign)
+0471:         with self.assertRaises(ApiError) as cm:
+0472:             foreign_sdk.GetResidency(session_id)
+0473:         self.assertEqual(cm.exception.code, ApiErrorCode.AUTH_DENIED)
+0474:         self.assertIn("AW_ERR_AUTH_DENIED", str(cm.exception))
+0475:         foreign_sdk.close()
+0476: 
+0477:         direct_client = self._make_client(self.owner)
+0478:         invalid_session_id = direct_client.CreateSession(self.owner)
+0479:         self.addCleanup(lambda: direct_client.CloseSession(invalid_session_id, self.owner))
+0480: 
+0481:         with self.assertRaises(ApiError) as cm:
+0482:             direct_client.RunStep(invalid_session_id, "decode", self.owner)
+0483:         self.assertEqual(cm.exception.code, ApiErrorCode.INVALID_STATE)
+0484: 
+0485:     def test_connection_rejects_caller_identity_switch_after_binding(self) -> None:
+0486:         client = self._make_client(self.owner)
+0487:         session_id = client.CreateSession(self.owner)
+0488:         self.addCleanup(lambda: client.CloseSession(session_id, self.owner))
+0489: 
+0490:         switched = CallerIdentity(user_sid=self.owner.user_sid, pid=self.owner.pid + 99)
+0491:         with self.assertRaises(ApiError) as cm:
+0492:             client.GetResidency(session_id, switched)
+0493:         self.assertEqual(cm.exception.code, ApiErrorCode.AUTH_DENIED)
+0494: 
+0495: 
+0496: if __name__ == "__main__":
+0497:     unittest.main()

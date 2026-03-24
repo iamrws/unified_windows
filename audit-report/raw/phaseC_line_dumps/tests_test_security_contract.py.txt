@@ -1,0 +1,161 @@
+﻿0001: """Contract tests for caller authorization and rate limiting."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import importlib
+0006: from inspect import signature
+0007: import os
+0008: import unittest
+0009: 
+0010: 
+0011: class SecurityContractTests(unittest.TestCase):
+0012:     @classmethod
+0013:     def setUpClass(cls) -> None:
+0014:         try:
+0015:             cls.security = importlib.import_module("astrawave.security")
+0016:         except ModuleNotFoundError as exc:  # pragma: no cover - makes the failure obvious
+0017:             raise AssertionError("astrawave.security is required for the security contract tests") from exc
+0018: 
+0019:         try:
+0020:             cls.CallerIdentity = getattr(cls.security, "CallerIdentity")
+0021:             cls.SecurityPolicy = getattr(cls.security, "SecurityPolicy")
+0022:             cls.SecurityGuard = getattr(cls.security, "SecurityGuard")
+0023:             cls.SecurityDecision = getattr(cls.security, "SecurityDecision")
+0024:             cls.SecurityDenyReason = getattr(cls.security, "SecurityDenyReason")
+0025:             cls.attest_caller_identity = getattr(cls.security, "attest_caller_identity")
+0026:             cls.resolve_process_user_sid = getattr(cls.security, "resolve_process_user_sid")
+0027:         except AttributeError as exc:  # pragma: no cover - keeps the contract explicit
+0028:             raise AssertionError(
+0029:                 "astrawave.security must expose CallerIdentity, SecurityPolicy, SecurityGuard, "
+0030:                 "SecurityDecision, SecurityDenyReason, attest_caller_identity, and resolve_process_user_sid"
+0031:             ) from exc
+0032: 
+0033:     def _make_policy(self, **policy_overrides):
+0034:         kwargs = dict(policy_overrides)
+0035:         params = signature(self.SecurityPolicy).parameters
+0036:         if "service_owner_sid" in params and "service_owner_sid" not in kwargs:
+0037:             kwargs["service_owner_sid"] = "S-1-5-21-1000"
+0038:         filtered = {name: value for name, value in kwargs.items() if name in params}
+0039:         return self.SecurityPolicy(**filtered)
+0040: 
+0041:     def _make_guard(self, **policy_overrides):
+0042:         policy = self._make_policy(**policy_overrides)
+0043:         return self.SecurityGuard(policy)
+0044: 
+0045:     def _call(self, obj, method_names, *args, **kwargs):
+0046:         for name in method_names:
+0047:             if hasattr(obj, name):
+0048:                 method = getattr(obj, name)
+0049:                 params = signature(method).parameters
+0050:                 if "caller" in params and args:
+0051:                     return method(*args, **kwargs)
+0052:                 filtered_kwargs = {key: value for key, value in kwargs.items() if key in params}
+0053:                 if len(args) == 1 and any(param.kind.name == "KEYWORD_ONLY" for param in params.values()):
+0054:                     return method(*args, **filtered_kwargs)
+0055:                 return method(*args, **filtered_kwargs)
+0056:         self.fail(f"{obj.__class__.__name__} is missing one of the required methods: {method_names}")
+0057: 
+0058:     def test_same_user_authorization_is_allowed(self) -> None:
+0059:         gate = self._make_guard()
+0060:         caller = self.CallerIdentity(user_sid="S-1-5-21-1000", pid=101)
+0061: 
+0062:         decision = self._call(gate, ("authorize_caller",), caller)
+0063:         self.assertTrue(decision.allowed)
+0064:         self.assertIsNone(decision.reason)
+0065:         self.assertEqual(decision.error_code.value, "AW_OK")
+0066: 
+0067:     def test_unknown_or_cross_user_caller_is_denied_by_default(self) -> None:
+0068:         gate = self._make_guard()
+0069:         caller = self.CallerIdentity(user_sid="S-1-5-21-2000", pid=202)
+0070: 
+0071:         decision = self._call(gate, ("authorize_caller",), caller)
+0072:         self.assertFalse(decision.allowed)
+0073:         self.assertEqual(decision.reason.name, "UNKNOWN_CALLER")
+0074:         self.assertEqual(decision.error_code.value, "AW_ERR_AUTH_DENIED")
+0075: 
+0076:     def test_cross_user_allowlist_can_grant_access(self) -> None:
+0077:         gate = self._make_guard(allowed_cross_user_sids=frozenset({"S-1-5-21-2000"}))
+0078:         cross_user_caller = self.CallerIdentity(user_sid="S-1-5-21-2000", pid=304)
+0079: 
+0080:         decision = self._call(gate, ("authorize_caller",), cross_user_caller)
+0081:         self.assertTrue(decision.allowed)
+0082: 
+0083:     def test_create_session_rate_limit_and_session_cap_are_enforced(self) -> None:
+0084:         class FakeClock:
+0085:             def __init__(self) -> None:
+0086:                 self.value = 0.0
+0087: 
+0088:             def __call__(self) -> float:
+0089:                 return self.value
+0090: 
+0091:         clock = FakeClock()
+0092:         gate = self.SecurityGuard(
+0093:             self._make_policy(create_session_limit_per_minute=100),
+0094:             clock=clock,
+0095:         )
+0096:         caller = self.CallerIdentity(user_sid="S-1-5-21-1000", pid=404)
+0097: 
+0098:         for _ in range(8):
+0099:             decision = gate.admit_create_session(caller)
+0100:             self.assertTrue(decision.allowed)
+0101: 
+0102:         denied = gate.admit_create_session(caller)
+0103:         self.assertFalse(denied.allowed)
+0104:         self.assertEqual(denied.reason.name, "MAX_CONCURRENT_SESSIONS")
+0105:         self.assertEqual(denied.error_code.value, "AW_ERR_RESOURCE_EXHAUSTED")
+0106: 
+0107:     def test_create_session_rate_limit_is_below_unbounded_spam(self) -> None:
+0108:         class FakeClock:
+0109:             def __init__(self) -> None:
+0110:                 self.value = 0.0
+0111: 
+0112:             def __call__(self) -> float:
+0113:                 return self.value
+0114: 
+0115:         gate = self.SecurityGuard(self._make_policy(), clock=FakeClock())
+0116:         caller = self.CallerIdentity(user_sid="S-1-5-21-1000", pid=505)
+0117:         for _ in range(6):
+0118:             self.assertTrue(gate.admit_create_session(caller).allowed)
+0119: 
+0120:         denied = gate.admit_create_session(caller)
+0121:         self.assertFalse(denied.allowed)
+0122:         self.assertEqual(denied.reason.name, "RATE_LIMIT_EXCEEDED")
+0123: 
+0124:     def test_caller_identity_rejects_bool_pid(self) -> None:
+0125:         with self.assertRaises(ValueError):
+0126:             self.CallerIdentity(user_sid="S-1-5-21-1000", pid=True)
+0127: 
+0128:     def test_runtime_attestation_rejects_sid_mismatch(self) -> None:
+0129:         caller = self.CallerIdentity(user_sid="S-1-5-21-wrong", pid=os.getpid())
+0130:         decision = type(self).attest_caller_identity(
+0131:             caller,
+0132:             pid_lookup=lambda pid: True,
+0133:             sid_lookup=lambda pid: "S-1-5-21-right",
+0134:         )
+0135:         self.assertFalse(decision.allowed)
+0136:         self.assertEqual(decision.reason.name, "UNKNOWN_CALLER")
+0137:         self.assertEqual(decision.error_code.value, "AW_ERR_AUTH_DENIED")
+0138: 
+0139:     def test_runtime_attestation_rejects_inactive_pid(self) -> None:
+0140:         caller = self.CallerIdentity(user_sid="S-1-5-21-1000", pid=999999)
+0141:         decision = type(self).attest_caller_identity(
+0142:             caller,
+0143:             pid_lookup=lambda pid: False,
+0144:             sid_lookup=lambda pid: None,
+0145:         )
+0146:         self.assertFalse(decision.allowed)
+0147:         self.assertEqual(decision.reason.name, "UNKNOWN_CALLER")
+0148: 
+0149:     def test_runtime_attestation_accepts_live_pid_with_matching_sid(self) -> None:
+0150:         current_sid = type(self).resolve_process_user_sid(os.getpid()) or "S-1-5-21-1000"
+0151:         caller = self.CallerIdentity(user_sid=current_sid, pid=os.getpid())
+0152:         decision = type(self).attest_caller_identity(
+0153:             caller,
+0154:             pid_lookup=lambda pid: True,
+0155:             sid_lookup=lambda pid: current_sid,
+0156:         )
+0157:         self.assertTrue(decision.allowed)
+0158: 
+0159: 
+0160: if __name__ == "__main__":
+0161:     unittest.main()

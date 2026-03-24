@@ -1,0 +1,451 @@
+﻿0001: """Contract tests for the AstraWeave IPC server adapter."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import importlib
+0006: import os
+0007: import unittest
+0008: 
+0009: 
+0010: class IpcServerContractTests(unittest.TestCase):
+0011:     @classmethod
+0012:     def setUpClass(cls) -> None:
+0013:         try:
+0014:             cls.server_module = importlib.import_module("astrawave.ipc_server")
+0015:             cls.protocol_module = importlib.import_module("astrawave.ipc_protocol")
+0016:             cls.service_module = importlib.import_module("astrawave.service")
+0017:             cls.security_module = importlib.import_module("astrawave.security")
+0018:         except ModuleNotFoundError as exc:  # pragma: no cover - explicit skip path
+0019:             raise unittest.SkipTest("astrawave.ipc_server / ipc_protocol are not present yet") from exc
+0020: 
+0021:         errors = importlib.import_module("astrawave.errors")
+0022:         cls.ApiError = errors.ApiError
+0023:         cls.ApiErrorCode = errors.ApiErrorCode
+0024:         cls.current_pid = os.getpid()
+0025:         cls.current_sid = cls.security_module.resolve_process_user_sid(cls.current_pid)
+0026: 
+0027:     def _lookup(self, module, *names: str):
+0028:         for name in names:
+0029:             if hasattr(module, name):
+0030:                 return getattr(module, name)
+0031:         self.fail(f"{module.__name__} is missing one of: {', '.join(names)}")
+0032: 
+0033:     def _make_server(self):
+0034:         server_cls = self._lookup(self.server_module, "AstraWeaveIpcServer")
+0035:         service_cls = getattr(self.service_module, "AstraWeaveService")
+0036:         policy_cls = self._lookup(self.security_module, "SecurityPolicy")
+0037:         guard_cls = self._lookup(self.security_module, "SecurityGuard")
+0038:         owner_sid = self.current_sid or getattr(self.service_module, "DEFAULT_SERVICE_OWNER_SID")
+0039:         service = service_cls(security_guard=guard_cls(policy_cls(service_owner_sid=owner_sid)))
+0040:         return server_cls(service)
+0041: 
+0042:     def _make_caller(self, user_sid: str | None = None, pid: int | None = None):
+0043:         caller_cls = self._lookup(self.security_module, "CallerIdentity")
+0044:         effective_sid = user_sid or self.current_sid or "S-1-5-21-1000"
+0045:         effective_pid = self.current_pid if pid is None else pid
+0046:         return caller_cls(user_sid=effective_sid, pid=effective_pid)
+0047: 
+0048:     def _make_request(self, method: str, params: dict, caller=None, request_id: str = "req-1"):
+0049:         request_cls = self._lookup(self.server_module, "IpcRequestEnvelope")
+0050:         return request_cls(id=request_id, method=method, params=params, caller=caller)
+0051: 
+0052:     def _make_capturing_service(self):
+0053:         policy_cls = self._lookup(self.security_module, "SecurityPolicy")
+0054:         guard_cls = self._lookup(self.security_module, "SecurityGuard")
+0055:         caller_cls = self._lookup(self.security_module, "CallerIdentity")
+0056:         owner_sid = self.current_sid or getattr(self.service_module, "DEFAULT_SERVICE_OWNER_SID")
+0057: 
+0058:         class _TelemetryStub:
+0059:             def __init__(self) -> None:
+0060:                 self.records = []
+0061: 
+0062:             def record_event(self, *args, **kwargs) -> None:
+0063:                 return None
+0064: 
+0065:         class _ServiceStub:
+0066:             def __init__(self) -> None:
+0067:                 self.security_guard = guard_cls(policy_cls(service_owner_sid=owner_sid))
+0068:                 self.telemetry = _TelemetryStub()
+0069:                 self.calls: list[tuple[str, dict[str, object]]] = []
+0070: 
+0071:             def CreateSession(self, caller_identity=None):
+0072:                 self.calls.append(("CreateSession", {"caller_identity": caller_identity}))
+0073:                 return "session-1"
+0074: 
+0075:             def LoadModel(
+0076:                 self,
+0077:                 session_id,
+0078:                 model_name,
+0079:                 caller_identity=None,
+0080:                 runtime_backend=None,
+0081:                 runtime_profile=None,
+0082:                 runtime_backend_options=None,
+0083:             ):
+0084:                 self.calls.append(
+0085:                     (
+0086:                         "LoadModel",
+0087:                         {
+0088:                             "session_id": session_id,
+0089:                             "model_name": model_name,
+0090:                             "caller_identity": caller_identity,
+0091:                             "runtime_backend": runtime_backend,
+0092:                             "runtime_profile": runtime_profile,
+0093:                             "runtime_backend_options": runtime_backend_options,
+0094:                         },
+0095:                     )
+0096:                 )
+0097:                 return None
+0098: 
+0099:             def RunStep(
+0100:                 self,
+0101:                 session_id,
+0102:                 step_name="run",
+0103:                 caller_identity=None,
+0104:                 prompt=None,
+0105:                 max_tokens=None,
+0106:                 temperature=None,
+0107:                 runtime_profile_override=None,
+0108:                 runtime_backend_options_override=None,
+0109:             ):
+0110:                 self.calls.append(
+0111:                     (
+0112:                         "RunStep",
+0113:                         {
+0114:                             "session_id": session_id,
+0115:                             "step_name": step_name,
+0116:                             "caller_identity": caller_identity,
+0117:                             "prompt": prompt,
+0118:                             "max_tokens": max_tokens,
+0119:                             "temperature": temperature,
+0120:                             "runtime_profile_override": runtime_profile_override,
+0121:                             "runtime_backend_options_override": runtime_backend_options_override,
+0122:                         },
+0123:                     )
+0124:                 )
+0125:                 return {
+0126:                     "session_id": session_id,
+0127:                     "step_name": step_name,
+0128:                     "prompt": prompt,
+0129:                     "max_tokens": max_tokens,
+0130:                     "temperature": temperature,
+0131:                     "runtime_profile_override": runtime_profile_override,
+0132:                     "runtime_backend_options_override": runtime_backend_options_override,
+0133:                 }
+0134: 
+0135:         return _ServiceStub(), caller_cls(user_sid=owner_sid, pid=self.current_pid)
+0136: 
+0137:     def _dispatch(self, server, envelope):
+0138:         for name in ("handle_request", "dispatch", "process_request", "serve_envelope"):
+0139:             if hasattr(server, name):
+0140:                 return getattr(server, name)(envelope)
+0141:         self.fail("IPC server is missing a request dispatch entrypoint")
+0142: 
+0143:     def test_create_session_load_model_register_run_close_happy_path(self) -> None:
+0144:         server = self._make_server()
+0145:         caller = self._make_caller(user_sid=server.service.security_guard.policy.service_owner_sid, pid=self.current_pid)
+0146: 
+0147:         create_response = self._dispatch(server, self._make_request("CreateSession", {}, caller=caller, request_id="req-1"))
+0148:         self.assertTrue(create_response["ok"])
+0149:         session_id = create_response["result"]
+0150:         self.assertIsInstance(session_id, str)
+0151: 
+0152:         load_response = self._dispatch(
+0153:             server,
+0154:             self._make_request(
+0155:                 "LoadModel",
+0156:                 {"session_id": session_id, "model_name": "demo-model"},
+0157:                 caller=caller,
+0158:                 request_id="req-2",
+0159:             ),
+0160:         )
+0161:         self.assertTrue(load_response["ok"])
+0162: 
+0163:         tensor_response = self._dispatch(
+0164:             server,
+0165:             self._make_request(
+0166:                 "RegisterTensor",
+0167:                 {"session_id": session_id, "tensor_name": "kv", "size_bytes": 1024},
+0168:                 caller=caller,
+0169:                 request_id="req-3",
+0170:             ),
+0171:         )
+0172:         self.assertTrue(tensor_response["ok"])
+0173: 
+0174:         run_response = self._dispatch(
+0175:             server,
+0176:             self._make_request(
+0177:                 "RunStep",
+0178:                 {"session_id": session_id, "step_name": "decode"},
+0179:                 caller=caller,
+0180:                 request_id="req-4",
+0181:             ),
+0182:         )
+0183:         self.assertTrue(run_response["ok"])
+0184:         self.assertEqual(run_response["result"]["session_id"], session_id)
+0185:         self.assertEqual(run_response["result"]["step_name"], "decode")
+0186: 
+0187:         close_response = self._dispatch(
+0188:             server,
+0189:             self._make_request("CloseSession", {"session_id": session_id}, caller=caller, request_id="req-5"),
+0190:         )
+0191:         self.assertTrue(close_response["ok"])
+0192: 
+0193:     def test_caller_propagation_and_typed_denial_behavior(self) -> None:
+0194:         server = self._make_server()
+0195:         owner = self._make_caller(user_sid=server.service.security_guard.policy.service_owner_sid, pid=self.current_pid)
+0196:         foreign = self._make_caller(user_sid="S-1-5-21-foreign", pid=self.current_pid)
+0197: 
+0198:         session_response = self._dispatch(
+0199:             server,
+0200:             self._make_request("CreateSession", {}, caller=owner, request_id="req-10"),
+0201:         )
+0202:         session_id = session_response["result"]
+0203: 
+0204:         denial = self._dispatch(
+0205:             server,
+0206:             self._make_request(
+0207:                 "LoadModel",
+0208:                 {"session_id": session_id, "model_name": "demo-model"},
+0209:                 caller=foreign,
+0210:                 request_id="req-11",
+0211:             ),
+0212:         )
+0213:         self.assertFalse(denial["ok"])
+0214:         self.assertEqual(denial["error"]["code"], self.ApiErrorCode.AUTH_DENIED.value)
+0215:         self.assertIsInstance(denial["error"]["message"], str)
+0216: 
+0217:     def test_server_returns_protocol_errors_for_malformed_payloads(self) -> None:
+0218:         server = self._make_server()
+0219:         malformed_envelopes = [
+0220:             {},
+0221:             {"id": "req-1"},
+0222:             {"id": "req-1", "method": "CreateSession", "params": "bad"},
+0223:             {"id": "req-1", "method": "CreateSession", "params": {}, "caller": {"pid": 1}},
+0224:             {"id": "", "method": "CreateSession", "params": {}},
+0225:         ]
+0226: 
+0227:         for envelope in malformed_envelopes:
+0228:             with self.subTest(envelope=envelope):
+0229:                 response = self._dispatch(server, envelope)
+0230:                 self.assertFalse(response["ok"])
+0231:                 self.assertIn(response["error"]["code"], {code.value for code in self.ApiErrorCode})
+0232: 
+0233:     def test_server_passes_caller_identity_through_to_service(self) -> None:
+0234:         server = self._make_server()
+0235:         caller = self._make_caller(user_sid=server.service.security_guard.policy.service_owner_sid, pid=self.current_pid)
+0236: 
+0237:         response = self._dispatch(
+0238:             server,
+0239:             self._make_request("CreateSession", {}, caller=caller, request_id="req-20"),
+0240:         )
+0241:         self.assertTrue(response["ok"])
+0242: 
+0243:         service = getattr(server, "service", None)
+0244:         self.assertIsNotNone(service)
+0245: 
+0246:         sessions = getattr(service, "_sessions", {})
+0247:         self.assertEqual(len(sessions), 1)
+0248:         stored_session = next(iter(sessions.values()))
+0249:         self.assertEqual(getattr(stored_session.owner_identity, "user_sid"), caller.user_sid)
+0250:         self.assertEqual(getattr(stored_session.owner_identity, "pid"), caller.pid)
+0251: 
+0252:     def test_server_requires_explicit_caller_identity_by_default(self) -> None:
+0253:         server = self._make_server()
+0254:         response = self._dispatch(
+0255:             server,
+0256:             self._make_request("CreateSession", {}, caller=None, request_id="req-30"),
+0257:         )
+0258:         self.assertFalse(response["ok"])
+0259:         self.assertEqual(response["error"]["code"], self.ApiErrorCode.AUTH_DENIED.value)
+0260: 
+0261:     def test_server_rejects_caller_switch_within_bound_connection_context(self) -> None:
+0262:         server = self._make_server()
+0263:         owner_sid = server.service.security_guard.policy.service_owner_sid
+0264:         bound = self._make_caller(user_sid=owner_sid, pid=401)
+0265:         switched = self._make_caller(user_sid=owner_sid, pid=402)
+0266: 
+0267:         response = server.handle_request(
+0268:             self._make_request("CreateSession", {}, caller=switched, request_id="req-31"),
+0269:             expected_caller=bound,
+0270:         )
+0271:         self.assertFalse(response["ok"])
+0272:         self.assertEqual(response["error"]["code"], self.ApiErrorCode.AUTH_DENIED.value)
+0273: 
+0274:     def test_server_rejects_non_localhost_listener_configuration(self) -> None:
+0275:         server_cls = self._lookup(self.server_module, "AstraWeaveIpcServer")
+0276:         service_cls = getattr(self.service_module, "AstraWeaveService")
+0277:         server = server_cls(service_cls(), prefer_named_pipe=False, host="0.0.0.0", port=0)
+0278:         with self.assertRaises(self.ApiError) as ctx:
+0279:             server.start()
+0280:         self.assertEqual(ctx.exception.code, self.ApiErrorCode.INVALID_ARGUMENT)
+0281: 
+0282:     def test_server_rejects_oversized_request_payload(self) -> None:
+0283:         server = self._make_server()
+0284:         max_bytes = self._lookup(self.protocol_module, "MAX_CONTROL_PLANE_PAYLOAD_BYTES")
+0285:         owner_sid = server.service.security_guard.policy.service_owner_sid
+0286:         payload = {
+0287:             "id": "req-too-large",
+0288:             "method": "CreateSession",
+0289:             "params": {"blob": "x" * (int(max_bytes) + 1024)},
+0290:             "caller": {"user_sid": owner_sid, "pid": 1001},
+0291:         }
+0292:         response = self._dispatch(server, payload)
+0293:         self.assertFalse(response["ok"])
+0294:         self.assertEqual(response["error"]["code"], self.ApiErrorCode.INVALID_ARGUMENT.value)
+0295: 
+0296:     def test_security_denials_are_recorded_in_telemetry(self) -> None:
+0297:         server = self._make_server()
+0298:         foreign = self._make_caller(user_sid="S-1-5-21-9999", pid=self.current_pid)
+0299:         response = self._dispatch(
+0300:             server,
+0301:             self._make_request("CreateSession", {}, caller=foreign, request_id="req-security-deny"),
+0302:         )
+0303:         self.assertFalse(response["ok"])
+0304:         records = tuple(server.service.telemetry.records)
+0305:         self.assertTrue(
+0306:             any(
+0307:                 record.event_type.value == "security_event"
+0308:                 and record.reason_code.value == "AW_TEL_REASON_SECURITY_DENY"
+0309:                 for record in records
+0310:             )
+0311:         )
+0312: 
+0313:     def test_server_accepts_canonical_protocol_request_envelope(self) -> None:
+0314:         server = self._make_server()
+0315:         RequestEnvelope = self._lookup(self.protocol_module, "RequestEnvelope")
+0316:         CallerEnvelope = self._lookup(self.protocol_module, "CallerEnvelope")
+0317:         owner_sid = server.service.security_guard.policy.service_owner_sid
+0318:         request = RequestEnvelope(
+0319:             id="req-32",
+0320:             method="CreateSession",
+0321:             params={},
+0322:             caller=CallerEnvelope(user_sid=owner_sid, pid=self.current_pid),
+0323:         )
+0324: 
+0325:         response = self._dispatch(server, request)
+0326:         self.assertTrue(response["ok"])
+0327:         self.assertIsInstance(response["result"], str)
+0328: 
+0329:     def test_server_forwards_runtime_backend_on_load_model(self) -> None:
+0330:         service, caller = self._make_capturing_service()
+0331:         server_cls = self._lookup(self.server_module, "AstraWeaveIpcServer")
+0332:         server = server_cls(service, enforce_runtime_caller_attestation=False)
+0333:         response = self._dispatch(
+0334:             server,
+0335:             self._make_request(
+0336:                 "LoadModel",
+0337:                 {"session_id": "session-1", "model_name": "demo-model", "runtime_backend": "ollama"},
+0338:                 caller=caller,
+0339:                 request_id="req-40",
+0340:             ),
+0341:         )
+0342:         self.assertTrue(response["ok"])
+0343:         self.assertEqual(service.calls[-1][0], "LoadModel")
+0344:         self.assertEqual(service.calls[-1][1]["runtime_backend"], "ollama")
+0345:         self.assertIsNone(service.calls[-1][1]["runtime_profile"])
+0346:         self.assertIsNone(service.calls[-1][1]["runtime_backend_options"])
+0347: 
+0348:     def test_server_forwards_runtime_tuning_controls_on_load_model(self) -> None:
+0349:         service, caller = self._make_capturing_service()
+0350:         server_cls = self._lookup(self.server_module, "AstraWeaveIpcServer")
+0351:         server = server_cls(service, enforce_runtime_caller_attestation=False)
+0352:         response = self._dispatch(
+0353:             server,
+0354:             self._make_request(
+0355:                 "LoadModel",
+0356:                 {
+0357:                     "session_id": "session-1",
+0358:                     "model_name": "qwen2.5:14b",
+0359:                     "runtime_backend": "ollama",
+0360:                     "runtime_profile": "vram_constrained",
+0361:                     "runtime_backend_options": {"num_ctx": 4096, "num_batch": 1},
+0362:                 },
+0363:                 caller=caller,
+0364:                 request_id="req-40b",
+0365:             ),
+0366:         )
+0367:         self.assertTrue(response["ok"])
+0368:         self.assertEqual(service.calls[-1][1]["runtime_profile"], "vram_constrained")
+0369:         self.assertEqual(service.calls[-1][1]["runtime_backend_options"], {"num_ctx": 4096, "num_batch": 1})
+0370: 
+0371:     def test_server_forwards_prompt_generation_knobs_on_run_step(self) -> None:
+0372:         service, caller = self._make_capturing_service()
+0373:         server_cls = self._lookup(self.server_module, "AstraWeaveIpcServer")
+0374:         server = server_cls(service, enforce_runtime_caller_attestation=False)
+0375:         response = self._dispatch(
+0376:             server,
+0377:             self._make_request(
+0378:                 "RunStep",
+0379:                 {
+0380:                     "session_id": "session-1",
+0381:                     "step_name": "decode",
+0382:                     "prompt": "hello",
+0383:                     "max_tokens": 32,
+0384:                     "temperature": 0.25,
+0385:                 },
+0386:                 caller=caller,
+0387:                 request_id="req-41",
+0388:             ),
+0389:         )
+0390:         self.assertTrue(response["ok"])
+0391:         self.assertEqual(service.calls[-1][0], "RunStep")
+0392:         self.assertEqual(service.calls[-1][1]["prompt"], "hello")
+0393:         self.assertEqual(service.calls[-1][1]["max_tokens"], 32)
+0394:         self.assertEqual(service.calls[-1][1]["temperature"], 0.25)
+0395:         self.assertIsNone(service.calls[-1][1]["runtime_profile_override"])
+0396:         self.assertIsNone(service.calls[-1][1]["runtime_backend_options_override"])
+0397: 
+0398:     def test_server_forwards_step_runtime_tuning_controls(self) -> None:
+0399:         service, caller = self._make_capturing_service()
+0400:         server_cls = self._lookup(self.server_module, "AstraWeaveIpcServer")
+0401:         server = server_cls(service, enforce_runtime_caller_attestation=False)
+0402:         response = self._dispatch(
+0403:             server,
+0404:             self._make_request(
+0405:                 "RunStep",
+0406:                 {
+0407:                     "session_id": "session-1",
+0408:                     "step_name": "decode",
+0409:                     "prompt": "hello",
+0410:                     "runtime_profile_override": "memory_saver",
+0411:                     "runtime_backend_options_override": {"num_predict": 64, "top_p": 0.9},
+0412:                 },
+0413:                 caller=caller,
+0414:                 request_id="req-41b",
+0415:             ),
+0416:         )
+0417:         self.assertTrue(response["ok"])
+0418:         self.assertEqual(service.calls[-1][1]["runtime_profile_override"], "memory_saver")
+0419:         self.assertEqual(
+0420:             service.calls[-1][1]["runtime_backend_options_override"],
+0421:             {"num_predict": 64, "top_p": 0.9},
+0422:         )
+0423: 
+0424:     def test_server_rejects_sid_mismatch_for_live_process(self) -> None:
+0425:         server = self._make_server()
+0426:         caller = self._make_caller(user_sid="S-1-5-21-mismatch", pid=self.current_pid)
+0427: 
+0428:         response = self._dispatch(
+0429:             server,
+0430:             self._make_request("CreateSession", {}, caller=caller, request_id="req-33"),
+0431:         )
+0432:         self.assertFalse(response["ok"])
+0433:         self.assertEqual(response["error"]["code"], self.ApiErrorCode.AUTH_DENIED.value)
+0434: 
+0435:     def test_server_rejects_inactive_pid_during_attestation(self) -> None:
+0436:         server = self._make_server()
+0437:         caller = self._make_caller(
+0438:             user_sid=server.service.security_guard.policy.service_owner_sid,
+0439:             pid=2_147_483_000,
+0440:         )
+0441: 
+0442:         response = self._dispatch(
+0443:             server,
+0444:             self._make_request("CreateSession", {}, caller=caller, request_id="req-34"),
+0445:         )
+0446:         self.assertFalse(response["ok"])
+0447:         self.assertEqual(response["error"]["code"], self.ApiErrorCode.AUTH_DENIED.value)
+0448: 
+0449: 
+0450: if __name__ == "__main__":
+0451:     unittest.main()

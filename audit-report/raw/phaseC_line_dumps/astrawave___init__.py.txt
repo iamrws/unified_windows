@@ -1,0 +1,55 @@
+﻿0001: """AstraWeave package surface."""
+0002: 
+0003: from .errors import ApiError, ApiErrorCode
+0004: from .cuda_runtime import run_cuda_transfer
+0005: from .hardware_probe import collect_hardware_probe
+0006: from .types import (
+0007:     MemoryTier,
+0008:     PolicyProfile,
+0009:     PressureSnapshot,
+0010:     ResidencySnapshot,
+0011:     ResidencyState,
+0012:     SessionState,
+0013:     TransferEvent,
+0014:     FallbackEvent,
+0015: )
+0016: 
+0017: try:
+0018:     from .service import AstraWeaveService
+0019: except ImportError:  # pragma: no cover - service is added by another worker
+0020:     AstraWeaveService = None
+0021: 
+0022: from .sdk import AstraWeaveSDK
+0023: 
+0024: try:  # pragma: no cover - optional IPC transport modules may not exist yet
+0025:     from .ipc_client import AstraWeaveIpcClient
+0026: except ImportError:  # pragma: no cover
+0027:     AstraWeaveIpcClient = None
+0028: 
+0029: try:  # pragma: no cover - optional IPC transport modules may not exist yet
+0030:     from .ipc_server import AstraWeaveIpcServer
+0031: except ImportError:  # pragma: no cover
+0032:     AstraWeaveIpcServer = None
+0033: 
+0034: __all__ = [
+0035:     "ApiError",
+0036:     "ApiErrorCode",
+0037:     "AstraWeaveSDK",
+0038:     "FallbackEvent",
+0039:     "collect_hardware_probe",
+0040:     "run_cuda_transfer",
+0041:     "MemoryTier",
+0042:     "PolicyProfile",
+0043:     "PressureSnapshot",
+0044:     "ResidencySnapshot",
+0045:     "ResidencyState",
+0046:     "SessionState",
+0047:     "TransferEvent",
+0048: ]
+0049: 
+0050: if AstraWeaveService is not None:
+0051:     __all__.append("AstraWeaveService")
+0052: if AstraWeaveIpcClient is not None:
+0053:     __all__.append("AstraWeaveIpcClient")
+0054: if AstraWeaveIpcServer is not None:
+0055:     __all__.append("AstraWeaveIpcServer")

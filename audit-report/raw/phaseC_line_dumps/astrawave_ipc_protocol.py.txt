@@ -1,0 +1,381 @@
+﻿0001: """JSON-serializable IPC envelopes for AstraWeave.
+0002: 
+0003: This module stays dependency-light on purpose. It defines the strict request
+0004: and response shapes used by the IPC boundary, plus deterministic helpers for
+0005: validation, serialization, and API error mapping.
+0006: """
+0007: 
+0008: from __future__ import annotations
+0009: 
+0010: from dataclasses import asdict, dataclass, field, is_dataclass
+0011: from enum import Enum
+0012: from math import isfinite
+0013: from json import dumps, loads
+0014: from typing import Any, Mapping, MutableMapping
+0015: 
+0016: from .errors import ApiError, ApiErrorCode
+0017: 
+0018: 
+0019: JsonPrimitive = str | int | float | bool | None
+0020: JsonValue = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
+0021: MAX_CONTROL_PLANE_PAYLOAD_BYTES = 1 * 1024 * 1024
+0022: 
+0023: 
+0024: @dataclass(frozen=True, slots=True)
+0025: class CallerEnvelope:
+0026:     """JSON caller identity for IPC messages."""
+0027: 
+0028:     user_sid: str
+0029:     pid: int
+0030: 
+0031:     def __post_init__(self) -> None:
+0032:         _validate_caller_fields(self.user_sid, self.pid)
+0033: 
+0034:     def to_dict(self) -> dict[str, JsonValue]:
+0035:         return {"user_sid": self.user_sid, "pid": self.pid}
+0036: 
+0037:     @classmethod
+0038:     def from_dict(cls, data: Mapping[str, Any]) -> "CallerEnvelope":
+0039:         user_sid = _require_string(data, "user_sid")
+0040:         pid = _require_int(data, "pid")
+0041:         return cls(user_sid=user_sid, pid=pid)
+0042: 
+0043: 
+0044: @dataclass(frozen=True, slots=True)
+0045: class RequestEnvelope:
+0046:     """Strict IPC request envelope."""
+0047: 
+0048:     id: str
+0049:     method: str
+0050:     params: Any = None
+0051:     caller: CallerEnvelope | None = None
+0052: 
+0053:     def __post_init__(self) -> None:
+0054:         _validate_request_fields(self.id, self.method, self.params, self.caller)
+0055: 
+0056:     def to_dict(self) -> dict[str, JsonValue]:
+0057:         _validate_exact_keys(self, {"id", "method", "params", "caller"})
+0058:         data: dict[str, JsonValue] = {
+0059:             "id": self.id,
+0060:             "method": self.method,
+0061:             "params": to_json_value(self.params),
+0062:             "caller": self.caller.to_dict() if self.caller is not None else None,
+0063:         }
+0064:         return data
+0065: 
+0066:     @classmethod
+0067:     def from_dict(cls, data: Mapping[str, Any]) -> "RequestEnvelope":
+0068:         _validate_exact_mapping_keys(data, {"id", "method", "params", "caller"})
+0069:         request_id = _require_string(data, "id")
+0070:         method = _require_string(data, "method")
+0071:         params = data["params"]
+0072:         caller_raw = data.get("caller")
+0073:         caller = None
+0074:         if caller_raw is not None:
+0075:             if not isinstance(caller_raw, Mapping):
+0076:                 raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "caller must be an object or null")
+0077:             caller = CallerEnvelope.from_dict(caller_raw)
+0078:         return cls(id=request_id, method=method, params=params, caller=caller)
+0079: 
+0080: 
+0081: @dataclass(frozen=True, slots=True)
+0082: class ErrorPayload:
+0083:     """Structured IPC error payload."""
+0084: 
+0085:     code: str
+0086:     message: str
+0087: 
+0088:     def __post_init__(self) -> None:
+0089:         if not self.code or not self.code.strip():
+0090:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "error code must be non-empty")
+0091:         if not self.message or not self.message.strip():
+0092:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "error message must be non-empty")
+0093: 
+0094:     def to_dict(self) -> dict[str, JsonValue]:
+0095:         _validate_exact_keys(self, {"code", "message"})
+0096:         return {"code": self.code, "message": self.message}
+0097: 
+0098:     @classmethod
+0099:     def from_api_error(cls, error: ApiError) -> "ErrorPayload":
+0100:         return cls(code=error.code.value, message=error.message)
+0101: 
+0102:     @classmethod
+0103:     def from_dict(cls, data: Mapping[str, Any]) -> "ErrorPayload":
+0104:         code = _require_string(data, "code")
+0105:         message = _require_string(data, "message")
+0106:         return cls(code=code, message=message)
+0107: 
+0108:     def to_api_error(self) -> ApiError:
+0109:         return ApiError(api_error_code_from_string(self.code), self.message)
+0110: 
+0111: 
+0112: @dataclass(frozen=True, slots=True)
+0113: class SuccessResponse:
+0114:     """Success response envelope."""
+0115: 
+0116:     id: str
+0117:     ok: bool = field(default=True, init=False)
+0118:     result: Any = None
+0119: 
+0120:     def __post_init__(self) -> None:
+0121:         if not self.id or not self.id.strip():
+0122:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "response id must be non-empty")
+0123: 
+0124:     def to_dict(self) -> dict[str, JsonValue]:
+0125:         _validate_exact_keys(self, {"id", "ok", "result"})
+0126:         return {
+0127:             "id": self.id,
+0128:             "ok": True,
+0129:             "result": to_json_value(self.result),
+0130:         }
+0131: 
+0132: 
+0133: @dataclass(frozen=True, slots=True)
+0134: class ErrorResponse:
+0135:     """Error response envelope."""
+0136: 
+0137:     id: str
+0138:     ok: bool = field(default=False, init=False)
+0139:     error: ErrorPayload = field(default_factory=lambda: ErrorPayload(ApiErrorCode.INTERNAL.value, "internal error"))
+0140: 
+0141:     def __post_init__(self) -> None:
+0142:         if not self.id or not self.id.strip():
+0143:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "response id must be non-empty")
+0144: 
+0145:     def to_dict(self) -> dict[str, JsonValue]:
+0146:         _validate_exact_keys(self, {"id", "ok", "error"})
+0147:         return {
+0148:             "id": self.id,
+0149:             "ok": False,
+0150:             "error": self.error.to_dict(),
+0151:         }
+0152: 
+0153: 
+0154: def to_json_value(value: Any) -> JsonValue:
+0155:     """Validate and return a JSON-serializable value.
+0156: 
+0157:     The function accepts native JSON types, lists/tuples, and mappings with
+0158:     string keys. Anything else is rejected with a stable `ApiError`.
+0159:     """
+0160: 
+0161:     if isinstance(value, Enum):
+0162:         return to_json_value(value.value)
+0163:     if is_dataclass(value):
+0164:         return to_json_value(asdict(value))
+0165:     if value is None or isinstance(value, (str, int, float, bool)):
+0166:         if isinstance(value, float) and not isfinite(value):
+0167:             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "JSON numbers must be finite")
+0168:         return value
+0169:     if isinstance(value, tuple):
+0170:         return [to_json_value(item) for item in value]
+0171:     if isinstance(value, list):
+0172:         return [to_json_value(item) for item in value]
+0173:     if isinstance(value, Mapping):
+0174:         result: dict[str, JsonValue] = {}
+0175:         for key, item in value.items():
+0176:             if not isinstance(key, str):
+0177:                 raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "JSON object keys must be strings")
+0178:             result[key] = to_json_value(item)
+0179:         return result
+0180:     raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"value is not JSON serializable: {type(value).__name__}")
+0181: 
+0182: 
+0183: def validate_request_payload(payload: Mapping[str, Any]) -> RequestEnvelope:
+0184:     """Validate and normalize a raw request payload."""
+0185: 
+0186:     _validate_request_payload_size(payload)
+0187:     return RequestEnvelope.from_dict(payload)
+0188: 
+0189: 
+0190: def request_to_json(request: RequestEnvelope, *, indent: int | None = None) -> str:
+0191:     """Serialize a validated request envelope to JSON."""
+0192: 
+0193:     return dumps(request.to_dict(), ensure_ascii=True, indent=indent)
+0194: 
+0195: 
+0196: def request_from_json(payload: str) -> RequestEnvelope:
+0197:     """Deserialize a request envelope from JSON."""
+0198: 
+0199:     data = loads(payload)
+0200:     if not isinstance(data, MutableMapping):
+0201:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "request JSON must decode to an object")
+0202:     return validate_request_payload(data)
+0203: 
+0204: 
+0205: def success_response(result: Any, *, id: str) -> SuccessResponse:
+0206:     """Build a success response envelope."""
+0207: 
+0208:     return SuccessResponse(id=id, result=result)
+0209: 
+0210: 
+0211: def error_response(error: ApiError, *, id: str) -> ErrorResponse:
+0212:     """Build an error response envelope from a typed API error."""
+0213: 
+0214:     return ErrorResponse(id=id, error=ErrorPayload.from_api_error(error))
+0215: 
+0216: 
+0217: def response_to_json(response: SuccessResponse | ErrorResponse, *, indent: int | None = None) -> str:
+0218:     """Serialize a response envelope to JSON."""
+0219: 
+0220:     return dumps(response.to_dict(), ensure_ascii=True, indent=indent)
+0221: 
+0222: 
+0223: def response_from_json(payload: str) -> SuccessResponse | ErrorResponse:
+0224:     """Deserialize a response envelope from JSON."""
+0225: 
+0226:     data = loads(payload)
+0227:     if not isinstance(data, MutableMapping):
+0228:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "response JSON must decode to an object")
+0229:     return validate_response_payload(data)
+0230: 
+0231: 
+0232: def validate_response_payload(payload: Mapping[str, Any]) -> SuccessResponse | ErrorResponse:
+0233:     """Validate and normalize a raw response payload."""
+0234: 
+0235:     response_id = _require_string(payload, "id")
+0236:     ok = _require_bool(payload, "ok")
+0237:     if ok:
+0238:         _validate_exact_mapping_keys(payload, {"id", "ok", "result"})
+0239:         return SuccessResponse(id=response_id, result=payload.get("result"))
+0240:     _validate_exact_mapping_keys(payload, {"id", "ok", "error"})
+0241:     error_raw = payload.get("error")
+0242:     if not isinstance(error_raw, Mapping):
+0243:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "error response must include an error object")
+0244:     return ErrorResponse(id=response_id, error=ErrorPayload.from_dict(error_raw))
+0245: 
+0246: 
+0247: def api_error_code_from_string(value: str) -> ApiErrorCode:
+0248:     """Resolve a string code to a stable `ApiErrorCode`."""
+0249: 
+0250:     try:
+0251:         return ApiErrorCode(value)
+0252:     except ValueError as exc:
+0253:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unknown API error code: {value}") from exc
+0254: 
+0255: 
+0256: def api_error_from_payload(payload: Mapping[str, Any]) -> ApiError:
+0257:     """Build a typed `ApiError` from an IPC error payload."""
+0258: 
+0259:     return ErrorPayload.from_dict(payload).to_api_error()
+0260: 
+0261: 
+0262: def api_error_to_payload(error: ApiError) -> ErrorPayload:
+0263:     """Convert a typed `ApiError` to an IPC error payload."""
+0264: 
+0265:     return ErrorPayload.from_api_error(error)
+0266: 
+0267: 
+0268: def estimate_json_size_bytes(value: Any) -> int:
+0269:     """Estimate UTF-8 JSON payload size for a value after protocol coercion."""
+0270: 
+0271:     serialized = dumps(to_json_value(value), ensure_ascii=True, separators=(",", ":"))
+0272:     return len(serialized.encode("utf-8"))
+0273: 
+0274: 
+0275: def _validate_request_fields(
+0276:     request_id: str,
+0277:     method: str,
+0278:     params: Any,
+0279:     caller: CallerEnvelope | None,
+0280: ) -> None:
+0281:     if not request_id or not request_id.strip():
+0282:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "request id must be non-empty")
+0283:     if not method or not method.strip():
+0284:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "method must be non-empty")
+0285:     to_json_value(params)
+0286:     if caller is not None and not isinstance(caller, CallerEnvelope):
+0287:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "caller must be a CallerEnvelope or null")
+0288: 
+0289: 
+0290: def _validate_caller_fields(user_sid: str, pid: int) -> None:
+0291:     if not user_sid or not user_sid.strip():
+0292:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "user_sid must be non-empty")
+0293:     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+0294:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "pid must be a positive integer")
+0295: 
+0296: 
+0297: def _require_string(payload: Mapping[str, Any], key: str) -> str:
+0298:     value = payload.get(key)
+0299:     if not isinstance(value, str) or not value.strip():
+0300:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be a non-empty string")
+0301:     return value
+0302: 
+0303: 
+0304: def _require_int(payload: Mapping[str, Any], key: str) -> int:
+0305:     value = payload.get(key)
+0306:     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+0307:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be a positive integer")
+0308:     return value
+0309: 
+0310: 
+0311: def _require_bool(payload: Mapping[str, Any], key: str) -> bool:
+0312:     value = payload.get(key)
+0313:     if not isinstance(value, bool):
+0314:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be a boolean")
+0315:     return value
+0316: 
+0317: 
+0318: def _validate_exact_mapping_keys(payload: Mapping[str, Any], allowed_keys: set[str]) -> None:
+0319:     payload_keys = set(payload.keys())
+0320:     extra_keys = payload_keys - allowed_keys
+0321:     missing_keys = allowed_keys - payload_keys
+0322:     if extra_keys or missing_keys:
+0323:         message_parts: list[str] = []
+0324:         if missing_keys:
+0325:             message_parts.append(f"missing keys: {sorted(missing_keys)}")
+0326:         if extra_keys:
+0327:             message_parts.append(f"unexpected keys: {sorted(extra_keys)}")
+0328:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "; ".join(message_parts))
+0329: 
+0330: 
+0331: def _validate_exact_keys(obj: Any, allowed_keys: set[str]) -> None:
+0332:     if not hasattr(obj, "__dict__") and not hasattr(obj, "__slots__"):
+0333:         return
+0334:     object_keys = {
+0335:         field_name
+0336:         for field_name in getattr(obj, "__dataclass_fields__", {})
+0337:     }
+0338:     extra_keys = object_keys - allowed_keys
+0339:     missing_keys = allowed_keys - object_keys
+0340:     if extra_keys or missing_keys:
+0341:         message_parts: list[str] = []
+0342:         if missing_keys:
+0343:             message_parts.append(f"missing fields: {sorted(missing_keys)}")
+0344:         if extra_keys:
+0345:             message_parts.append(f"unexpected fields: {sorted(extra_keys)}")
+0346:         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "; ".join(message_parts))
+0347: 
+0348: 
+0349: def _validate_request_payload_size(payload: Mapping[str, Any]) -> None:
+0350:     size_bytes = estimate_json_size_bytes(payload)
+0351:     if size_bytes > MAX_CONTROL_PLANE_PAYLOAD_BYTES:
+0352:         raise ApiError(
+0353:             ApiErrorCode.INVALID_ARGUMENT,
+0354:             f"request payload exceeds maximum size of {MAX_CONTROL_PLANE_PAYLOAD_BYTES} bytes",
+0355:         )
+0356: 
+0357: 
+0358: __all__ = [
+0359:     "ApiError",
+0360:     "ApiErrorCode",
+0361:     "CallerEnvelope",
+0362:     "ErrorPayload",
+0363:     "ErrorResponse",
+0364:     "JsonValue",
+0365:     "RequestEnvelope",
+0366:     "SuccessResponse",
+0367:     "MAX_CONTROL_PLANE_PAYLOAD_BYTES",
+0368:     "api_error_code_from_string",
+0369:     "api_error_from_payload",
+0370:     "api_error_to_payload",
+0371:     "estimate_json_size_bytes",
+0372:     "error_response",
+0373:     "request_from_json",
+0374:     "request_to_json",
+0375:     "response_from_json",
+0376:     "response_to_json",
+0377:     "success_response",
+0378:     "to_json_value",
+0379:     "validate_request_payload",
+0380:     "validate_response_payload",
+0381: ]

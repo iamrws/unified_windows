@@ -1,0 +1,41 @@
+﻿0001: """Run a real CUDA transfer proof using shared AstraWeave runtime primitives."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import argparse
+0006: import json
+0007: import sys
+0008: from pathlib import Path
+0009: 
+0010: REPO_ROOT = Path(__file__).resolve().parent.parent
+0011: if str(REPO_ROOT) not in sys.path:
+0012:     sys.path.insert(0, str(REPO_ROOT))
+0013: 
+0014: from astrawave.cuda_runtime import run_cuda_transfer
+0015: 
+0016: 
+0017: def _build_parser() -> argparse.ArgumentParser:
+0018:     parser = argparse.ArgumentParser(description="Run CUDA driver transfer PoC")
+0019:     parser.add_argument("--bytes", type=int, default=1_048_576, help="Transfer size in bytes")
+0020:     parser.add_argument("--device-index", type=int, default=0, help="CUDA device ordinal")
+0021:     parser.add_argument("--hold-ms", type=int, default=75, help="Delay after allocation before sampling NVML")
+0022:     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON")
+0023:     return parser
+0024: 
+0025: 
+0026: def main(argv: list[str] | None = None) -> int:
+0027:     args = _build_parser().parse_args(argv)
+0028:     result = run_cuda_transfer(
+0029:         size_bytes=args.bytes,
+0030:         device_index=args.device_index,
+0031:         hold_ms=max(args.hold_ms, 0),
+0032:     )
+0033:     if args.pretty:
+0034:         print(json.dumps(result, ensure_ascii=True, indent=2, sort_keys=True))
+0035:     else:
+0036:         print(json.dumps(result, ensure_ascii=True, separators=(",", ":"), sort_keys=True))
+0037:     return 0 if result.get("ok") else 1
+0038: 
+0039: 
+0040: if __name__ == "__main__":
+0041:     raise SystemExit(main())

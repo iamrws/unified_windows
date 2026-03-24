@@ -1,0 +1,146 @@
+﻿0001: """Phase 3 service-host runtime tests."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import time
+0006: import unittest
+0007: 
+0008: from astrawave.errors import ApiError, ApiErrorCode
+0009: from astrawave.ipc_server import AstraWeaveIpcServer
+0010: 
+0011: try:  # pragma: no cover - optional Phase 3 host module
+0012:     from astrawave.service_host import AstraWeaveServiceHost, ServiceHostConfig
+0013: except ImportError:  # pragma: no cover - current repo falls back to the IPC server
+0014:     AstraWeaveServiceHost = None
+0015:     ServiceHostConfig = None
+0016: 
+0017: 
+0018: def _endpoint_uri(endpoint: object) -> str:
+0019:     if isinstance(endpoint, tuple) and len(endpoint) == 2:
+0020:         host, port = endpoint
+0021:         return f"tcp://{host}:{port}"
+0022:     if isinstance(endpoint, str):
+0023:         if endpoint.startswith("\\\\.\\pipe\\"):
+0024:             return f"pipe://{endpoint}"
+0025:         if endpoint.startswith(("tcp://", "pipe://")):
+0026:             return endpoint
+0027:         return f"tcp://{endpoint}"
+0028:     raise AssertionError(f"Unsupported endpoint shape: {endpoint!r}")
+0029: 
+0030: 
+0031: class _RuntimeHarness:
+0032:     """Use a Phase 3 host if present, otherwise exercise the IPC server directly."""
+0033: 
+0034:     def __init__(self) -> None:
+0035:         if AstraWeaveServiceHost is not None:
+0036:             self.runtime = AstraWeaveServiceHost(
+0037:                 ServiceHostConfig(
+0038:                     endpoint="tcp://127.0.0.1:0",
+0039:                     prefer_named_pipe=False,
+0040:                     host="127.0.0.1",
+0041:                     port=0,
+0042:                 )
+0043:             )
+0044:         else:
+0045:             self.runtime = AstraWeaveIpcServer(prefer_named_pipe=False, host="127.0.0.1", port=0)
+0046: 
+0047:     def start(self) -> None:
+0048:         self.runtime.start()
+0049: 
+0050:     def stop(self) -> None:
+0051:         self.runtime.stop()
+0052: 
+0053:     def run_for(self, duration_seconds: float) -> None:
+0054:         self.start()
+0055:         try:
+0056:             deadline = time.monotonic() + duration_seconds
+0057:             while time.monotonic() < deadline:
+0058:                 time.sleep(0.01)
+0059:         finally:
+0060:             self.stop()
+0061: 
+0062:     @property
+0063:     def endpoint(self) -> object:
+0064:         status = self.status()
+0065:         return status["endpoint"] if isinstance(status, dict) else status.endpoint
+0066: 
+0067:     @property
+0068:     def transport(self) -> object:
+0069:         status = self.status()
+0070:         return status["transport"] if isinstance(status, dict) else status.transport
+0071: 
+0072:     @property
+0073:     def is_running(self) -> bool:
+0074:         return self.runtime.is_running
+0075: 
+0076:     def status(self) -> dict[str, object]:
+0077:         if hasattr(self.runtime, "status"):
+0078:             status = self.runtime.status()
+0079:             if isinstance(status, dict):
+0080:                 return status
+0081:             return {
+0082:                 "running": status.running,
+0083:                 "endpoint": status.endpoint,
+0084:                 "transport": status.transport,
+0085:                 "uptime_seconds": status.uptime_seconds,
+0086:                 "served_connections": status.served_connections,
+0087:                 "served_requests": status.served_requests,
+0088:             }
+0089:         return {
+0090:             "running": self.is_running,
+0091:             "endpoint": self.endpoint,
+0092:             "transport": self.transport,
+0093:         }
+0094: 
+0095: 
+0096: class Phase3ServiceHostTests(unittest.TestCase):
+0097:     def test_start_exposes_usable_endpoint(self) -> None:
+0098:         harness = _RuntimeHarness()
+0099:         self.addCleanup(harness.stop)
+0100: 
+0101:         harness.start()
+0102:         self.assertTrue(harness.is_running)
+0103: 
+0104:         endpoint = harness.endpoint
+0105:         self.assertIsNotNone(endpoint)
+0106:         self.assertIn(harness.transport, {"localhost", "named_pipe", None})
+0107: 
+0108:         endpoint_uri = _endpoint_uri(endpoint)
+0109:         self.assertTrue(endpoint_uri.startswith(("tcp://", "pipe://")))
+0110: 
+0111:         status = harness.status()
+0112:         self.assertIn("endpoint", status)
+0113:         self.assertIn("transport", status)
+0114:         self.assertTrue(status["running"])
+0115: 
+0116:     def test_controlled_runtime_run_for_shuts_down_cleanly(self) -> None:
+0117:         harness = _RuntimeHarness()
+0118:         harness.run_for(0.05)
+0119: 
+0120:         self.assertFalse(harness.is_running)
+0121:         status = harness.status()
+0122:         self.assertFalse(status["running"])
+0123:         self.assertIsNotNone(status["endpoint"])
+0124: 
+0125:     def test_non_localhost_tcp_bind_is_rejected(self) -> None:
+0126:         if AstraWeaveServiceHost is not None and ServiceHostConfig is not None:
+0127:             host = AstraWeaveServiceHost(
+0128:                 ServiceHostConfig(
+0129:                     endpoint="tcp://0.0.0.0:0",
+0130:                     prefer_named_pipe=False,
+0131:                     host="127.0.0.1",
+0132:                     port=0,
+0133:                 )
+0134:             )
+0135:             with self.assertRaises(ValueError):
+0136:                 host.start()
+0137:             return
+0138: 
+0139:         server = AstraWeaveIpcServer(prefer_named_pipe=False, host="0.0.0.0", port=0)
+0140:         with self.assertRaises(ApiError) as ctx:
+0141:             server.start()
+0142:         self.assertEqual(ctx.exception.code, ApiErrorCode.INVALID_ARGUMENT)
+0143: 
+0144: 
+0145: if __name__ == "__main__":
+0146:     unittest.main()

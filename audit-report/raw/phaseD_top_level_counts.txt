@@ -1,0 +1,6 @@
+﻿# Top-Level File Counts
+astrawave	19
+scripts	8
+tests	17
+docs	11
+reports	18

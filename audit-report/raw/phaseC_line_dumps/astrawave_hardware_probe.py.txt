@@ -1,0 +1,480 @@
+﻿0001: """Real hardware probe helpers for Windows/NVIDIA environments.
+0002: 
+0003: The probe is intentionally fail-soft: missing tools, missing NVML, or runtime
+0004: errors are reflected in structured result blocks instead of bubbling up.
+0005: """
+0006: 
+0007: from __future__ import annotations
+0008: 
+0009: import csv
+0010: import ctypes
+0011: import subprocess
+0012: from dataclasses import dataclass
+0013: from ctypes import byref, c_uint, c_void_p, create_string_buffer
+0014: from ctypes.util import find_library
+0015: from time import time_ns
+0016: from typing import Any, Iterable
+0017: 
+0018: NVML_SUCCESS = 0
+0019: DEFAULT_COMMAND_TIMEOUT_SECONDS = 10.0
+0020: STRING_BUFFER_SIZE = 96
+0021: 
+0022: 
+0023: @dataclass(frozen=True, slots=True)
+0024: class _ProbeError:
+0025:     code: str
+0026:     message: str
+0027:     detail: str | None = None
+0028: 
+0029:     def as_dict(self) -> dict[str, str]:
+0030:         data: dict[str, str] = {"code": self.code, "message": self.message}
+0031:         if self.detail:
+0032:             data["detail"] = self.detail
+0033:         return data
+0034: 
+0035: 
+0036: def collect_hardware_probe() -> dict[str, Any]:
+0037:     """Collect the current NVIDIA hardware view in a JSON-serializable dict."""
+0038: 
+0039:     warnings: list[str] = []
+0040:     timestamp_ms = time_ns() // 1_000_000
+0041: 
+0042:     nvidia_smi_block = _probe_nvidia_smi(warnings)
+0043:     nvml_block = _probe_nvml(warnings)
+0044:     effective = _merge_effective_summary(nvidia_smi_block, nvml_block, warnings)
+0045: 
+0046:     return {
+0047:         "timestamp_ms": timestamp_ms,
+0048:         "nvidia_smi": nvidia_smi_block,
+0049:         "nvml": nvml_block,
+0050:         "effective": effective,
+0051:         "warnings": warnings,
+0052:     }
+0053: 
+0054: 
+0055: def _probe_nvidia_smi(warnings: list[str]) -> dict[str, Any]:
+0056:     command = [
+0057:         "nvidia-smi",
+0058:         "--query-gpu=index,name,memory.total,memory.used,memory.free,driver_version",
+0059:         "--format=csv,noheader,nounits",
+0060:     ]
+0061:     block: dict[str, Any] = {
+0062:         "available": False,
+0063:         "status": "unavailable",
+0064:         "command": command,
+0065:         "driver_version": None,
+0066:         "devices": [],
+0067:         "error": None,
+0068:     }
+0069: 
+0070:     try:
+0071:         completed = subprocess.run(
+0072:             command,
+0073:             capture_output=True,
+0074:             text=True,
+0075:             check=False,
+0076:             timeout=DEFAULT_COMMAND_TIMEOUT_SECONDS,
+0077:         )
+0078:     except FileNotFoundError as exc:
+0079:         block["error"] = _error_dict(
+0080:             "HARDWARE_PROBE_TOOL_MISSING",
+0081:             "nvidia-smi is not available on PATH",
+0082:             str(exc),
+0083:         )
+0084:         warnings.append("nvidia-smi unavailable")
+0085:         return block
+0086:     except subprocess.TimeoutExpired as exc:
+0087:         block["status"] = "timeout"
+0088:         block["error"] = _error_dict(
+0089:             "HARDWARE_PROBE_TIMEOUT",
+0090:             "nvidia-smi timed out while collecting hardware data",
+0091:             str(exc),
+0092:         )
+0093:         warnings.append("nvidia-smi timed out")
+0094:         return block
+0095:     except Exception as exc:  # pragma: no cover - defensive fallback
+0096:         block["status"] = "error"
+0097:         block["error"] = _error_dict(
+0098:             "HARDWARE_PROBE_INTERNAL",
+0099:             "unexpected failure while invoking nvidia-smi",
+0100:             repr(exc),
+0101:         )
+0102:         warnings.append("nvidia-smi probe failed")
+0103:         return block
+0104: 
+0105:     block["exit_code"] = completed.returncode
+0106:     block["stdout"] = completed.stdout.strip()
+0107:     block["stderr"] = completed.stderr.strip() or None
+0108: 
+0109:     if completed.returncode != 0:
+0110:         block["status"] = "error"
+0111:         block["error"] = _error_dict(
+0112:             "HARDWARE_PROBE_TOOL_ERROR",
+0113:             "nvidia-smi returned a non-zero exit code",
+0114:             completed.stderr.strip() or completed.stdout.strip() or None,
+0115:         )
+0116:         warnings.append("nvidia-smi returned an error")
+0117:         return block
+0118: 
+0119:     devices: list[dict[str, Any]] = []
+0120:     driver_version: str | None = None
+0121:     parse_errors: list[str] = []
+0122:     for row in _iter_csv_rows(completed.stdout):
+0123:         if len(row) < 6:
+0124:             parse_errors.append(f"unexpected nvidia-smi row shape: {row!r}")
+0125:             continue
+0126:         try:
+0127:             index = int(row[0].strip())
+0128:             name = row[1].strip()
+0129:             memory_total_mib = int(row[2].strip())
+0130:             memory_used_mib = int(row[3].strip())
+0131:             memory_free_mib = int(row[4].strip())
+0132:             row_driver_version = row[5].strip() or None
+0133:         except ValueError as exc:
+0134:             parse_errors.append(f"failed to parse nvidia-smi row {row!r}: {exc}")
+0135:             continue
+0136: 
+0137:         driver_version = driver_version or row_driver_version
+0138:         devices.append(
+0139:             {
+0140:                 "index": index,
+0141:                 "name": name,
+0142:                 "memory_total_bytes": memory_total_mib * 1024 * 1024,
+0143:                 "memory_used_bytes": memory_used_mib * 1024 * 1024,
+0144:                 "memory_free_bytes": memory_free_mib * 1024 * 1024,
+0145:                 "driver_version": row_driver_version,
+0146:             }
+0147:         )
+0148: 
+0149:     if parse_errors:
+0150:         warnings.extend(parse_errors)
+0151: 
+0152:     block["available"] = True
+0153:     if parse_errors and devices:
+0154:         block["status"] = "partial"
+0155:     elif parse_errors:
+0156:         block["status"] = "error"
+0157:     else:
+0158:         block["status"] = "ok" if devices else "empty"
+0159:     block["devices"] = devices
+0160:     block["driver_version"] = driver_version
+0161:     if parse_errors:
+0162:         block["error"] = _error_dict(
+0163:             "HARDWARE_PROBE_PARTIAL_PARSE",
+0164:             "nvidia-smi output contained rows that could not be parsed",
+0165:             "; ".join(parse_errors),
+0166:         )
+0167:     return block
+0168: 
+0169: 
+0170: def _probe_nvml(warnings: list[str]) -> dict[str, Any]:
+0171:     block: dict[str, Any] = {
+0172:         "available": False,
+0173:         "status": "unavailable",
+0174:         "library": None,
+0175:         "initialized": False,
+0176:         "driver_version": None,
+0177:         "devices": [],
+0178:         "error": None,
+0179:     }
+0180: 
+0181:     library = _load_nvml_library()
+0182:     if library is None:
+0183:         block["error"] = _error_dict(
+0184:             "HARDWARE_PROBE_LIBRARY_MISSING",
+0185:             "NVML library could not be loaded",
+0186:             "tried common NVML library names",
+0187:         )
+0188:         warnings.append("NVML library unavailable")
+0189:         return block
+0190: 
+0191:     block["library"] = library._name if getattr(library, "_name", None) else "nvml"
+0192:     api = _NvmlApi(library)
+0193:     try:
+0194:         api.init()
+0195:         block["initialized"] = True
+0196:         block["driver_version"] = api.system_driver_version()
+0197: 
+0198:         count = api.device_count()
+0199:         devices = []
+0200:         partial_read = False
+0201:         for index in range(count):
+0202:             device_entry: dict[str, Any] = {"index": index}
+0203:             try:
+0204:                 handle = api.device_handle(index)
+0205:                 if handle is None:
+0206:                     partial_read = True
+0207:                     warning = f"NVML skipped device index {index}"
+0208:                     warnings.append(warning)
+0209:                     device_entry["error"] = _error_dict(
+0210:                         "HARDWARE_PROBE_NVML_ERROR",
+0211:                         "NVML could not resolve a device handle",
+0212:                         f"index={index}",
+0213:                     )
+0214:                     devices.append(device_entry)
+0215:                     continue
+0216: 
+0217:                 name = api.device_name(handle)
+0218:                 memory = api.device_memory_info(handle)
+0219:                 device_entry.update(
+0220:                     {
+0221:                         "name": name,
+0222:                         "memory_total_bytes": memory["total_bytes"],
+0223:                         "memory_used_bytes": memory["used_bytes"],
+0224:                         "memory_free_bytes": memory["free_bytes"],
+0225:                     }
+0226:                 )
+0227:                 devices.append(device_entry)
+0228:             except _NvmlError as exc:
+0229:                 partial_read = True
+0230:                 warnings.append(f"NVML device query failed for index {index}")
+0231:                 device_entry["error"] = exc.as_dict()
+0232:                 devices.append(device_entry)
+0233: 
+0234:         block["available"] = True
+0235:         if partial_read and devices:
+0236:             block["status"] = "partial"
+0237:         elif partial_read:
+0238:             block["status"] = "error"
+0239:         else:
+0240:             block["status"] = "ok" if devices else "empty"
+0241:         block["devices"] = devices
+0242:         if partial_read:
+0243:             block["error"] = _error_dict(
+0244:                 "HARDWARE_PROBE_PARTIAL_READ",
+0245:                 "NVML initialized but some device data could not be collected",
+0246:                 f"device_count={count}",
+0247:             )
+0248:         return block
+0249:     except _NvmlError as exc:
+0250:         block["status"] = "error"
+0251:         block["error"] = exc.as_dict()
+0252:         warnings.append("NVML probe failed")
+0253:         return block
+0254:     except Exception as exc:  # pragma: no cover - defensive fallback
+0255:         block["status"] = "error"
+0256:         block["error"] = _error_dict(
+0257:             "HARDWARE_PROBE_INTERNAL",
+0258:             "unexpected failure while probing NVML",
+0259:             repr(exc),
+0260:         )
+0261:         warnings.append("NVML probe failed")
+0262:         return block
+0263:     finally:
+0264:         with _suppress_exception():
+0265:             api.shutdown()
+0266: 
+0267: 
+0268: def _merge_effective_summary(
+0269:     nvidia_smi_block: dict[str, Any],
+0270:     nvml_block: dict[str, Any],
+0271:     warnings: list[str],
+0272: ) -> dict[str, Any]:
+0273:     effective_devices = _merge_device_views(nvidia_smi_block.get("devices", []), nvml_block.get("devices", []))
+0274:     nvidia_valid_count = _count_valid_devices(nvidia_smi_block.get("devices", []))
+0275:     nvml_valid_count = _count_valid_devices(nvml_block.get("devices", []))
+0276:     if nvml_valid_count > 0 and nvml_valid_count >= nvidia_valid_count and nvml_block.get("available"):
+0277:         source = "nvml"
+0278:     elif nvidia_valid_count > 0 and nvidia_smi_block.get("available"):
+0279:         source = "nvidia-smi"
+0280:     elif nvml_block.get("available"):
+0281:         source = "nvml"
+0282:     elif nvidia_smi_block.get("available"):
+0283:         source = "nvidia-smi"
+0284:     else:
+0285:         source = "none"
+0286:     if source == "none":
+0287:         warnings.append("no NVIDIA hardware data could be collected")
+0288: 
+0289:     return {
+0290:         "source": source,
+0291:         "device_count": _count_valid_devices(effective_devices),
+0292:         "driver_version": nvml_block.get("driver_version") or nvidia_smi_block.get("driver_version"),
+0293:         "devices": effective_devices,
+0294:         "has_nvidia_gpu": _count_valid_devices(effective_devices) > 0,
+0295:     }
+0296: 
+0297: 
+0298: def _merge_device_views(
+0299:     nvidia_smi_devices: Iterable[dict[str, Any]],
+0300:     nvml_devices: Iterable[dict[str, Any]],
+0301: ) -> list[dict[str, Any]]:
+0302:     merged: dict[int, dict[str, Any]] = {}
+0303: 
+0304:     for device in nvidia_smi_devices:
+0305:         index = device.get("index")
+0306:         if isinstance(index, int):
+0307:             merged[index] = {"index": index, **device, "source": "nvidia-smi"}
+0308: 
+0309:     for device in nvml_devices:
+0310:         index = device.get("index")
+0311:         if not isinstance(index, int):
+0312:             continue
+0313:         current = merged.get(index, {"index": index})
+0314:         current.update(device)
+0315:         current["source"] = "nvml" if current.get("source") != "nvidia-smi" else "nvml+nvidia-smi"
+0316:         merged[index] = current
+0317: 
+0318:     return [merged[index] for index in sorted(merged)]
+0319: 
+0320: 
+0321: def _count_valid_devices(devices: Iterable[dict[str, Any]]) -> int:
+0322:     count = 0
+0323:     for device in devices:
+0324:         if any(key in device for key in ("memory_total_bytes", "memory_used_bytes", "memory_free_bytes", "name")):
+0325:             count += 1
+0326:     return count
+0327: 
+0328: 
+0329: def _iter_csv_rows(stdout: str) -> list[list[str]]:
+0330:     rows: list[list[str]] = []
+0331:     reader = csv.reader(line for line in stdout.splitlines() if line.strip())
+0332:     for row in reader:
+0333:         rows.append([column.strip() for column in row])
+0334:     return rows
+0335: 
+0336: 
+0337: def _error_dict(code: str, message: str, detail: str | None = None) -> dict[str, str]:
+0338:     return _ProbeError(code=code, message=message, detail=detail).as_dict()
+0339: 
+0340: 
+0341: def _load_nvml_library() -> ctypes.CDLL | None:
+0342:     candidates = (
+0343:         "nvml.dll",
+0344:         "nvml64.dll",
+0345:         "libnvidia-ml.so.1",
+0346:         "libnvidia-ml.so",
+0347:     )
+0348:     loader = getattr(ctypes, "WinDLL", ctypes.CDLL)
+0349: 
+0350:     for candidate in candidates:
+0351:         try:
+0352:             return loader(candidate)
+0353:         except OSError:
+0354:             continue
+0355: 
+0356:     found = find_library("nvidia-ml")
+0357:     if found:
+0358:         try:
+0359:             return loader(found)
+0360:         except OSError:
+0361:             return None
+0362:     return None
+0363: 
+0364: 
+0365: class _NvmlError(Exception):
+0366:     def __init__(self, code: int, message: str, detail: str | None = None) -> None:
+0367:         super().__init__(message)
+0368:         self.code = code
+0369:         self.message = message
+0370:         self.detail = detail
+0371: 
+0372:     def as_dict(self) -> dict[str, str]:
+0373:         detail = self.detail if self.detail is not None else f"nvml_return_code={self.code}"
+0374:         return _error_dict("HARDWARE_PROBE_NVML_ERROR", self.message, detail)
+0375: 
+0376: 
+0377: class _NvmlMemoryInfo(ctypes.Structure):
+0378:     _fields_ = [
+0379:         ("total", ctypes.c_uint64),
+0380:         ("free", ctypes.c_uint64),
+0381:         ("used", ctypes.c_uint64),
+0382:     ]
+0383: 
+0384: 
+0385: class _NvmlApi:
+0386:     def __init__(self, library: ctypes.CDLL) -> None:
+0387:         self._library = library
+0388: 
+0389:     def init(self) -> None:
+0390:         self._call_noargs("nvmlInit_v2")
+0391: 
+0392:     def shutdown(self) -> None:
+0393:         self._call_noargs("nvmlShutdown")
+0394: 
+0395:     def device_count(self) -> int:
+0396:         count = c_uint()
+0397:         self._call("nvmlDeviceGetCount_v2", byref(count))
+0398:         return int(count.value)
+0399: 
+0400:     def device_handle(self, index: int) -> c_void_p | None:
+0401:         handle = c_void_p()
+0402:         rc = self._call(
+0403:             "nvmlDeviceGetHandleByIndex_v2",
+0404:             c_uint(index),
+0405:             byref(handle),
+0406:             allow_missing=True,
+0407:         )
+0408:         if rc != NVML_SUCCESS:
+0409:             return None
+0410:         return handle
+0411: 
+0412:     def device_name(self, handle: c_void_p) -> str:
+0413:         buffer = create_string_buffer(STRING_BUFFER_SIZE)
+0414:         self._call("nvmlDeviceGetName", handle, ctypes.addressof(buffer), c_uint(len(buffer)))
+0415:         return _decode_c_string(buffer.value)
+0416: 
+0417:     def device_memory_info(self, handle: c_void_p) -> dict[str, int]:
+0418:         info = _NvmlMemoryInfo()
+0419:         self._call("nvmlDeviceGetMemoryInfo", handle, byref(info))
+0420:         return {
+0421:             "total_bytes": int(info.total),
+0422:             "free_bytes": int(info.free),
+0423:             "used_bytes": int(info.used),
+0424:         }
+0425: 
+0426:     def system_driver_version(self) -> str | None:
+0427:         if not hasattr(self._library, "nvmlSystemGetDriverVersion"):
+0428:             return None
+0429:         buffer = create_string_buffer(STRING_BUFFER_SIZE)
+0430:         rc = self._call(
+0431:             "nvmlSystemGetDriverVersion",
+0432:             ctypes.addressof(buffer),
+0433:             c_uint(len(buffer)),
+0434:             allow_missing=True,
+0435:         )
+0436:         if rc != NVML_SUCCESS:
+0437:             return None
+0438:         return _decode_c_string(buffer.value)
+0439: 
+0440:     def _call_noargs(self, name: str) -> None:
+0441:         self._call(name)
+0442: 
+0443:     def _call(self, name: str, *args: Any, allow_missing: bool = False) -> int:
+0444:         func = getattr(self._library, name, None)
+0445:         if func is None:
+0446:             if allow_missing:
+0447:                 return -1
+0448:             raise _NvmlError(-1, f"NVML function missing: {name}")
+0449: 
+0450:         func.restype = c_uint
+0451:         func.argtypes = self._argtypes_for(name)
+0452:         rc = int(func(*args))
+0453:         if rc != NVML_SUCCESS and not allow_missing:
+0454:             raise _NvmlError(rc, f"NVML call failed: {name}", f"nvml_return_code={rc}")
+0455:         return rc
+0456: 
+0457:     @staticmethod
+0458:     def _argtypes_for(name: str) -> list[Any] | None:
+0459:         mapping: dict[str, list[Any] | None] = {
+0460:             "nvmlInit_v2": None,
+0461:             "nvmlShutdown": None,
+0462:             "nvmlDeviceGetCount_v2": [ctypes.POINTER(c_uint)],
+0463:             "nvmlDeviceGetHandleByIndex_v2": [c_uint, ctypes.POINTER(c_void_p)],
+0464:             "nvmlDeviceGetName": [c_void_p, ctypes.c_void_p, c_uint],
+0465:             "nvmlDeviceGetMemoryInfo": [c_void_p, ctypes.POINTER(_NvmlMemoryInfo)],
+0466:             "nvmlSystemGetDriverVersion": [ctypes.c_void_p, c_uint],
+0467:         }
+0468:         return mapping.get(name)
+0469: 
+0470: 
+0471: class _suppress_exception:
+0472:     def __enter__(self) -> None:
+0473:         return None
+0474: 
+0475:     def __exit__(self, exc_type, exc, tb) -> bool:
+0476:         return True
+0477: 
+0478: 
+0479: def _decode_c_string(value: bytes) -> str:
+0480:     return value.decode("utf-8", errors="replace").rstrip("\x00").strip()

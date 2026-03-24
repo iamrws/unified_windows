@@ -1,0 +1,61 @@
+﻿0001: """Compatibility-matrix capability mode contract tests."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import unittest
+0006: 
+0007: from astrawave.capabilities import CapabilityMode, CapabilitySignals, resolve_capability_mode
+0008: 
+0009: 
+0010: class CapabilityMatrixContractTests(unittest.TestCase):
+0011:     def test_profile_pa_primary_maps_to_numa_dgpu(self) -> None:
+0012:         snapshot = resolve_capability_mode(
+0013:             CapabilitySignals(
+0014:                 supports_runtime=True,
+0015:                 has_discrete_gpu=True,
+0016:                 is_uma=False,
+0017:                 is_cache_coherent_uma=False,
+0018:             )
+0019:         )
+0020:         self.assertEqual(snapshot.mode, CapabilityMode.NUMA_DGPU)
+0021:         self.assertEqual(snapshot.reason_code, "CAPABILITY_NUMA_DGPU")
+0022: 
+0023:     def test_profile_pb_secondary_maps_to_cache_coherent_uma(self) -> None:
+0024:         snapshot = resolve_capability_mode(
+0025:             CapabilitySignals(
+0026:                 supports_runtime=True,
+0027:                 has_discrete_gpu=False,
+0028:                 is_uma=True,
+0029:                 is_cache_coherent_uma=True,
+0030:             )
+0031:         )
+0032:         self.assertEqual(snapshot.mode, CapabilityMode.CACHE_COHERENT_UMA)
+0033:         self.assertEqual(snapshot.reason_code, "CAPABILITY_CACHE_COHERENT_UMA")
+0034: 
+0035:     def test_profile_pc_degraded_maps_to_uma(self) -> None:
+0036:         snapshot = resolve_capability_mode(
+0037:             CapabilitySignals(
+0038:                 supports_runtime=True,
+0039:                 has_discrete_gpu=False,
+0040:                 is_uma=True,
+0041:                 is_cache_coherent_uma=False,
+0042:             )
+0043:         )
+0044:         self.assertEqual(snapshot.mode, CapabilityMode.UMA)
+0045:         self.assertEqual(snapshot.reason_code, "CAPABILITY_UMA")
+0046: 
+0047:     def test_profile_pd_unsupported_fails_fast(self) -> None:
+0048:         snapshot = resolve_capability_mode(
+0049:             CapabilitySignals(
+0050:                 supports_runtime=False,
+0051:                 has_discrete_gpu=False,
+0052:                 is_uma=False,
+0053:                 is_cache_coherent_uma=False,
+0054:             )
+0055:         )
+0056:         self.assertEqual(snapshot.mode, CapabilityMode.UNSUPPORTED)
+0057:         self.assertEqual(snapshot.reason_code, "CAPABILITY_UNSUPPORTED_RUNTIME")
+0058: 
+0059: 
+0060: if __name__ == "__main__":
+0061:     unittest.main()

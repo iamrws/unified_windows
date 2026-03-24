@@ -1,0 +1,7 @@
+﻿# Command Summary
+unittest_discover=97 passed in 14.852s (wall 15220.1507ms)
+pytest_default=16 collection errors in 0.46s (exit 2, wall 2239.3561ms)
+pytest_tests_pythonpath=97 passed, 1 warning, 12 subtests in 15.50s (exit 0)
+compileall=exit 0 (syntax check passed)
+build_configs_found=0
+lint_configs_found=0

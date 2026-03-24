@@ -1,0 +1,169 @@
+﻿0001: """Fallback ladder and anti-oscillation controls for AstraWeave."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: from dataclasses import dataclass
+0006: from enum import Enum
+0007: from typing import Iterable, Sequence
+0008: 
+0009: 
+0010: class FallbackStep(str, Enum):
+0011:     """Mandatory fallback ladder steps in execution order."""
+0012: 
+0013:     KV_CONTEXT_REDUCTION = "kv_context_reduction"
+0014:     BATCH_REDUCTION = "batch_reduction"
+0015:     PRECISION_REDUCTION = "precision_reduction"
+0016:     SELECTIVE_CPU_OFFLOAD = "selective_cpu_offload"
+0017:     CONTROLLED_FAIL = "controlled_fail"
+0018: 
+0019: 
+0020: DEFAULT_FALLBACK_LADDER: tuple[FallbackStep, ...] = (
+0021:     FallbackStep.KV_CONTEXT_REDUCTION,
+0022:     FallbackStep.BATCH_REDUCTION,
+0023:     FallbackStep.PRECISION_REDUCTION,
+0024:     FallbackStep.SELECTIVE_CPU_OFFLOAD,
+0025:     FallbackStep.CONTROLLED_FAIL,
+0026: )
+0027: 
+0028: 
+0029: @dataclass(frozen=True, slots=True)
+0030: class OscillationControls:
+0031:     """Thresholds used to prevent fallback thrashing."""
+0032: 
+0033:     cooldown_seconds: int = 30
+0034:     minimum_dwell_seconds: int = 15
+0035:     churn_window_seconds: int = 30
+0036:     churn_threshold: int = 1
+0037: 
+0038: 
+0039: @dataclass(frozen=True, slots=True)
+0040: class FallbackState:
+0041:     """Observed fallback state used by the control logic."""
+0042: 
+0043:     current_step: FallbackStep | None
+0044:     last_step_change_ms: int | None
+0045:     step_change_history_ms: tuple[int, ...] = ()
+0046:     stability_mode: bool = False
+0047: 
+0048: 
+0049: @dataclass(frozen=True, slots=True)
+0050: class FallbackDecision:
+0051:     """Deterministic result of evaluating the fallback policy."""
+0052: 
+0053:     should_advance: bool
+0054:     next_step: FallbackStep | None
+0055:     enter_stability_mode: bool
+0056:     reason_code: str
+0057: 
+0058: 
+0059: class FallbackController:
+0060:     """Ladder planner with anti-oscillation safeguards."""
+0061: 
+0062:     def __init__(
+0063:         self,
+0064:         ladder: Sequence[FallbackStep] | None = None,
+0065:         controls: OscillationControls | None = None,
+0066:     ) -> None:
+0067:         self._ladder = tuple(ladder or DEFAULT_FALLBACK_LADDER)
+0068:         self._controls = controls or OscillationControls()
+0069: 
+0070:     @property
+0071:     def ladder(self) -> tuple[FallbackStep, ...]:
+0072:         """Expose the fallback ladder in execution order."""
+0073: 
+0074:         return self._ladder
+0075: 
+0076:     @property
+0077:     def controls(self) -> OscillationControls:
+0078:         """Expose the oscillation controls used by the controller."""
+0079: 
+0080:         return self._controls
+0081: 
+0082:     def next_step(self, current_step: FallbackStep | None) -> FallbackStep | None:
+0083:         """Return the next ladder step after the current one."""
+0084: 
+0085:         if current_step is None:
+0086:             return self._ladder[0]
+0087: 
+0088:         try:
+0089:             index = self._ladder.index(current_step)
+0090:         except ValueError:
+0091:             return None
+0092: 
+0093:         if index + 1 >= len(self._ladder):
+0094:             return None
+0095:         return self._ladder[index + 1]
+0096: 
+0097:     def evaluate(
+0098:         self,
+0099:         state: FallbackState,
+0100:         now_ms: int,
+0101:     ) -> FallbackDecision:
+0102:         """Evaluate whether the ladder may advance at the current timestamp."""
+0103: 
+0104:         if state.current_step is None:
+0105:             return FallbackDecision(
+0106:                 should_advance=True,
+0107:                 next_step=self._ladder[0],
+0108:                 enter_stability_mode=False,
+0109:                 reason_code="FALLBACK_INITIAL_STEP",
+0110:             )
+0111: 
+0112:         if self._is_churn_triggered(state.step_change_history_ms, now_ms):
+0113:             return FallbackDecision(
+0114:                 should_advance=False,
+0115:                 next_step=state.current_step,
+0116:                 enter_stability_mode=True,
+0117:                 reason_code="FALLBACK_CHURN_TRIGGERED_STABILITY_MODE",
+0118:             )
+0119: 
+0120:         if state.last_step_change_ms is not None:
+0121:             elapsed_ms = now_ms - state.last_step_change_ms
+0122:             cooldown_ms = self._controls.cooldown_seconds * 1000
+0123:             dwell_ms = self._controls.minimum_dwell_seconds * 1000
+0124:             if elapsed_ms < cooldown_ms:
+0125:                 return FallbackDecision(
+0126:                     should_advance=False,
+0127:                     next_step=state.current_step,
+0128:                     enter_stability_mode=state.stability_mode,
+0129:                     reason_code="FALLBACK_COOLDOWN_ACTIVE",
+0130:                 )
+0131:             if elapsed_ms < dwell_ms:
+0132:                 return FallbackDecision(
+0133:                     should_advance=False,
+0134:                     next_step=state.current_step,
+0135:                     enter_stability_mode=state.stability_mode,
+0136:                     reason_code="FALLBACK_MINIMUM_DWELL_ACTIVE",
+0137:                 )
+0138: 
+0139:         next_step = self.next_step(state.current_step)
+0140:         if next_step is None:
+0141:             return FallbackDecision(
+0142:                 should_advance=False,
+0143:                 next_step=state.current_step,
+0144:                 enter_stability_mode=state.stability_mode,
+0145:                 reason_code="FALLBACK_FINAL_STEP_REACHED",
+0146:             )
+0147: 
+0148:         return FallbackDecision(
+0149:             should_advance=True,
+0150:             next_step=next_step,
+0151:             enter_stability_mode=state.stability_mode,
+0152:             reason_code="FALLBACK_ADVANCE_ALLOWED",
+0153:         )
+0154: 
+0155:     def _is_churn_triggered(
+0156:         self,
+0157:         step_change_history_ms: Sequence[int],
+0158:         now_ms: int,
+0159:     ) -> bool:
+0160:         """Detect whether the recent step-change rate exceeds the policy threshold."""
+0161: 
+0162:         window_ms = self._controls.churn_window_seconds * 1000
+0163:         recent_changes = [
+0164:             timestamp
+0165:             for timestamp in step_change_history_ms
+0166:             if now_ms - timestamp <= window_ms
+0167:         ]
+0168:         return len(recent_changes) > self._controls.churn_threshold
+0169: 

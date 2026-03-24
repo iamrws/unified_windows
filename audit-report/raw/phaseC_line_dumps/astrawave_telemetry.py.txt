@@ -1,0 +1,582 @@
+﻿0001: """Telemetry pipeline primitives for AstraWeave.
+0002: 
+0003: This module keeps telemetry local by default, redacts sensitive values before
+0004: persisting them, and only allows export bundles after explicit opt-in.
+0005: """
+0006: 
+0007: from __future__ import annotations
+0008: 
+0009: from dataclasses import asdict, dataclass, field
+0010: from datetime import datetime, timezone
+0011: from enum import Enum
+0012: import hashlib
+0013: import json
+0014: import re
+0015: import uuid
+0016: from typing import Any, Callable, ClassVar, Mapping
+0017: 
+0018: from .errors import ApiError, ApiErrorCode
+0019: 
+0020: 
+0021: def utcnow() -> datetime:
+0022:     """Return a timezone-aware UTC timestamp."""
+0023: 
+0024:     return datetime.now(timezone.utc)
+0025: 
+0026: 
+0027: def new_correlation_id(prefix: str = "tel") -> str:
+0028:     """Generate a stable-format correlation id for telemetry events."""
+0029: 
+0030:     return f"{prefix}-{uuid.uuid4()}"
+0031: 
+0032: 
+0033: def hash_identifier(value: object, salt: str = "") -> str:
+0034:     """Hash an identifier for persisted telemetry records.
+0035: 
+0036:     The output is deterministic for the same input and salt, but the raw value
+0037:     is not preserved in persisted telemetry.
+0038:     """
+0039: 
+0040:     digest = hashlib.sha256(f"{salt}|{value!s}".encode("utf-8")).hexdigest()
+0041:     return f"sha256:{digest}"
+0042: 
+0043: 
+0044: def _coerce_datetime(value: datetime | None) -> datetime:
+0045:     if value is None:
+0046:         return utcnow()
+0047:     if value.tzinfo is None:
+0048:         return value.replace(tzinfo=timezone.utc)
+0049:     return value.astimezone(timezone.utc)
+0050: 
+0051: 
+0052: def _coerce_reason_code(value: str | TelemetryReasonCode) -> TelemetryReasonCode:
+0053:     if isinstance(value, TelemetryReasonCode):
+0054:         return value
+0055:     try:
+0056:         return TelemetryReasonCode(value)
+0057:     except ValueError as exc:  # pragma: no cover - defensive branch
+0058:         raise ApiError(
+0059:             ApiErrorCode.INVALID_ARGUMENT,
+0060:             f"Unknown telemetry reason code: {value}",
+0061:         ) from exc
+0062: 
+0063: 
+0064: def _is_sensitive_key(key: str) -> bool:
+0065:     lowered = key.lower()
+0066:     return any(
+0067:         token in lowered
+0068:         for token in (
+0069:             "prompt",
+0070:             "completion",
+0071:             "output",
+0072:             "response",
+0073:             "secret",
+0074:             "token",
+0075:             "password",
+0076:             "passphrase",
+0077:             "credential",
+0078:             "authorization",
+0079:             "bearer",
+0080:             "cookie",
+0081:             "api_key",
+0082:             "apikey",
+0083:             "file_contents",
+0084:             "content",
+0085:         )
+0086:     )
+0087: 
+0088: 
+0089: def _is_identifier_key(key: str) -> bool:
+0090:     lowered = key.lower()
+0091:     return lowered in {
+0092:         "session_id",
+0093:         "caller_id",
+0094:         "caller_sid",
+0095:         "caller_pid",
+0096:         "process_id",
+0097:         "pid",
+0098:     } or lowered.endswith("_id")
+0099: 
+0100: 
+0101: _SECRET_PATTERNS = [
+0102:     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-+=/]+\b"),
+0103:     re.compile(r"(?i)\b(?:api[_-]?key|secret|token|password|passphrase)\b\s*[:=]\s*\S+"),
+0104: ]
+0105: 
+0106: 
+0107: def redact_text(text: str) -> str:
+0108:     """Redact obvious secret material from free-form text."""
+0109: 
+0110:     redacted = text
+0111:     for pattern in _SECRET_PATTERNS:
+0112:         redacted = pattern.sub("<redacted>", redacted)
+0113:     return redacted
+0114: 
+0115: 
+0116: def redact_value(
+0117:     value: Any,
+0118:     *,
+0119:     salt: str = "",
+0120:     allow_debug_identifiers: bool = False,
+0121: ) -> Any:
+0122:     """Redact or hash a value recursively."""
+0123: 
+0124:     if value is None:
+0125:         return None
+0126:     if isinstance(value, Mapping):
+0127:         return redact_mapping(
+0128:             value,
+0129:             salt=salt,
+0130:             allow_debug_identifiers=allow_debug_identifiers,
+0131:         )
+0132:     if isinstance(value, (list, tuple)):
+0133:         return [
+0134:             redact_value(
+0135:                 item,
+0136:                 salt=salt,
+0137:                 allow_debug_identifiers=allow_debug_identifiers,
+0138:             )
+0139:             for item in value
+0140:         ]
+0141:     if isinstance(value, str):
+0142:         return redact_text(value)
+0143:     return value
+0144: 
+0145: 
+0146: def redact_mapping(
+0147:     data: Mapping[str, Any],
+0148:     *,
+0149:     salt: str = "",
+0150:     allow_debug_identifiers: bool = False,
+0151: ) -> dict[str, Any]:
+0152:     """Redact a mapping while hashing identifiers for persisted records."""
+0153: 
+0154:     redacted: dict[str, Any] = {}
+0155:     for key, value in data.items():
+0156:         if _is_sensitive_key(key):
+0157:             redacted[key] = "<redacted>"
+0158:             continue
+0159:         if _is_identifier_key(key) and not allow_debug_identifiers:
+0160:             redacted[key] = hash_identifier(value, salt=salt)
+0161:             continue
+0162:         redacted[key] = redact_value(
+0163:             value,
+0164:             salt=salt,
+0165:             allow_debug_identifiers=allow_debug_identifiers,
+0166:         )
+0167:     return redacted
+0168: 
+0169: 
+0170: class TelemetryEventType(str, Enum):
+0171:     """Structured telemetry event kinds."""
+0172: 
+0173:     CUSTOM = "custom"
+0174:     RESIDENCY_CHANGE = "residency_change"
+0175:     TRANSFER = "transfer_event"
+0176:     FALLBACK = "fallback_event"
+0177:     PRESSURE = "pressure_snapshot"
+0178:     SECURITY = "security_event"
+0179:     POLICY = "policy_event"
+0180: 
+0181: 
+0182: class TelemetryReasonCode(str, Enum):
+0183:     """Stable reason codes used by telemetry events and exports."""
+0184: 
+0185:     UNKNOWN = "AW_TEL_REASON_UNKNOWN"
+0186:     RESIDENCY_PROMOTED = "AW_TEL_REASON_RESIDENCY_PROMOTED"
+0187:     RESIDENCY_DEMOTED = "AW_TEL_REASON_RESIDENCY_DEMOTED"
+0188:     TRANSFER_PREFETCH = "AW_TEL_REASON_TRANSFER_PREFETCH"
+0189:     TRANSFER_EVICTION = "AW_TEL_REASON_TRANSFER_EVICTION"
+0190:     FALLBACK_KV_REDUCTION = "AW_TEL_REASON_FALLBACK_KV_REDUCTION"
+0191:     FALLBACK_BATCH_REDUCTION = "AW_TEL_REASON_FALLBACK_BATCH_REDUCTION"
+0192:     FALLBACK_PRECISION_REDUCTION = "AW_TEL_REASON_FALLBACK_PRECISION_REDUCTION"
+0193:     FALLBACK_CPU_OFFLOAD = "AW_TEL_REASON_FALLBACK_CPU_OFFLOAD"
+0194:     FALLBACK_CONTROLLED_FAIL = "AW_TEL_REASON_FALLBACK_CONTROLLED_FAIL"
+0195:     PRESSURE_RISE = "AW_TEL_REASON_PRESSURE_RISE"
+0196:     PRESSURE_RELIEF = "AW_TEL_REASON_PRESSURE_RELIEF"
+0197:     SECURITY_DENY = "AW_TEL_REASON_SECURITY_DENY"
+0198:     POLICY_CHANGED = "AW_TEL_REASON_POLICY_CHANGED"
+0199:     EXPORT_BLOCKED = "AW_TEL_REASON_EXPORT_BLOCKED"
+0200:     RETENTION_CLEANUP = "AW_TEL_REASON_RETENTION_CLEANUP"
+0201: 
+0202: 
+0203: class TelemetryRecordClass(str, Enum):
+0204:     """Record classes used by retention rules."""
+0205: 
+0206:     EVENT = "event"
+0207:     METRIC = "metric"
+0208:     CRASH = "crash"
+0209:     BUNDLE = "bundle"
+0210: 
+0211: 
+0212: @dataclass(frozen=True, slots=True, kw_only=True)
+0213: class TelemetryEvent:
+0214:     """Base telemetry event with a correlation id and stable reason code."""
+0215: 
+0216:     reason_code: TelemetryReasonCode | str
+0217:     correlation_id: str = field(default_factory=new_correlation_id)
+0218:     session_id: str | None = None
+0219:     timestamp: datetime | None = None
+0220: 
+0221:     event_type: ClassVar[TelemetryEventType] = TelemetryEventType.CUSTOM
+0222:     record_class: ClassVar[TelemetryRecordClass] = TelemetryRecordClass.EVENT
+0223: 
+0224:     def __post_init__(self) -> None:
+0225:         object.__setattr__(self, "reason_code", _coerce_reason_code(self.reason_code))
+0226:         object.__setattr__(self, "timestamp", _coerce_datetime(self.timestamp))
+0227:         if not self.correlation_id.strip():
+0228:             raise ApiError(
+0229:                 ApiErrorCode.INVALID_ARGUMENT,
+0230:                 "Telemetry events require a non-empty correlation id.",
+0231:             )
+0232:         if self.session_id is not None and not self.session_id.strip():
+0233:             raise ApiError(
+0234:                 ApiErrorCode.INVALID_ARGUMENT,
+0235:                 "Telemetry session ids cannot be empty.",
+0236:             )
+0237: 
+0238:     def structured_dict(self) -> dict[str, Any]:
+0239:         """Return a JSON-friendly structured event dictionary."""
+0240: 
+0241:         structured = asdict(self)
+0242:         structured["event_type"] = self.event_type.value
+0243:         structured["record_class"] = self.record_class.value
+0244:         structured["reason_code"] = self.reason_code.value
+0245:         structured["timestamp"] = self.timestamp.isoformat()
+0246:         return structured
+0247: 
+0248: 
+0249: @dataclass(frozen=True, slots=True, kw_only=True)
+0250: class ResidencyChangeEvent(TelemetryEvent):
+0251:     event_type: ClassVar[TelemetryEventType] = TelemetryEventType.RESIDENCY_CHANGE
+0252:     tensor_class: str
+0253:     from_state: str
+0254:     to_state: str
+0255: 
+0256: 
+0257: @dataclass(frozen=True, slots=True, kw_only=True)
+0258: class TransferEvent(TelemetryEvent):
+0259:     event_type: ClassVar[TelemetryEventType] = TelemetryEventType.TRANSFER
+0260:     bytes_moved: int
+0261:     direction: str
+0262:     latency_ms: float
+0263:     mode: str
+0264: 
+0265: 
+0266: @dataclass(frozen=True, slots=True, kw_only=True)
+0267: class FallbackEvent(TelemetryEvent):
+0268:     event_type: ClassVar[TelemetryEventType] = TelemetryEventType.FALLBACK
+0269:     ladder_step: str
+0270:     trigger: str
+0271:     stabilization_mode: bool = False
+0272: 
+0273: 
+0274: @dataclass(frozen=True, slots=True, kw_only=True)
+0275: class PressureSnapshotEvent(TelemetryEvent):
+0276:     event_type: ClassVar[TelemetryEventType] = TelemetryEventType.PRESSURE
+0277:     budget_bytes: int
+0278:     used_bytes: int
+0279:     pressure_level: str
+0280: 
+0281: 
+0282: @dataclass(frozen=True, slots=True, kw_only=True)
+0283: class SecurityEvent(TelemetryEvent):
+0284:     event_type: ClassVar[TelemetryEventType] = TelemetryEventType.SECURITY
+0285:     caller_id: str
+0286:     endpoint: str
+0287:     decision: str
+0288: 
+0289: 
+0290: @dataclass(frozen=True, slots=True, kw_only=True)
+0291: class PolicyEvent(TelemetryEvent):
+0292:     event_type: ClassVar[TelemetryEventType] = TelemetryEventType.POLICY
+0293:     previous_profile: str
+0294:     new_profile: str
+0295: 
+0296: 
+0297: @dataclass(frozen=True, slots=True)
+0298: class TelemetryRecord:
+0299:     """Persisted redacted telemetry record."""
+0300: 
+0301:     record_class: TelemetryRecordClass
+0302:     event_type: TelemetryEventType
+0303:     reason_code: TelemetryReasonCode
+0304:     correlation_id: str
+0305:     timestamp: datetime
+0306:     session_id_hash: str | None
+0307:     identifiers: dict[str, str]
+0308:     payload: dict[str, Any]
+0309: 
+0310:     def to_dict(self) -> dict[str, Any]:
+0311:         return {
+0312:             "record_class": self.record_class.value,
+0313:             "event_type": self.event_type.value,
+0314:             "reason_code": self.reason_code.value,
+0315:             "correlation_id": self.correlation_id,
+0316:             "timestamp": self.timestamp.isoformat(),
+0317:             "session_id_hash": self.session_id_hash,
+0318:             "identifiers": dict(self.identifiers),
+0319:             "payload": _json_safe(self.payload),
+0320:         }
+0321: 
+0322: 
+0323: @dataclass(frozen=True, slots=True)
+0324: class TelemetryExportBundle:
+0325:     """Local export bundle containing only redacted persisted records."""
+0326: 
+0327:     schema_version: str
+0328:     created_at: datetime
+0329:     policy: dict[str, Any]
+0330:     records: tuple[TelemetryRecord, ...]
+0331:     summary: dict[str, Any]
+0332: 
+0333:     def to_dict(self) -> dict[str, Any]:
+0334:         return {
+0335:             "schema_version": self.schema_version,
+0336:             "created_at": self.created_at.isoformat(),
+0337:             "policy": _json_safe(self.policy),
+0338:             "summary": _json_safe(self.summary),
+0339:             "records": [record.to_dict() for record in self.records],
+0340:         }
+0341: 
+0342:     def to_json(self, *, indent: int | None = 2) -> str:
+0343:         return json.dumps(self.to_dict(), ensure_ascii=True, indent=indent)
+0344: 
+0345: 
+0346: def _default_retention_seconds() -> dict[TelemetryRecordClass, int]:
+0347:     return {
+0348:         TelemetryRecordClass.EVENT: 24 * 60 * 60,
+0349:         TelemetryRecordClass.METRIC: 30 * 24 * 60 * 60,
+0350:         TelemetryRecordClass.CRASH: 14 * 24 * 60 * 60,
+0351:         TelemetryRecordClass.BUNDLE: 7 * 24 * 60 * 60,
+0352:     }
+0353: 
+0354: 
+0355: def _default_max_retention_seconds() -> dict[TelemetryRecordClass, int]:
+0356:     return {
+0357:         TelemetryRecordClass.EVENT: 72 * 60 * 60,
+0358:         TelemetryRecordClass.METRIC: 90 * 24 * 60 * 60,
+0359:         TelemetryRecordClass.CRASH: 30 * 24 * 60 * 60,
+0360:         TelemetryRecordClass.BUNDLE: 30 * 24 * 60 * 60,
+0361:     }
+0362: 
+0363: 
+0364: @dataclass(slots=True)
+0365: class TelemetryPolicy:
+0366:     """Policy container for local-only telemetry behavior."""
+0367: 
+0368:     local_only: bool = True
+0369:     export_opt_in: bool = False
+0370:     allow_debug_identifiers: bool = False
+0371:     identifier_hash_salt: str = ""
+0372:     retention_seconds_by_class: dict[TelemetryRecordClass, int] = field(
+0373:         default_factory=_default_retention_seconds
+0374:     )
+0375:     max_retention_seconds_by_class: dict[TelemetryRecordClass, int] = field(
+0376:         default_factory=_default_max_retention_seconds
+0377:     )
+0378: 
+0379:     def validate(self) -> None:
+0380:         for record_class, retention in self.retention_seconds_by_class.items():
+0381:             max_retention = self.max_retention_seconds_by_class.get(record_class)
+0382:             if max_retention is None:
+0383:                 continue
+0384:             if retention < 0:
+0385:                 raise ApiError(
+0386:                     ApiErrorCode.INVALID_ARGUMENT,
+0387:                     f"Retention for {record_class.value} cannot be negative.",
+0388:                 )
+0389:             if retention > max_retention:
+0390:                 raise ApiError(
+0391:                     ApiErrorCode.INVALID_ARGUMENT,
+0392:                     f"Retention for {record_class.value} exceeds allowed maximum.",
+0393:                 )
+0394: 
+0395:     def snapshot(self) -> dict[str, Any]:
+0396:         return {
+0397:             "local_only": self.local_only,
+0398:             "export_opt_in": self.export_opt_in,
+0399:             "allow_debug_identifiers": self.allow_debug_identifiers,
+0400:             "identifier_hash_salt": "<redacted>" if self.identifier_hash_salt else "",
+0401:             "retention_seconds_by_class": {
+0402:                 key.value: value for key, value in self.retention_seconds_by_class.items()
+0403:             },
+0404:             "max_retention_seconds_by_class": {
+0405:                 key.value: value for key, value in self.max_retention_seconds_by_class.items()
+0406:             },
+0407:         }
+0408: 
+0409: 
+0410: @dataclass(slots=True)
+0411: class TelemetryPipeline:
+0412:     """In-memory telemetry pipeline with redaction, retention, and export."""
+0413: 
+0414:     policy: TelemetryPolicy = field(default_factory=TelemetryPolicy)
+0415:     schema_version: str = "1.0"
+0416:     _records: list[TelemetryRecord] = field(default_factory=list, init=False, repr=False)
+0417: 
+0418:     def __post_init__(self) -> None:
+0419:         self.policy.validate()
+0420: 
+0421:     @property
+0422:     def records(self) -> tuple[TelemetryRecord, ...]:
+0423:         return tuple(self._records)
+0424: 
+0425:     def set_export_opt_in(self, enabled: bool) -> None:
+0426:         self.policy.export_opt_in = bool(enabled)
+0427: 
+0428:     def record_event(
+0429:         self,
+0430:         event: TelemetryEvent,
+0431:         *,
+0432:         extra_identifiers: Mapping[str, Any] | None = None,
+0433:     ) -> TelemetryRecord:
+0434:         """Persist a structured event after redaction and identifier hashing."""
+0435: 
+0436:         structured = event.structured_dict()
+0437:         payload = {
+0438:             key: value
+0439:             for key, value in structured.items()
+0440:             if key
+0441:             not in {
+0442:                 "event_type",
+0443:                 "record_class",
+0444:                 "reason_code",
+0445:                 "correlation_id",
+0446:                 "timestamp",
+0447:                 "session_id",
+0448:             }
+0449:         }
+0450:         payload = redact_mapping(
+0451:             payload,
+0452:             salt=self.policy.identifier_hash_salt,
+0453:             allow_debug_identifiers=self.policy.allow_debug_identifiers,
+0454:         )
+0455: 
+0456:         identifiers = {
+0457:             key: (
+0458:                 value
+0459:                 if self.policy.allow_debug_identifiers
+0460:                 else hash_identifier(value, salt=self.policy.identifier_hash_salt)
+0461:             )
+0462:             for key, value in (extra_identifiers or {}).items()
+0463:             if value is not None
+0464:         }
+0465:         session_id_hash = (
+0466:             hash_identifier(event.session_id, salt=self.policy.identifier_hash_salt)
+0467:             if event.session_id is not None and not self.policy.allow_debug_identifiers
+0468:             else event.session_id
+0469:         )
+0470:         if event.session_id is not None and self.policy.allow_debug_identifiers:
+0471:             session_id_hash = event.session_id
+0472: 
+0473:         record = TelemetryRecord(
+0474:             record_class=event.record_class,
+0475:             event_type=event.event_type,
+0476:             reason_code=event.reason_code,
+0477:             correlation_id=event.correlation_id,
+0478:             timestamp=event.timestamp,
+0479:             session_id_hash=session_id_hash,
+0480:             identifiers=identifiers,
+0481:             payload=payload,
+0482:         )
+0483:         self._records.append(record)
+0484:         return record
+0485: 
+0486:     def cleanup(
+0487:         self,
+0488:         *,
+0489:         now: datetime | None = None,
+0490:         on_remove: Callable[[TelemetryRecord], None] | None = None,
+0491:     ) -> tuple[TelemetryRecord, ...]:
+0492:         """Drop expired records and call the optional cleanup hook."""
+0493: 
+0494:         current_time = _coerce_datetime(now)
+0495:         kept: list[TelemetryRecord] = []
+0496:         removed: list[TelemetryRecord] = []
+0497: 
+0498:         for record in self._records:
+0499:             retention = self.policy.retention_seconds_by_class.get(record.record_class)
+0500:             if retention is None:
+0501:                 kept.append(record)
+0502:                 continue
+0503:             age_seconds = (current_time - record.timestamp).total_seconds()
+0504:             if age_seconds > retention:
+0505:                 removed.append(record)
+0506:                 if on_remove is not None:
+0507:                     on_remove(record)
+0508:             else:
+0509:                 kept.append(record)
+0510: 
+0511:         self._records = kept
+0512:         return tuple(removed)
+0513: 
+0514:     def build_export_bundle(self, *, now: datetime | None = None) -> TelemetryExportBundle:
+0515:         """Build a local export bundle from already-redacted persisted records."""
+0516: 
+0517:         if not self.policy.export_opt_in:
+0518:             raise ApiError(
+0519:                 ApiErrorCode.INVALID_STATE,
+0520:                 "Telemetry export is disabled until explicit opt-in.",
+0521:             )
+0522: 
+0523:         current_time = _coerce_datetime(now)
+0524:         self.cleanup(now=current_time, on_remove=lambda _record: None)
+0525: 
+0526:         summary = {
+0527:             "record_count": len(self._records),
+0528:             "by_event_type": {},
+0529:             "by_reason_code": {},
+0530:         }
+0531:         for record in self._records:
+0532:             summary["by_event_type"][record.event_type.value] = (
+0533:                 summary["by_event_type"].get(record.event_type.value, 0) + 1
+0534:             )
+0535:             summary["by_reason_code"][record.reason_code.value] = (
+0536:                 summary["by_reason_code"].get(record.reason_code.value, 0) + 1
+0537:             )
+0538: 
+0539:         return TelemetryExportBundle(
+0540:             schema_version=self.schema_version,
+0541:             created_at=current_time,
+0542:             policy=self.policy.snapshot(),
+0543:             records=tuple(self._records),
+0544:             summary=summary,
+0545:         )
+0546: 
+0547: 
+0548: def _json_safe(value: Any) -> Any:
+0549:     if isinstance(value, datetime):
+0550:         return value.isoformat()
+0551:     if isinstance(value, Enum):
+0552:         return value.value
+0553:     if isinstance(value, Mapping):
+0554:         return {key: _json_safe(item) for key, item in value.items()}
+0555:     if isinstance(value, tuple):
+0556:         return [_json_safe(item) for item in value]
+0557:     if isinstance(value, list):
+0558:         return [_json_safe(item) for item in value]
+0559:     return value
+0560: 
+0561: 
+0562: __all__ = [
+0563:     "FallbackEvent",
+0564:     "PolicyEvent",
+0565:     "PressureSnapshotEvent",
+0566:     "ResidencyChangeEvent",
+0567:     "SecurityEvent",
+0568:     "TelemetryEvent",
+0569:     "TelemetryEventType",
+0570:     "TelemetryExportBundle",
+0571:     "TelemetryPipeline",
+0572:     "TelemetryPolicy",
+0573:     "TelemetryReasonCode",
+0574:     "TelemetryRecord",
+0575:     "TelemetryRecordClass",
+0576:     "TransferEvent",
+0577:     "hash_identifier",
+0578:     "new_correlation_id",
+0579:     "redact_mapping",
+0580:     "redact_text",
+0581:     "redact_value",
+0582: ]

@@ -1,0 +1,59 @@
+﻿0001: """Contract tests for the live inference smoke workflow."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import unittest
+0006: 
+0007: from scripts.live_inference_smoke import run_live_inference_smoke
+0008: 
+0009: 
+0010: class LiveInferenceSmokeTests(unittest.TestCase):
+0011:     def test_run_live_inference_smoke_simulation_backend_returns_structured_json(self) -> None:
+0012:         result = run_live_inference_smoke(
+0013:             model_name="demo-model",
+0014:             prompt="Say hello in one short sentence.",
+0015:             runtime_backend="simulation",
+0016:             service_runstep_mode="simulation",
+0017:             max_tokens=32,
+0018:             temperature=0.2,
+0019:         )
+0020: 
+0021:         self.assertEqual(result["model_name"], "demo-model")
+0022:         self.assertEqual(result["runtime_backend"], "simulation")
+0023:         self.assertEqual(result["service"]["load_model"]["runtime_backend"], "simulation")
+0024:         self.assertEqual(result["service"]["run_step"]["step_name"], "prompt_smoke")
+0025: 
+0026:         inference = result["inference"]["result"]
+0027:         self.assertEqual(inference["backend"], "simulation")
+0028:         self.assertEqual(inference["model_name"], "demo-model")
+0029:         self.assertTrue(inference["ok"])
+0030:         self.assertIn("output_text", inference)
+0031: 
+0032:     def test_run_live_inference_smoke_auto_profiles_large_models(self) -> None:
+0033:         result = run_live_inference_smoke(
+0034:             model_name="qwen2.5:14b",
+0035:             prompt="Summarize the effect of large host RAM on local inference.",
+0036:             runtime_backend="simulation",
+0037:             runtime_backend_options={"num_ctx": 4096},
+0038:             runtime_profile_override="memory_saver",
+0039:             runtime_backend_options_override={"num_predict": 64, "top_p": 0.9},
+0040:             service_runstep_mode="simulation",
+0041:             max_tokens=32,
+0042:             temperature=0.2,
+0043:         )
+0044: 
+0045:         tuning = result["runtime_tuning"]
+0046:         self.assertEqual(tuning["model_size_billion"], 14.0)
+0047:         self.assertEqual(tuning["effective"]["load_profile"], "vram_constrained")
+0048:         self.assertEqual(tuning["effective"]["load_backend_options"]["num_ctx"], 4096)
+0049:         self.assertEqual(tuning["effective"]["step_profile_override"], "memory_saver")
+0050:         self.assertEqual(tuning["effective"]["step_backend_options_override"]["num_predict"], 64)
+0051:         self.assertEqual(result["service"]["load_model"]["runtime_backend_options"]["num_ctx"], 4096)
+0052:         self.assertEqual(result["service"]["run_step"]["runtime_profile_override"], "memory_saver")
+0053:         self.assertEqual(result["service"]["run_step"]["runtime_backend_options_override"]["num_predict"], 64)
+0054:         self.assertEqual(result["inference"]["runtime_profile"], "memory_saver")
+0055:         self.assertEqual(result["inference"]["runtime_backend_options"]["num_predict"], 64)
+0056: 
+0057: 
+0058: if __name__ == "__main__":
+0059:     unittest.main()

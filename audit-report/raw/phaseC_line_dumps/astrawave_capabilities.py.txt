@@ -1,0 +1,92 @@
+﻿0001: """Capability-mode detection for AstraWeave.
+0002: 
+0003: The service uses this module to choose a deterministic runtime path before any
+0004: policy decisions are made.  The detection API is intentionally pure and
+0005: dependency-injectable so callers can feed it either real hardware probes or
+0006: synthetic fixtures in tests.
+0007: """
+0008: 
+0009: from __future__ import annotations
+0010: 
+0011: from dataclasses import dataclass
+0012: from enum import Enum
+0013: from typing import Protocol
+0014: 
+0015: 
+0016: class CapabilityMode(str, Enum):
+0017:     """Supported runtime capability modes."""
+0018: 
+0019:     NUMA_DGPU = "NUMA_dGPU"
+0020:     CACHE_COHERENT_UMA = "CacheCoherentUMA"
+0021:     UMA = "UMA"
+0022:     UNSUPPORTED = "UNSUPPORTED"
+0023: 
+0024: 
+0025: @dataclass(frozen=True, slots=True)
+0026: class CapabilitySignals:
+0027:     """Hardware signals consumed by capability detection."""
+0028: 
+0029:     supports_runtime: bool
+0030:     has_discrete_gpu: bool
+0031:     is_uma: bool
+0032:     is_cache_coherent_uma: bool
+0033: 
+0034: 
+0035: @dataclass(frozen=True, slots=True)
+0036: class CapabilitySnapshot:
+0037:     """Resolved capability mode and the signals that produced it."""
+0038: 
+0039:     mode: CapabilityMode
+0040:     signals: CapabilitySignals
+0041:     reason_code: str
+0042: 
+0043: 
+0044: class CapabilityProbe(Protocol):
+0045:     """Protocol for pluggable capability probing."""
+0046: 
+0047:     def probe(self) -> CapabilitySignals:
+0048:         """Return the current hardware capability signals."""
+0049: 
+0050: 
+0051: def resolve_capability_mode(signals: CapabilitySignals) -> CapabilitySnapshot:
+0052:     """Map raw hardware signals to a deterministic runtime capability mode."""
+0053: 
+0054:     if not signals.supports_runtime:
+0055:         return CapabilitySnapshot(
+0056:             mode=CapabilityMode.UNSUPPORTED,
+0057:             signals=signals,
+0058:             reason_code="CAPABILITY_UNSUPPORTED_RUNTIME",
+0059:         )
+0060: 
+0061:     if signals.is_cache_coherent_uma:
+0062:         return CapabilitySnapshot(
+0063:             mode=CapabilityMode.CACHE_COHERENT_UMA,
+0064:             signals=signals,
+0065:             reason_code="CAPABILITY_CACHE_COHERENT_UMA",
+0066:         )
+0067: 
+0068:     if signals.is_uma:
+0069:         return CapabilitySnapshot(
+0070:             mode=CapabilityMode.UMA,
+0071:             signals=signals,
+0072:             reason_code="CAPABILITY_UMA",
+0073:         )
+0074: 
+0075:     if signals.has_discrete_gpu:
+0076:         return CapabilitySnapshot(
+0077:             mode=CapabilityMode.NUMA_DGPU,
+0078:             signals=signals,
+0079:             reason_code="CAPABILITY_NUMA_DGPU",
+0080:         )
+0081: 
+0082:     return CapabilitySnapshot(
+0083:         mode=CapabilityMode.UNSUPPORTED,
+0084:         signals=signals,
+0085:         reason_code="CAPABILITY_NO_SUPPORTED_GPU",
+0086:     )
+0087: 
+0088: 
+0089: def probe_capability_mode(probe: CapabilityProbe) -> CapabilitySnapshot:
+0090:     """Convenience helper that resolves a probe into a capability snapshot."""
+0091: 
+0092:     return resolve_capability_mode(probe.probe())

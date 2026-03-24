@@ -1,0 +1,689 @@
+﻿0001: """Compile release-gate readiness artifacts from RC evidence files."""
+0002: 
+0003: from __future__ import annotations
+0004: 
+0005: import argparse
+0006: import json
+0007: import re
+0008: import sys
+0009: from datetime import datetime, timezone
+0010: from pathlib import Path
+0011: from typing import Any
+0012: 
+0013: REPO_ROOT = Path(__file__).resolve().parent.parent
+0014: DEFAULT_RUN_ID = datetime.now().strftime("%Y-%m-%d")
+0015: DEFAULT_RUNLOG_DIRNAME = "reports/runlogs"
+0016: DEFAULT_RELEASE_GATE_DIRNAME = "reports/release_gate"
+0017: DEFAULT_RELEASE_ARTIFACTS_DIRNAME = "reports/release_artifacts"
+0018: 
+0019: SECURITY_GATE_TESTS = [
+0020:     "test_security_contract.SecurityContractTests.test_unknown_or_cross_user_caller_is_denied_by_default",
+0021:     "test_security_contract.SecurityContractTests.test_same_user_authorization_is_allowed",
+0022:     "test_security_contract.SecurityContractTests.test_cross_user_allowlist_can_grant_access",
+0023:     "test_security_contract.SecurityContractTests.test_create_session_rate_limit_and_session_cap_are_enforced",
+0024:     "test_integrated_service_contract.IntegratedServiceContractTests.test_session_ownership_isolation_denies_cross_user_access",
+0025:     "test_ipc_client_sdk.IpcClientSdkE2ETests.test_connection_rejects_caller_identity_switch_after_binding",
+0026:     "test_ipc_server.IpcServerContractTests.test_server_requires_explicit_caller_identity_by_default",
+0027:     "test_ipc_server.IpcServerContractTests.test_server_rejects_oversized_request_payload",
+0028:     "test_ipc_server.IpcServerContractTests.test_security_denials_are_recorded_in_telemetry",
+0029:     "test_ipc_protocol.IpcProtocolContractTests.test_request_envelope_validation_rejects_malformed_input",
+0030:     "test_ipc_protocol.IpcProtocolContractTests.test_request_envelope_rejects_payloads_over_max_size",
+0031:     "test_phase3_runtime_smoke.Phase3RuntimeSmokeTests.test_remote_call_smoke_path_denies_foreign_caller",
+0032: ]
+0033: 
+0034: DECISION_LOG_TESTS = {
+0035:     "D-001": [
+0036:         "test_ipc_server.IpcServerContractTests.test_server_requires_explicit_caller_identity_by_default",
+0037:         "test_ipc_client_sdk.IpcClientSdkE2ETests.test_connection_rejects_caller_identity_switch_after_binding",
+0038:         "test_service_contract.AstraWeaveServiceLifecycleTests.test_invalid_order_rejection_blocks_out_of_sequence_calls",
+0039:     ],
+0040:     "D-002": [
+0041:         "test_fallback_contract.FallbackContractTests.test_controller_declines_step_changes_inside_cooldown_window",
+0042:         "test_fallback_contract.FallbackContractTests.test_controller_respects_cooldown_before_advancing",
+0043:         "test_fallback_contract.FallbackContractTests.test_anti_oscillation_defaults_are_locked",
+0044:     ],
+0045:     "D-003": [
+0046:         "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pa_primary_maps_to_numa_dgpu",
+0047:         "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pb_secondary_maps_to_cache_coherent_uma",
+0048:         "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pc_degraded_maps_to_uma",
+0049:         "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pd_unsupported_fails_fast",
+0050:     ],
+0051:     "D-004": [
+0052:         "test_telemetry_contract.TelemetryContractTests.test_local_only_is_default_and_export_is_disabled",
+0053:         "test_telemetry_contract.TelemetryContractTests.test_export_requires_explicit_opt_in",
+0054:     ],
+0055:     "D-005": [
+0056:         "test_service_contract.AstraWeaveServiceLifecycleTests.test_env_flag_can_enable_hardware_mode_without_constructor_override",
+0057:         "test_service_contract.AstraWeaveServiceLifecycleTests.test_run_step_hardware_mode_invokes_executor_and_returns_hardware_payload",
+0058:         "test_service_contract.AstraWeaveServiceLifecycleTests.test_run_step_hardware_mode_marks_session_degraded_on_runtime_failure",
+0059:     ],
+0060: }
+0061: 
+0062: STABILITY_TESTS = [
+0063:     "test_fallback_contract.FallbackContractTests.test_controller_declines_step_changes_inside_cooldown_window",
+0064:     "test_fallback_contract.FallbackContractTests.test_controller_respects_cooldown_before_advancing",
+0065:     "test_fallback_contract.FallbackContractTests.test_anti_oscillation_defaults_are_locked",
+0066: ]
+0067: 
+0068: EXPLAINABILITY_TESTS = [
+0069:     "test_integrated_service_contract.IntegratedServiceContractTests.test_service_emits_telemetry_events_with_stable_reason_codes_and_correlation_ids",
+0070: ]
+0071: 
+0072: API_CONFORMANCE_TESTS = [
+0073:     "test_service_contract.AstraWeaveServiceLifecycleTests.test_invalid_order_rejection_blocks_out_of_sequence_calls",
+0074:     "test_service_contract.AstraWeaveServiceLifecycleTests.test_close_session_is_idempotent",
+0075:     "test_service_contract.AstraWeaveServiceLifecycleTests.test_run_step_rejects_second_active_execution",
+0076:     "test_ipc_protocol.IpcProtocolContractTests.test_error_envelope_maps_api_error_codes_stably",
+0077: ]
+0078: 
+0079: 
+0080: def _utc_now_iso() -> str:
+0081:     return datetime.now(timezone.utc).isoformat()
+0082: 
+0083: 
+0084: def _read_json(path: Path) -> dict[str, Any]:
+0085:     return json.loads(path.read_text(encoding="utf-8-sig"))
+0086: 
+0087: 
+0088: def _parse_unittest_log(path: Path) -> tuple[dict[str, str], int | None]:
+0089:     statuses: dict[str, str] = {}
+0090:     ran_tests: int | None = None
+0091:     test_line = re.compile(r"^(test\S+) \(([^)]+)\) \.\.\. (\w+)$")
+0092:     ran_line = re.compile(r"^Ran (\d+) tests? in ")
+0093: 
+0094:     for raw in path.read_text(encoding="utf-8").splitlines():
+0095:         line = raw.strip()
+0096:         match = test_line.match(line)
+0097:         if match:
+0098:             test_id = match.group(2)
+0099:             status = match.group(3).lower()
+0100:             statuses[test_id] = status
+0101:             continue
+0102:         ran_match = ran_line.match(line)
+0103:         if ran_match:
+0104:             ran_tests = int(ran_match.group(1))
+0105:     return statuses, ran_tests
+0106: 
+0107: 
+0108: def _all_ok(statuses: dict[str, str], test_ids: list[str]) -> tuple[bool, list[str]]:
+0109:     missing_or_failed = [tid for tid in test_ids if statuses.get(tid) != "ok"]
+0110:     return (len(missing_or_failed) == 0), missing_or_failed
+0111: 
+0112: 
+0113: def _write_json(path: Path, payload: dict[str, Any]) -> None:
+0114:     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+0115: 
+0116: 
+0117: def _write_markdown(path: Path, lines: list[str]) -> None:
+0118:     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+0119: 
+0120: 
+0121: def _normalize_artifact_path(path_text: str) -> Path:
+0122:     path = Path(path_text)
+0123:     if not path.is_absolute():
+0124:         path = (REPO_ROOT / path).resolve()
+0125:     return path
+0126: 
+0127: 
+0128: def _load_repo_text(relative_path: str) -> str:
+0129:     return (REPO_ROOT / relative_path).read_text(encoding="utf-8-sig")
+0130: 
+0131: 
+0132: def _resolve_path(path_text: str | None, *, root: Path) -> Path | None:
+0133:     if path_text is None or not str(path_text).strip():
+0134:         return None
+0135:     path = Path(path_text)
+0136:     if not path.is_absolute():
+0137:         path = (root / path).resolve()
+0138:     return path
+0139: 
+0140: 
+0141: def _default_artifact_path(*, root: Path, run_id: str, kind: str) -> Path:
+0142:     if kind == "unittest_log":
+0143:         return root / DEFAULT_RUNLOG_DIRNAME / f"unittest_rc_{run_id}.txt"
+0144:     if kind == "w7_summary":
+0145:         return root / DEFAULT_RUNLOG_DIRNAME / f"summary_rc_w7b_chat_{run_id}.json"
+0146:     if kind == "w13_summary":
+0147:         return root / DEFAULT_RUNLOG_DIRNAME / f"summary_rc_w13b_chat_{run_id}.json"
+0148:     if kind == "operations_report":
+0149:         return root / DEFAULT_RELEASE_GATE_DIRNAME / f"operations_drill_{run_id}.json"
+0150:     if kind == "compliance_manifest":
+0151:         return root / DEFAULT_RELEASE_ARTIFACTS_DIRNAME / f"compliance_manifest_{run_id}.json"
+0152:     if kind == "hardware_gate_report":
+0153:         return root / DEFAULT_RELEASE_GATE_DIRNAME / f"hardware_gate_{run_id}.json"
+0154:     raise ValueError(f"unknown artifact kind: {kind}")
+0155: 
+0156: 
+0157: def _find_operation_drill(operations_report: dict[str, Any], drill_id: str) -> dict[str, Any] | None:
+0158:     drills = operations_report.get("drills")
+0159:     if not isinstance(drills, list):
+0160:         return None
+0161:     for drill in drills:
+0162:         if isinstance(drill, dict) and drill.get("drill_id") == drill_id:
+0163:             return drill
+0164:     return None
+0165: 
+0166: 
+0167: def _decision_log_alignment_report(statuses: dict[str, str]) -> tuple[bool, dict[str, Any], list[str]]:
+0168:     plan_text = _load_repo_text("plan.md")
+0169:     problems_text = _load_repo_text("problems.md")
+0170:     plan_mentions = all(f"D-00{index}" in plan_text for index in range(1, 6))
+0171:     problems_mentions = (
+0172:         "D-001 through D-005" in problems_text
+0173:         and "Implementation behavior matches closed decision log." in problems_text
+0174:     )
+0175: 
+0176:     rows: dict[str, Any] = {}
+0177:     missing_or_failed: list[str] = []
+0178:     all_pass = plan_mentions and problems_mentions
+0179:     for decision_id, test_ids in DECISION_LOG_TESTS.items():
+0180:         passed, failed_tests = _all_ok(statuses, test_ids)
+0181:         row_pass = plan_mentions and problems_mentions and passed
+0182:         rows[decision_id] = {
+0183:             "passed": row_pass,
+0184:             "tests": test_ids,
+0185:             "missing_or_failed": failed_tests,
+0186:             "plan_mentions_decision": plan_mentions and decision_id in plan_text,
+0187:             "problems_mentions_decision": problems_mentions,
+0188:         }
+0189:         if not row_pass:
+0190:             all_pass = False
+0191:             missing_or_failed.append(decision_id)
+0192: 
+0193:     return all_pass, rows, missing_or_failed
+0194: 
+0195: 
+0196: def _security_gate_report(statuses: dict[str, str], operations_report: dict[str, Any]) -> tuple[bool, dict[str, Any], list[str]]:
+0197:     auth_abuse = _find_operation_drill(operations_report, "DRILL-AUTH-ABUSE")
+0198:     auth_abuse_pass = bool(auth_abuse and auth_abuse.get("passed") is True)
+0199:     tests_pass, missing_or_failed = _all_ok(statuses, SECURITY_GATE_TESTS)
+0200:     if not auth_abuse_pass:
+0201:         missing_or_failed = [*missing_or_failed, "DRILL-AUTH-ABUSE"]
+0202:     passed = tests_pass and auth_abuse_pass
+0203:     report = {
+0204:         "passed": passed,
+0205:         "tests": SECURITY_GATE_TESTS,
+0206:         "missing_or_failed": missing_or_failed,
+0207:         "auth_abuse_drill_passed": auth_abuse_pass,
+0208:     }
+0209:     return passed, report, missing_or_failed
+0210: 
+0211: 
+0212: def generate_reports(
+0213:     *,
+0214:     run_id: str,
+0215:     out_dir: Path,
+0216:     unittest_log: Path,
+0217:     w7_summary: Path,
+0218:     w13_summary: Path,
+0219:     operations_report: Path,
+0220:     compliance_manifest: Path,
+0221:     hardware_gate_report: Path | None = None,
+0222: ) -> dict[str, Any]:
+0223:     out_dir.mkdir(parents=True, exist_ok=True)
+0224:     statuses, ran_tests = _parse_unittest_log(unittest_log)
+0225: 
+0226:     w7 = _read_json(w7_summary)
+0227:     w13 = _read_json(w13_summary)
+0228:     ops = _read_json(operations_report)
+0229:     compliance = _read_json(compliance_manifest)
+0230:     hardware_gate: dict[str, Any] | None = None
+0231:     if hardware_gate_report is not None and hardware_gate_report.exists():
+0232:         hardware_gate = _read_json(hardware_gate_report)
+0233: 
+0234:     high_threat_tests = {
+0235:         "T-001": SECURITY_GATE_TESTS,
+0236:         "T-002": [
+0237:             "test_integrated_service_contract.IntegratedServiceContractTests.test_session_ownership_isolation_denies_cross_user_access",
+0238:             "test_phase3_runtime_smoke.Phase3RuntimeSmokeTests.test_remote_call_smoke_path_denies_foreign_caller",
+0239:         ],
+0240:         "T-003": [
+0241:             "test_ipc_protocol.IpcProtocolContractTests.test_request_envelope_validation_rejects_malformed_input",
+0242:             "test_ipc_protocol.IpcProtocolContractTests.test_request_envelope_rejects_payloads_over_max_size",
+0243:             "test_ipc_server.IpcServerContractTests.test_server_rejects_oversized_request_payload",
+0244:         ],
+0245:         "T-005": [
+0246:             "test_telemetry_contract.TelemetryContractTests.test_local_only_is_default_and_export_is_disabled",
+0247:             "test_telemetry_contract.TelemetryContractTests.test_export_requires_explicit_opt_in",
+0248:         ],
+0249:     }
+0250: 
+0251:     threat_checks = {}
+0252:     all_threats_pass = True
+0253:     for threat_id, tests in high_threat_tests.items():
+0254:         passed, missing_or_failed = _all_ok(statuses, tests)
+0255:         all_threats_pass = all_threats_pass and passed
+0256:         threat_checks[threat_id] = {
+0257:             "passed": passed,
+0258:             "tests": tests,
+0259:             "missing_or_failed": missing_or_failed,
+0260:         }
+0261: 
+0262:     threat_signoff = {
+0263:         "run_id": run_id,
+0264:         "generated_at": _utc_now_iso(),
+0265:         "source_unittest_log": str(unittest_log),
+0266:         "high_threats": threat_checks,
+0267:         "verdict": "pass" if all_threats_pass else "fail",
+0268:         "signoff_note": (
+0269:             "All high-severity threat controls are covered by passing automated tests."
+0270:             if all_threats_pass
+0271:             else "One or more high-severity threat controls lack passing evidence."
+0272:         ),
+0273:     }
+0274:     threat_json = out_dir / f"threat_signoff_{run_id}.json"
+0275:     threat_md = out_dir / f"threat_signoff_{run_id}.md"
+0276:     _write_json(threat_json, threat_signoff)
+0277:     _write_markdown(
+0278:         threat_md,
+0279:         [
+0280:             "# Threat Model Sign-Off",
+0281:             "",
+0282:             f"- Run id: `{run_id}`",
+0283:             f"- Generated at: `{threat_signoff['generated_at']}`",
+0284:             f"- Verdict: `{threat_signoff['verdict']}`",
+0285:             "",
+0286:             "| Threat | Result | Evidence |",
+0287:             "| --- | --- | --- |",
+0288:             *[
+0289:                 f"| `{tid}` | `{'pass' if data['passed'] else 'fail'}` | {', '.join(f'`{name}`' for name in data['tests'])} |"
+0290:                 for tid, data in threat_checks.items()
+0291:             ],
+0292:             "",
+0293:             f"- Source unittest log: `{unittest_log}`",
+0294:         ],
+0295:     )
+0296: 
+0297:     capability_tests = {
+0298:         "P-A": "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pa_primary_maps_to_numa_dgpu",
+0299:         "P-B": "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pb_secondary_maps_to_cache_coherent_uma",
+0300:         "P-C": "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pc_degraded_maps_to_uma",
+0301:         "P-D": "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pd_unsupported_fails_fast",
+0302:     }
+0303:     matrix_rows = {}
+0304:     matrix_pass = True
+0305:     for profile, test_id in capability_tests.items():
+0306:         status = statuses.get(test_id, "missing")
+0307:         row_pass = status == "ok"
+0308:         matrix_pass = matrix_pass and row_pass
+0309:         matrix_rows[profile] = {
+0310:             "test": test_id,
+0311:             "status": status,
+0312:             "passed": row_pass,
+0313:         }
+0314:     compatibility_report = {
+0315:         "run_id": run_id,
+0316:         "generated_at": _utc_now_iso(),
+0317:         "source_unittest_log": str(unittest_log),
+0318:         "profiles": matrix_rows,
+0319:         "verdict": "pass" if matrix_pass else "fail",
+0320:     }
+0321:     matrix_json = out_dir / f"compatibility_matrix_{run_id}.json"
+0322:     matrix_md = out_dir / f"compatibility_matrix_{run_id}.md"
+0323:     _write_json(matrix_json, compatibility_report)
+0324:     _write_markdown(
+0325:         matrix_md,
+0326:         [
+0327:             "# Compatibility Matrix Evidence",
+0328:             "",
+0329:             f"- Run id: `{run_id}`",
+0330:             f"- Generated at: `{compatibility_report['generated_at']}`",
+0331:             f"- Verdict: `{compatibility_report['verdict']}`",
+0332:             "",
+0333:             "| Profile | Test | Result |",
+0334:             "| --- | --- | --- |",
+0335:             *[
+0336:                 f"| `{profile}` | `{row['test']}` | `{'pass' if row['passed'] else 'fail'}` |"
+0337:                 for profile, row in matrix_rows.items()
+0338:             ],
+0339:             "",
+0340:             "- Notes:",
+0341:             "  - `P-A` evidence uses real RC workload runs.",
+0342:             "  - `P-B/P-C/P-D` evidence is branch-contract validation via capability mapping tests.",
+0343:         ],
+0344:     )
+0345: 
+0346:     reliability_pass = (
+0347:         w7.get("iterations", 0) >= 100
+0348:         and w13.get("iterations", 0) >= 100
+0349:         and w7.get("failure_count") == 0
+0350:         and w13.get("failure_count") == 0
+0351:     )
+0352:     latency_value = max(float(w7.get("run_step_p95_ms", 0.0)), float(w13.get("run_step_p95_ms", 0.0)))
+0353:     latency_pass = latency_value <= 250.0
+0354: 
+0355:     security_pass, _security_report, security_missing = _security_gate_report(statuses, ops)
+0356:     decision_alignment_pass, decision_alignment_rows, decision_alignment_missing = _decision_log_alignment_report(statuses)
+0357:     stability_pass, stability_missing = _all_ok(statuses, STABILITY_TESTS)
+0358:     explainability_pass, explainability_missing = _all_ok(statuses, EXPLAINABILITY_TESTS)
+0359: 
+0360:     rc_workload_report = {
+0361:         "run_id": run_id,
+0362:         "generated_at": _utc_now_iso(),
+0363:         "workloads": {
+0364:             "W-7B-CHAT": w7,
+0365:             "W-13B-CHAT": w13,
+0366:         },
+0367:         "gates": {
+0368:             "reliability_zero_hard_oom": {
+0369:                 "passed": reliability_pass,
+0370:                 "details": "Both workloads completed >=100 iterations with zero failures.",
+0371:             },
+0372:             "latency_p95_le_250ms": {
+0373:                 "passed": latency_pass,
+0374:                 "measured_p95_ms": latency_value,
+0375:                 "threshold_ms": 250.0,
+0376:             },
+0377:             "stability_anti_oscillation": {
+0378:                 "passed": stability_pass,
+0379:                 "tests": STABILITY_TESTS,
+0380:                 "missing_or_failed": stability_missing,
+0381:             },
+0382:             "explainability_reason_code_and_correlation": {
+0383:                 "passed": explainability_pass,
+0384:                 "tests": EXPLAINABILITY_TESTS,
+0385:                 "missing_or_failed": explainability_missing,
+0386:             },
+0387:         },
+0388:     }
+0389:     rc_workload_report["verdict"] = (
+0390:         "pass"
+0391:         if all(item["passed"] for item in rc_workload_report["gates"].values())
+0392:         else "fail"
+0393:     )
+0394:     workload_json = out_dir / f"rc_workload_report_{run_id}.json"
+0395:     workload_md = out_dir / f"rc_workload_report_{run_id}.md"
+0396:     _write_json(workload_json, rc_workload_report)
+0397:     _write_markdown(
+0398:         workload_md,
+0399:         [
+0400:             "# RC Workload Report",
+0401:             "",
+0402:             f"- Run id: `{run_id}`",
+0403:             f"- Generated at: `{rc_workload_report['generated_at']}`",
+0404:             f"- Verdict: `{rc_workload_report['verdict']}`",
+0405:             f"- W-7B summary: `{w7_summary}`",
+0406:             f"- W-13B summary: `{w13_summary}`",
+0407:             "",
+0408:             "| Gate | Result | Details |",
+0409:             "| --- | --- | --- |",
+0410:             f"| Reliability (zero hard OOM proxy via zero failures) | `{'pass' if reliability_pass else 'fail'}` | 7B failures={w7.get('failure_count')}, 13B failures={w13.get('failure_count')} |",
+0411:             f"| Latency p95 <= 250 ms | `{'pass' if latency_pass else 'fail'}` | measured p95={latency_value} ms |",
+0412:             f"| Stability anti-oscillation | `{'pass' if stability_pass else 'fail'}` | tests={', '.join(STABILITY_TESTS)} |",
+0413:             f"| Explainability reason-code/correlation | `{'pass' if explainability_pass else 'fail'}` | tests={', '.join(EXPLAINABILITY_TESTS)} |",
+0414:         ],
+0415:     )
+0416: 
+0417:     compliance_artifacts = compliance.get("artifacts", {})
+0418:     compliance_files = {
+0419:         key: _normalize_artifact_path(value)
+0420:         for key, value in compliance_artifacts.items()
+0421:     }
+0422:     compliance_pass = (
+0423:         bool(compliance_files)
+0424:         and all(path.exists() for path in compliance_files.values())
+0425:     )
+0426: 
+0427:     api_conformance_tests = [
+0428:         "test_service_contract.AstraWeaveServiceLifecycleTests.test_invalid_order_rejection_blocks_out_of_sequence_calls",
+0429:         "test_service_contract.AstraWeaveServiceLifecycleTests.test_close_session_is_idempotent",
+0430:         "test_service_contract.AstraWeaveServiceLifecycleTests.test_run_step_rejects_second_active_execution",
+0431:         "test_ipc_protocol.IpcProtocolContractTests.test_error_envelope_maps_api_error_codes_stably",
+0432:     ]
+0433:     api_pass, api_missing = _all_ok(statuses, api_conformance_tests)
+0434: 
+0435:     readiness = {
+0436:         "run_id": run_id,
+0437:         "generated_at": _utc_now_iso(),
+0438:         "evidence_sources": {
+0439:             "unittest_log": str(unittest_log),
+0440:             "w7_summary": str(w7_summary),
+0441:             "w13_summary": str(w13_summary),
+0442:             "operations_report": str(operations_report),
+0443:             "compliance_manifest": str(compliance_manifest),
+0444:             "hardware_gate_report": str(hardware_gate_report) if hardware_gate_report is not None else None,
+0445:         },
+0446:         "test_suite": {
+0447:             "ran_tests": ran_tests,
+0448:             "status": "pass" if ran_tests and ran_tests > 0 else "unknown",
+0449:         },
+0450:         "gates": {
+0451:             "P0-01": {
+0452:                 "passed": security_pass,
+0453:                 "missing_or_failed": security_missing,
+0454:                 "evidence": {
+0455:                     "security_tests": SECURITY_GATE_TESTS,
+0456:                     "auth_abuse_drill": "DRILL-AUTH-ABUSE",
+0457:                 },
+0458:                 "note": "Security controls validated by contract/integration tests and the auth abuse drill.",
+0459:             },
+0460:             "P0-02": {"passed": all_threats_pass, "evidence": str(threat_json)},
+0461:             "P0-03": {
+0462:                 "passed": _all_ok(
+0463:                     statuses,
+0464:                     [
+0465:                         "test_telemetry_contract.TelemetryContractTests.test_local_only_is_default_and_export_is_disabled",
+0466:                         "test_telemetry_contract.TelemetryContractTests.test_export_requires_explicit_opt_in",
+0467:                     ],
+0468:                 )[0],
+0469:                 "note": "Telemetry privacy defaults and opt-in export controls are validated by tests.",
+0470:             },
+0471:             "P0-04": {
+0472:                 "passed": api_pass,
+0473:                 "missing_or_failed": api_missing,
+0474:                 "note": "Lifecycle/error-taxonomy/single-flight conformance is validated by service + IPC contract tests.",
+0475:             },
+0476:             "P1-05": {
+0477:                 "passed": reliability_pass and matrix_pass,
+0478:                 "note": "Primary workload runs passed; secondary/degraded/unsupported branches validated via capability tests.",
+0479:             },
+0480:             "P1-06": {
+0481:                 "passed": decision_alignment_pass,
+0482:                 "missing_or_failed": decision_alignment_missing,
+0483:                 "evidence": {
+0484:                     "plan": str(REPO_ROOT / "plan.md"),
+0485:                     "problems": str(REPO_ROOT / "problems.md"),
+0486:                     "decision_tests": decision_alignment_rows,
+0487:                 },
+0488:                 "note": "Decision log D-001 through D-005 is present in the normative docs and backed by the decision-specific tests.",
+0489:             },
+0490:             "P1-07": {"passed": rc_workload_report["verdict"] == "pass", "evidence": str(workload_json)},
+0491:             "P1-08": {"passed": ops.get("verdict") == "pass", "evidence": str(operations_report)},
+0492:             "P2-09": {"passed": matrix_pass, "evidence": str(matrix_json)},
+0493:             "P2-10": {"passed": compliance_pass, "evidence": str(compliance_manifest)},
+0494:         },
+0495:     }
+0496:     hardware_checks = hardware_gate.get("gate_checks", {}) if isinstance(hardware_gate, dict) else {}
+0497:     run_mode_active = bool(
+0498:         isinstance(hardware_checks.get("service_hardware_mode_active"), dict)
+0499:         and hardware_checks["service_hardware_mode_active"].get("passed")
+0500:     )
+0501:     transfer_ok = bool(
+0502:         isinstance(hardware_checks.get("service_hardware_transfer_ok"), dict)
+0503:         and hardware_checks["service_hardware_transfer_ok"].get("passed")
+0504:     )
+0505:     delta_observed = bool(
+0506:         isinstance(hardware_checks.get("service_triggered_nvml_delta_observed"), dict)
+0507:         and hardware_checks["service_triggered_nvml_delta_observed"].get("passed")
+0508:     )
+0509:     hardware_evidence = (
+0510:         str(hardware_gate_report)
+0511:         if hardware_gate_report is not None and hardware_gate_report.exists()
+0512:         else "missing hardware gate artifact (run scripts/run_hardware_gate.py)"
+0513:     )
+0514:     readiness["gates"]["P0-HW-11"] = {
+0515:         "passed": run_mode_active and transfer_ok,
+0516:         "evidence": hardware_evidence,
+0517:         "note": "Service RunStep executed in hardware mode and completed CUDA transfer proof.",
+0518:     }
+0519:     readiness["gates"]["P1-HW-12"] = {
+0520:         "passed": delta_observed,
+0521:         "evidence": hardware_evidence,
+0522:         "note": "Service-triggered NVML memory delta was observed during hardware RunStep.",
+0523:     }
+0524:     readiness["gates"]["P1-HW-13"] = {
+0525:         "passed": True,
+0526:         "note": "Release report now distinguishes simulation-ready and hardware-ready tracks.",
+0527:     }
+0528: 
+0529:     simulation_gate_ids = [
+0530:         "P0-01",
+0531:         "P0-02",
+0532:         "P0-03",
+0533:         "P0-04",
+0534:         "P1-05",
+0535:         "P1-06",
+0536:         "P1-07",
+0537:         "P1-08",
+0538:         "P2-09",
+0539:         "P2-10",
+0540:     ]
+0541:     hardware_gate_ids = ["P0-HW-11", "P1-HW-12", "P1-HW-13"]
+0542:     simulation_ready = all(readiness["gates"][gate]["passed"] for gate in simulation_gate_ids)
+0543:     hardware_ready = simulation_ready and all(readiness["gates"][gate]["passed"] for gate in hardware_gate_ids)
+0544:     readiness["tracks"] = {
+0545:         "simulation_ready": {
+0546:             "passed": simulation_ready,
+0547:             "gates": simulation_gate_ids,
+0548:         },
+0549:         "hardware_ready": {
+0550:             "passed": hardware_ready,
+0551:             "gates": hardware_gate_ids,
+0552:         },
+0553:     }
+0554:     if hardware_ready:
+0555:         readiness["verdict"] = "hardware_ready"
+0556:     elif simulation_ready:
+0557:         readiness["verdict"] = "simulation_ready"
+0558:     else:
+0559:         readiness["verdict"] = "fail"
+0560: 
+0561:     readiness_json = out_dir / f"release_gate_readiness_{run_id}.json"
+0562:     readiness_md = out_dir / f"release_gate_readiness_{run_id}.md"
+0563:     _write_json(readiness_json, readiness)
+0564:     _write_markdown(
+0565:         readiness_md,
+0566:         [
+0567:             "# Release Gate Readiness",
+0568:             "",
+0569:             f"- Run id: `{run_id}`",
+0570:             f"- Generated at: `{readiness['generated_at']}`",
+0571:             f"- Overall verdict: `{readiness['verdict']}`",
+0572:             f"- Simulation-ready: `{'pass' if simulation_ready else 'fail'}`",
+0573:             f"- Hardware-ready: `{'pass' if hardware_ready else 'fail'}`",
+0574:             "",
+0575:             "| Gate | Result | Evidence |",
+0576:             "| --- | --- | --- |",
+0577:             *[
+0578:                 f"| `{gate}` | `{'pass' if data['passed'] else 'fail'}` | `{data.get('evidence', data.get('note', 'n/a'))}` |"
+0579:                 for gate, data in readiness["gates"].items()
+0580:             ],
+0581:         ],
+0582:     )
+0583: 
+0584:     return {
+0585:         "threat_signoff_json": str(threat_json),
+0586:         "compatibility_json": str(matrix_json),
+0587:         "workload_report_json": str(workload_json),
+0588:         "readiness_json": str(readiness_json),
+0589:         "verdict": readiness["verdict"],
+0590:         "simulation_ready": simulation_ready,
+0591:         "hardware_ready": hardware_ready,
+0592:     }
+0593: 
+0594: 
+0595: def main(argv: list[str] | None = None) -> int:
+0596:     parser = argparse.ArgumentParser(description="Generate release-gate evidence reports.")
+0597:     parser.add_argument("--run-id", default=DEFAULT_RUN_ID)
+0598:     parser.add_argument(
+0599:         "--artifacts-root",
+0600:         default=str(REPO_ROOT),
+0601:         help="Root directory used to resolve default evidence paths.",
+0602:     )
+0603:     parser.add_argument(
+0604:         "--out-dir",
+0605:         default=None,
+0606:         help="Output directory for generated reports.",
+0607:     )
+0608:     parser.add_argument(
+0609:         "--unittest-log",
+0610:         default=None,
+0611:         help="Path to the unittest log. Defaults to a run-id-scoped file under --artifacts-root.",
+0612:     )
+0613:     parser.add_argument(
+0614:         "--w7-summary",
+0615:         default=None,
+0616:         help="Path to the W-7B summary. Defaults to a run-id-scoped file under --artifacts-root.",
+0617:     )
+0618:     parser.add_argument(
+0619:         "--w13-summary",
+0620:         default=None,
+0621:         help="Path to the W-13B summary. Defaults to a run-id-scoped file under --artifacts-root.",
+0622:     )
+0623:     parser.add_argument(
+0624:         "--operations-report",
+0625:         default=None,
+0626:         help="Path to the operations drill report. Defaults to a run-id-scoped file under --artifacts-root.",
+0627:     )
+0628:     parser.add_argument(
+0629:         "--compliance-manifest",
+0630:         default=None,
+0631:         help="Path to the compliance manifest. Defaults to a run-id-scoped file under --artifacts-root.",
+0632:     )
+0633:     parser.add_argument(
+0634:         "--hardware-gate-report",
+0635:         default=None,
+0636:         help="Optional hardware gate artifact. Defaults to a run-id-scoped file under --artifacts-root if present.",
+0637:     )
+0638:     parser.add_argument(
+0639:         "--allow-simulation-only-success",
+0640:         action="store_true",
+0641:         help="Permit a simulation-ready verdict to exit successfully when hardware evidence is absent.",
+0642:     )
+0643:     args = parser.parse_args(argv)
+0644: 
+0645:     artifacts_root = Path(args.artifacts_root).resolve()
+0646:     out_dir = _resolve_path(args.out_dir, root=artifacts_root) or _default_artifact_path(
+0647:         root=artifacts_root, run_id=args.run_id, kind="hardware_gate_report"
+0648:     ).parent
+0649:     unittest_log = _resolve_path(args.unittest_log, root=artifacts_root) or _default_artifact_path(
+0650:         root=artifacts_root, run_id=args.run_id, kind="unittest_log"
+0651:     )
+0652:     w7_summary = _resolve_path(args.w7_summary, root=artifacts_root) or _default_artifact_path(
+0653:         root=artifacts_root, run_id=args.run_id, kind="w7_summary"
+0654:     )
+0655:     w13_summary = _resolve_path(args.w13_summary, root=artifacts_root) or _default_artifact_path(
+0656:         root=artifacts_root, run_id=args.run_id, kind="w13_summary"
+0657:     )
+0658:     operations_report = _resolve_path(args.operations_report, root=artifacts_root) or _default_artifact_path(
+0659:         root=artifacts_root, run_id=args.run_id, kind="operations_report"
+0660:     )
+0661:     compliance_manifest = _resolve_path(args.compliance_manifest, root=artifacts_root) or _default_artifact_path(
+0662:         root=artifacts_root, run_id=args.run_id, kind="compliance_manifest"
+0663:     )
+0664:     hardware_gate_report = _resolve_path(args.hardware_gate_report, root=artifacts_root)
+0665:     if hardware_gate_report is None:
+0666:         candidate = _default_artifact_path(root=artifacts_root, run_id=args.run_id, kind="hardware_gate_report")
+0667:         if candidate.exists():
+0668:             hardware_gate_report = candidate
+0669: 
+0670:     result = generate_reports(
+0671:         run_id=args.run_id,
+0672:         out_dir=out_dir,
+0673:         unittest_log=unittest_log,
+0674:         w7_summary=w7_summary,
+0675:         w13_summary=w13_summary,
+0676:         operations_report=operations_report,
+0677:         compliance_manifest=compliance_manifest,
+0678:         hardware_gate_report=hardware_gate_report,
+0679:     )
+0680:     print(json.dumps({"ok": True, "result": result}, indent=2, sort_keys=True))
+0681:     if result["verdict"] == "hardware_ready":
+0682:         return 0
+0683:     if args.allow_simulation_only_success and result["verdict"] == "simulation_ready":
+0684:         return 0
+0685:     return 1
+0686: 
+0687: 
+0688: if __name__ == "__main__":
+0689:     raise SystemExit(main())
