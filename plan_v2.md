@@ -1,12 +1,13 @@
 # AstraWeave v1 Execution Plan (dGPU-First, Local-Only Telemetry)
 
 ## Summary
-- This plan integrates the latest repo analysis: the workspace is currently docs-only, and `problems.md` defines 10 release-blocking gaps.
+- This plan is an older execution draft and is retained for historical context.
+- The repo now includes both the normative docs and the current Python runtime/service prototype, while `problems.md` remains the hard-gate register.
 - v1 is locked to a **dGPU reliability-first primary path** (8 GB VRAM class), with **`CacheCoherentUMA` as a secondary optimized path**.
 - Primary objective: move from concept docs to a build-ready, release-gated spec and implementation sequence that closes all `P0` and `P1` gaps before code freeze.
 
 ## Implementation Changes
-- Create one normative spec baseline in [plan.md](/c:/Users/grzeg/Documents/Jito/testmarch24/unified_windows/plan.md) and treat [problems.md](/c:/Users/grzeg/Documents/Jito/testmarch24/unified_windows/problems.md) as hard release gates.
+- Keep [plan.md](/c:/Users/grzeg/Documents/Jito/testmarch24/unified_windows/plan.md) as the normative spec baseline and treat [problems.md](/c:/Users/grzeg/Documents/Jito/testmarch24/unified_windows/problems.md) as hard release gates.
 - Add a decision log in [plan.md](/c:/Users/grzeg/Documents/Jito/testmarch24/unified_windows/plan.md) that explicitly closes: policy boundary, tunability level, minimum hardware bar, telemetry surface.
 - Define service trust boundary and IPC contract: local-only IPC, same-user default access, default-deny for unknown callers, per-session isolation, per-client rate limiting.
 - Define a formal threat model: assets, actors, entrypoints, trust boundaries, abuse cases, mitigations, and release-blocking severity criteria.

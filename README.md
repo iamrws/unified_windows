@@ -1,10 +1,10 @@
-# AstraWeave (Docs-First v1 Spec Workspace)
+# AstraWeave (v1 Spec and Runtime Workspace)
 
 AstraWeave is a Windows user-mode service plus SDK that orchestrates RAM and VRAM as one logical pool for local LLM inference, with reliability-first behavior on 8 GB dGPU systems.
 
-This repository currently contains normative design and governance artifacts for v1.
+This repository contains the normative v1 spec, supporting governance docs, and the current Python runtime/service prototype.
 
-Phase 2 adds a local IPC transport layer plus SDK and CLI wrappers around the core service prototype.
+Phase 2 introduced the local IPC transport layer plus SDK and CLI wrappers around the core service prototype.
 
 ## Core Documents
 
@@ -41,11 +41,11 @@ There is also a real transfer proof script:
 - `scripts/cuda_transfer_poc.py` uses the CUDA Driver API (`nvcuda.dll`) through `ctypes` to perform a real host->device->host byte copy and verify integrity.
 - `scripts/run_hardware_gate.py` triggers hardware-mode `RunStep` in `AstraWeaveService` and checks for service-triggered NVML memory delta evidence.
 
-The service orchestration layer remains a prototype boundary for now:
+The service orchestration layer is still intentionally bounded:
 
-- service/session/tiering behavior is still modeled in-memory.
-- residency changes, fallback steps, and migration latency are deterministic simulation state.
-- no live tensor orchestration is wired into the service path yet.
+- service/session/tiering behavior remains in-process and deterministic.
+- residency changes, fallback steps, and migration latency are controlled by the Python runtime.
+- the hardware gate currently validates real transfer behavior, while full model-aware tensor orchestration remains a separate future milestone.
 
 ## Historical Inputs
 
