@@ -151,3 +151,9 @@ For an operator, success in this phase looks like:
 - and the output tells the truth about which part was handled by AstraWeave versus the local backend.
 
 That is the right bar for this phase.
+
+## Phase 5 Continuity
+
+Phase 4 proves the bridge. Phase 5 adds the large-model control layer for 14B+ workloads by making runtime profiles and backend tuning more explicit.
+
+The operator guide for that next step is in `docs/phase5-large-model-orchestration.md`.

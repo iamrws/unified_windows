@@ -375,6 +375,93 @@ class IpcClientSdkE2ETests(unittest.TestCase):
         self.assertEqual(bridge.calls[1][1]["runtime_profile_override"], "memory_saver")
         self.assertEqual(bridge.calls[1][1]["runtime_backend_options_override"], {"num_predict": 32})
 
+    def test_runtime_tuning_controls_apply_through_real_ipc_service_path(self) -> None:
+        captured: dict[str, object] = {}
+
+        class _CapturingRuntime:
+            backend_name = "simulation"
+
+            def load_model(
+                self,
+                model_name: str,
+                *,
+                runtime_profile: str | None = None,
+                backend_options: dict[str, object] | None = None,
+            ):
+                from astrawave.inference_runtime import InferenceModelBinding
+
+                captured["load_profile"] = runtime_profile
+                captured["load_options"] = dict(backend_options or {})
+                return InferenceModelBinding(
+                    backend="simulation",
+                    requested_model_name=model_name,
+                    resolved_model_name=model_name,
+                    metadata={},
+                )
+
+            def generate(
+                self,
+                model_name: str,
+                *,
+                prompt: str,
+                step_name: str,
+                max_tokens: int | None = None,
+                temperature: float | None = None,
+                system_prompt: str | None = None,
+                backend_options: dict[str, object] | None = None,
+            ) -> dict[str, object]:
+                captured["step_options"] = dict(backend_options or {})
+                return {
+                    "ok": True,
+                    "backend": "simulation",
+                    "model_name": model_name,
+                    "output_text": "ok",
+                }
+
+        service = AstraWeaveService(
+            inference_runtime_factory=lambda backend_name: _CapturingRuntime(),
+            security_guard=SecurityGuard(SecurityPolicy(service_owner_sid=self.owner.user_sid)),
+        )
+        server = AstraWeaveIpcServer(
+            service=service,
+            prefer_named_pipe=False,
+            host="127.0.0.1",
+            port=0,
+        )
+        server.start()
+        self.addCleanup(server.stop)
+        endpoint = _endpoint_to_uri(server.endpoint)
+        client = _connect_client(endpoint, self.owner)
+        self.addCleanup(client.close)
+
+        session_id = client.CreateSession(self.owner)
+        client.LoadModel(
+            session_id,
+            "demo-model",
+            self.owner,
+            runtime_profile="vram_constrained",
+            runtime_backend_options={"num_ctx": 4096, "num_batch": 2},
+        )
+        client.RunStep(
+            session_id,
+            "decode",
+            self.owner,
+            prompt="hello",
+            runtime_profile_override="memory_saver",
+            runtime_backend_options_override={"num_ctx": 1024},
+        )
+
+        self.assertEqual(captured["load_profile"], "vram_constrained")
+        load_options = captured["load_options"]
+        self.assertIsInstance(load_options, dict)
+        self.assertEqual(load_options["num_ctx"], 4096)
+        self.assertEqual(load_options["num_batch"], 2)
+        self.assertTrue(load_options["low_vram"])
+        step_options = captured["step_options"]
+        self.assertIsInstance(step_options, dict)
+        self.assertEqual(step_options["num_ctx"], 1024)
+        self.assertTrue(step_options["low_vram"])
+
     def test_remote_errors_propagate_as_typed_api_errors(self) -> None:
         sdk = self._make_sdk(self.owner)
         session_id = sdk.CreateSession()

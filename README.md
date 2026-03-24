@@ -19,6 +19,7 @@ Phase 2 introduced the local IPC transport layer plus SDK and CLI wrappers aroun
 - `docs/release-governance.md`
 - `docs/test-plan.md`
 - `docs/phase4-live-inference-ctospec.md`
+- `docs/phase5-large-model-orchestration.md`
 
 ## Phase 2 Runtime
 
@@ -81,6 +82,26 @@ python scripts/live_inference_smoke.py --runtime-backend ollama --model <your-lo
 The smoke script starts the AstraWeave service itself, loads the chosen model name with the chosen runtime backend, and sends the prompt through AstraWeave `RunStep`. It is the fastest honest test of the current bridge phase.
 
 Note: the smoke path imports the AstraWeave package, so it assumes the runtime import path is healthy.
+
+## Phase 5 Large-Model Orchestration
+
+Phase 5 is the next step for running 14B+ models on an 8 GB VRAM host with lots of system RAM. It adds size-aware runtime profiles, backend tuning, and a more explicit fallback path so the local backend can spill work into host memory without pretending the GPU is larger than it is.
+
+What it changes:
+
+- prefers constrained-VRAM runtime profiles for larger model tags,
+- passes backend tuning options through the service and smoke workflow,
+- and makes the operator tradeoffs visible up front.
+
+What it does not change:
+
+- AstraWeave still does not replace the model runtime,
+- 8 GB VRAM still limits how much can stay on GPU at once,
+- and a 14B+ model still needs the right quantization and context settings to be practical.
+
+Operator guide and exact commands:
+
+- `docs/phase5-large-model-orchestration.md`
 
 ## Historical Inputs
 

@@ -523,6 +523,7 @@ class AstraWeaveIpcServer:
                 caller_identity=caller,
                 runtime_backend=runtime_backend,
                 runtime_profile=runtime_profile,
+                backend_options=runtime_backend_options,
                 runtime_backend_options=runtime_backend_options,
             )
             return None
@@ -563,6 +564,7 @@ class AstraWeaveIpcServer:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 runtime_profile_override=runtime_profile_override,
+                backend_options=runtime_backend_options_override,
                 runtime_backend_options_override=runtime_backend_options_override,
             )
         if method == "GetResidency":

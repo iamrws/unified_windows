@@ -403,6 +403,84 @@ class AstraWeaveServiceLifecycleTests(unittest.TestCase):
         self.assertTrue(calls[1]["backend_options"]["low_vram"])
         self.assertAlmostEqual(calls[1]["backend_options"]["repeat_penalty"], 1.05)
 
+    def test_run_step_runtime_profile_override_applies_constrained_defaults(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class FakeOllamaRuntime:
+            backend_name = "ollama"
+
+            def load_model(
+                self,
+                model_name: str,
+                *,
+                runtime_profile: str | None = None,
+                backend_options: dict[str, object] | None = None,
+            ):
+                calls.append(
+                    {
+                        "phase": "load_model",
+                        "model_name": model_name,
+                        "runtime_profile": runtime_profile,
+                        "backend_options": backend_options,
+                    }
+                )
+                from astrawave.inference_runtime import InferenceModelBinding
+
+                return InferenceModelBinding(
+                    backend="ollama",
+                    requested_model_name=model_name,
+                    resolved_model_name=model_name,
+                    metadata={},
+                )
+
+            def generate(
+                self,
+                model_name: str,
+                *,
+                prompt: str,
+                step_name: str,
+                max_tokens: int | None = None,
+                temperature: float | None = None,
+                system_prompt: str | None = None,
+                backend_options: dict[str, object] | None = None,
+            ) -> dict[str, object]:
+                calls.append(
+                    {
+                        "phase": "generate",
+                        "model_name": model_name,
+                        "step_name": step_name,
+                        "backend_options": backend_options,
+                    }
+                )
+                return {
+                    "ok": True,
+                    "backend": "ollama",
+                    "model_name": model_name,
+                    "output_text": "override-response",
+                }
+
+        def runtime_factory(backend_name: str):
+            if backend_name == "ollama":
+                return FakeOllamaRuntime()
+            raise AssertionError(f"unexpected backend requested: {backend_name}")
+
+        service = AstraWeaveService(runstep_mode="simulation", inference_runtime_factory=runtime_factory)
+        session_id = service.CreateSession()
+        service.LoadModel(session_id, "qwen2.5:7b", runtime_backend="ollama")
+        service.RunStep(
+            session_id,
+            step_name="decode",
+            prompt="hello",
+            runtime_profile_override="memory_saver",
+            runtime_backend_options_override={"num_ctx": 1024},
+        )
+
+        self.assertEqual(calls[0]["phase"], "load_model")
+        self.assertEqual(calls[0]["runtime_profile"], "default")
+        self.assertEqual(calls[1]["phase"], "generate")
+        self.assertEqual(calls[1]["backend_options"]["num_ctx"], 1024)
+        self.assertTrue(calls[1]["backend_options"]["low_vram"])
+
 
 if __name__ == "__main__":
     unittest.main()

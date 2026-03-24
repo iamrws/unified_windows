@@ -200,6 +200,7 @@ class AstraWeaveService:
         *,
         runtime_backend: str | None = None,
         runtime_profile: str | None = None,
+        runtime_backend_options: Mapping[str, Any] | None = None,
         backend_options: Mapping[str, Any] | None = None,
         caller_identity: CallerIdentity | None = None,
     ) -> None:
@@ -214,7 +215,7 @@ class AstraWeaveService:
         tuning = resolve_runtime_tuning(
             resolved_model_name,
             runtime_profile=runtime_profile,
-            backend_options=backend_options,
+            backend_options=merge_backend_options(backend_options, runtime_backend_options),
         )
         runtime = self._inference_runtime_factory(backend_name)
         binding = self._call_runtime_method(
@@ -328,6 +329,8 @@ class AstraWeaveService:
         max_tokens: int | None = None,
         temperature: float | None = None,
         system_prompt: str | None = None,
+        runtime_profile_override: str | None = None,
+        runtime_backend_options_override: Mapping[str, Any] | None = None,
         backend_options: Mapping[str, Any] | None = None,
         caller_identity: CallerIdentity | None = None,
     ) -> dict[str, object]:
@@ -364,6 +367,8 @@ class AstraWeaveService:
             if prompt is not None:
                 effective_backend_options = self._resolve_effective_backend_options(
                     session=session,
+                    runtime_profile_override=runtime_profile_override,
+                    runtime_backend_options_override=runtime_backend_options_override,
                     backend_options=backend_options,
                 )
                 inference_result = self._execute_inference_runstep(
@@ -1174,12 +1179,29 @@ class AstraWeaveService:
     def _resolve_effective_backend_options(
         *,
         session: _Session,
+        runtime_profile_override: str | None,
+        runtime_backend_options_override: Mapping[str, Any] | None,
         backend_options: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
         stored_options = session.inference_metadata.get("backend_options")
         if not isinstance(stored_options, Mapping):
             stored_options = {}
-        return merge_backend_options(stored_options, backend_options)
+        profile_options: Mapping[str, Any] | None = None
+        if runtime_profile_override is not None:
+            resolved_model_name = session.resolved_model_name
+            if not isinstance(resolved_model_name, str) or not resolved_model_name.strip():
+                raise ApiError(ApiErrorCode.INVALID_STATE, "session has no resolved model binding")
+            override_tuning = resolve_runtime_tuning(
+                resolved_model_name,
+                runtime_profile=runtime_profile_override,
+            )
+            profile_options = override_tuning.backend_options
+        return merge_backend_options(
+            stored_options,
+            profile_options,
+            runtime_backend_options_override,
+            backend_options,
+        )
 
 
 __all__ = ["AstraWeaveService"]
