@@ -1,6 +1,7 @@
 """AstraWeave package surface."""
 
 from .errors import ApiError, ApiErrorCode
+from .hardware_probe import collect_hardware_probe
 from .types import (
     MemoryTier,
     PolicyProfile,
@@ -34,6 +35,7 @@ __all__ = [
     "ApiErrorCode",
     "AstraWeaveSDK",
     "FallbackEvent",
+    "collect_hardware_probe",
     "MemoryTier",
     "PolicyProfile",
     "PressureSnapshot",

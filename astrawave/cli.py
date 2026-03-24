@@ -38,6 +38,11 @@ except Exception:  # pragma: no cover - optional phase-3 host wrapper
     ServiceHostConfig = None
 
 try:
+    from .hardware_probe import collect_hardware_probe as _collect_hardware_probe_impl
+except Exception:  # pragma: no cover - optional hardware probe module
+    _collect_hardware_probe_impl = None
+
+try:
     from .service import DEFAULT_SERVICE_OWNER_SID
 except Exception:  # pragma: no cover - future-proof fallback
     DEFAULT_SERVICE_OWNER_SID = "S-1-5-21-AstraWeave-Owner"
@@ -233,6 +238,48 @@ def _parse_tcp_endpoint(value: str) -> tuple[str, int]:
         host = _require_loopback_host(host)
         return host, _parse_port_value(port_text, allow_zero=True)
     return _require_loopback_host(hint), 0
+
+
+def _hardware_probe_result() -> dict[str, Any]:
+    if _collect_hardware_probe_impl is not None:
+        try:
+            probe = _collect_hardware_probe_impl()
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            raise ApiError(ApiErrorCode.INTERNAL, "hardware probe failed unexpectedly") from exc
+        if isinstance(probe, Mapping):
+            return dict(probe)
+        raise ApiError(ApiErrorCode.INTERNAL, "hardware probe returned an invalid payload")
+
+    warning = "hardware probe module is unavailable in this build"
+    return {
+        "timestamp_ms": _now_ms(),
+        "nvidia_smi": {
+            "available": False,
+            "status": "unavailable",
+            "devices": [],
+            "error": {
+                "code": "HARDWARE_PROBE_MODULE_MISSING",
+                "message": warning,
+            },
+        },
+        "nvml": {
+            "available": False,
+            "status": "unavailable",
+            "devices": [],
+            "error": {
+                "code": "HARDWARE_PROBE_MODULE_MISSING",
+                "message": warning,
+            },
+        },
+        "effective": {
+            "source": "none",
+            "device_count": 0,
+            "driver_version": None,
+            "devices": [],
+            "has_nvidia_gpu": False,
+        },
+        "warnings": [warning],
+    }
 
 
 class LocalBackend:
@@ -654,6 +701,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("close-session")
     p.add_argument("session_id")
 
+    sub.add_parser("hardware-probe")
+
     serve = sub.add_parser("serve")
     serve.add_argument(
         "--endpoint",
@@ -801,6 +850,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "serve":
         try:
             return _serve(args)
+        except ApiError as exc:
+            _emit_error(exc)
+            return 1
+    if args.command == "hardware-probe":
+        try:
+            _emit_ok(_json_safe(_hardware_probe_result()))
+            return 0
         except ApiError as exc:
             _emit_error(exc)
             return 1

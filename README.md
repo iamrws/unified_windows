@@ -28,6 +28,24 @@ Phase 2 adds a local IPC transport layer plus SDK and CLI wrappers around the co
 - `astrawave/sdk.py`: convenience wrapper around the IPC client.
 - `astrawave/cli.py`: JSON-first command-line entrypoint.
 
+## Hardware Probe Boundary
+
+The new `hardware-probe` CLI command is the first place where AstraWeave reads real NVIDIA platform data:
+
+- `nvidia-smi` is parsed when the tool is present.
+- NVML is queried through `ctypes` when NVIDIA's library is available.
+- The command still returns a JSON envelope even when those tools are missing, so the probe is safe to run on non-NVIDIA systems.
+
+There is also a real transfer proof script:
+
+- `scripts/cuda_transfer_poc.py` uses the CUDA Driver API (`nvcuda.dll`) through `ctypes` to perform a real host->device->host byte copy and verify integrity.
+
+The service orchestration layer remains a prototype boundary for now:
+
+- service/session/tiering behavior is still modeled in-memory.
+- residency changes, fallback steps, and migration latency are deterministic simulation state.
+- no live tensor orchestration is wired into the service path yet.
+
 ## Historical Inputs
 
 - `plan_v2.md`: earlier execution-plan draft.
@@ -78,6 +96,10 @@ python -m astrawave.cli --endpoint tcp://127.0.0.1:8765 load-model <session-id> 
 python -m astrawave.cli --endpoint tcp://127.0.0.1:8765 run-step <session-id> --step-name decode
 # Explicit local simulator mode (not the default path):
 python -m astrawave.cli --backend local create-session
+# Real NVIDIA diagnostics:
+python -m astrawave.cli hardware-probe
+# Real CUDA transfer PoC (host->device->host round-trip):
+python scripts/cuda_transfer_poc.py --bytes 1048576 --pretty
 ```
 
 ## Release-Gate Automation

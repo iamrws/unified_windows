@@ -24,6 +24,35 @@ Audit intent: keep P0/P1 as hard release gates and make evidence requirements ex
 - `P1`: high-priority blocker for delivery confidence and product fit.
 - `P2`: important completeness/governance blocker for scale-up.
 
+## Hardware Reality Reset (March 24, 2026)
+
+This addendum reopens hardware execution gates after validating that most existing
+evidence is contract/simulation coverage, not end-to-end GPU orchestration.
+
+### Finding 11
+
+- ID: `P0-HW-11`
+- Problem: Service orchestration path does not execute real tensor allocation/migration in VRAM.
+- Status: `Open`.
+- Resolution artifact: `scripts/cuda_transfer_poc.py` and follow-on service integration work.
+- Gate evidence required: repeatable host->device->host byte round-trip on target GPU with integrity verification artifacts.
+
+### Finding 12
+
+- ID: `P1-HW-12`
+- Problem: Hardware telemetry and orchestration are not yet integrated in the service lifecycle path (`CreateSession`...`RunStep`).
+- Status: `Open`.
+- Resolution artifact: planned runtime integration in `astrawave/service.py` and related module boundaries.
+- Gate evidence required: service-triggered operation showing observable NVML memory deltas and typed failure behavior when GPU resources are unavailable.
+
+### Finding 13
+
+- ID: `P1-HW-13`
+- Problem: Release narrative can be interpreted as fully release-ready despite simulation-bound runtime behavior.
+- Status: `Mitigated in part` (README now documents real vs simulated boundaries), still open at report/governance level.
+- Resolution artifact: README boundary section plus pending report/register alignment updates.
+- Gate evidence required: all release-facing summaries explicitly distinguish simulation pass evidence from hardware execution pass evidence.
+
 ## Findings and Resolution Artifacts
 
 ### Finding 1
@@ -120,7 +149,8 @@ Status update:
 Decision status:
 
 - No unresolved high-impact product decisions remain in the normative spec baseline.
-- Release blockers from this register are closed by attached implementation evidence and gate validation artifacts.
+- Prior contract/governance blockers are closed.
+- Hardware execution blockers `P0-HW-11`, `P1-HW-12`, and `P1-HW-13` are open and release-blocking for production claims.
 
 ## Latest Validation Evidence (March 23-24, 2026)
 
@@ -154,6 +184,12 @@ Execution and evidence artifacts:
   - Evidence: `reports/release_artifacts/compliance_manifest_2026-03-24.json`
 - Consolidated readiness report:
   - Evidence: `reports/release_gate/release_gate_readiness_2026-03-24.json`
+- Hardware probe evidence (real `nvidia-smi` + NVML reads):
+  - Command: `python -m astrawave.cli hardware-probe`
+  - Evidence: `reports/runlogs/hardware_probe_2026-03-24_131123.json`
+- CUDA transfer PoC evidence (real host->device->host round-trip):
+  - Command: `python scripts/cuda_transfer_poc.py --bytes 1048576`
+  - Evidence: `reports/runlogs/cuda_transfer_poc_2026-03-24_131123.json`
 
 ## Release Readiness Checklist
 
@@ -182,3 +218,6 @@ Validation completeness (release blocking):
 - [x] `P1-08` Incident/rollback/support drills completed with evidence.
 - [x] `P2-09` Matrix profiles covered by repeatable test runs.
 - [x] `P2-10` SBOM/signing/attribution artifacts attached to release candidate.
+- [ ] `P0-HW-11` Real GPU transfer gate passed with repeatable round-trip artifacts.
+- [ ] `P1-HW-12` Service-path hardware orchestration and NVML-delta evidence validated.
+- [ ] `P1-HW-13` Release-facing reports/gates distinguish simulation validation from hardware execution validation.

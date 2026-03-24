@@ -171,6 +171,24 @@ class AstraWeaveCliContractTests(unittest.TestCase):
         self.assertEqual(envelope["error"]["code"], "AW_ERR_INVALID_ARGUMENT")
         self.assertNotIn("Traceback", completed.stderr)
 
+    def test_hardware_probe_returns_structured_json_even_without_nvidia_tools(self) -> None:
+        completed = self.run_cli_default("hardware-probe")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        envelope = self.assert_success_envelope(completed.stdout)
+        result = envelope["result"]
+        self.assertIsInstance(result, dict)
+        self.assertIn("timestamp_ms", result)
+        self.assertIsInstance(result["timestamp_ms"], int)
+        self.assertIn("warnings", result)
+        self.assertIsInstance(result["warnings"], list)
+        self.assertIn("effective", result)
+        self.assertIsInstance(result["effective"], dict)
+        self.assertIn("nvidia_smi", result)
+        self.assertIsInstance(result["nvidia_smi"], dict)
+        self.assertIn("nvml", result)
+        self.assertIsInstance(result["nvml"], dict)
+
 
 if __name__ == "__main__":
     unittest.main()
