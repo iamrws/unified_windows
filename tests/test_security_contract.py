@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 from inspect import signature
+import os
 import unittest
 
 
@@ -21,10 +22,12 @@ class SecurityContractTests(unittest.TestCase):
             cls.SecurityGuard = getattr(cls.security, "SecurityGuard")
             cls.SecurityDecision = getattr(cls.security, "SecurityDecision")
             cls.SecurityDenyReason = getattr(cls.security, "SecurityDenyReason")
+            cls.attest_caller_identity = getattr(cls.security, "attest_caller_identity")
+            cls.resolve_process_user_sid = getattr(cls.security, "resolve_process_user_sid")
         except AttributeError as exc:  # pragma: no cover - keeps the contract explicit
             raise AssertionError(
                 "astrawave.security must expose CallerIdentity, SecurityPolicy, SecurityGuard, "
-                "SecurityDecision, and SecurityDenyReason"
+                "SecurityDecision, SecurityDenyReason, attest_caller_identity, and resolve_process_user_sid"
             ) from exc
 
     def _make_policy(self, **policy_overrides):
@@ -121,6 +124,37 @@ class SecurityContractTests(unittest.TestCase):
     def test_caller_identity_rejects_bool_pid(self) -> None:
         with self.assertRaises(ValueError):
             self.CallerIdentity(user_sid="S-1-5-21-1000", pid=True)
+
+    def test_runtime_attestation_rejects_sid_mismatch(self) -> None:
+        caller = self.CallerIdentity(user_sid="S-1-5-21-wrong", pid=os.getpid())
+        decision = type(self).attest_caller_identity(
+            caller,
+            pid_lookup=lambda pid: True,
+            sid_lookup=lambda pid: "S-1-5-21-right",
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason.name, "UNKNOWN_CALLER")
+        self.assertEqual(decision.error_code.value, "AW_ERR_AUTH_DENIED")
+
+    def test_runtime_attestation_rejects_inactive_pid(self) -> None:
+        caller = self.CallerIdentity(user_sid="S-1-5-21-1000", pid=999999)
+        decision = type(self).attest_caller_identity(
+            caller,
+            pid_lookup=lambda pid: False,
+            sid_lookup=lambda pid: None,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason.name, "UNKNOWN_CALLER")
+
+    def test_runtime_attestation_accepts_live_pid_with_matching_sid(self) -> None:
+        current_sid = type(self).resolve_process_user_sid(os.getpid()) or "S-1-5-21-1000"
+        caller = self.CallerIdentity(user_sid=current_sid, pid=os.getpid())
+        decision = type(self).attest_caller_identity(
+            caller,
+            pid_lookup=lambda pid: True,
+            sid_lookup=lambda pid: current_sid,
+        )
+        self.assertTrue(decision.allowed)
 
 
 if __name__ == "__main__":

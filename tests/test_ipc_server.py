@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import unittest
 
 
@@ -20,6 +21,8 @@ class IpcServerContractTests(unittest.TestCase):
         errors = importlib.import_module("astrawave.errors")
         cls.ApiError = errors.ApiError
         cls.ApiErrorCode = errors.ApiErrorCode
+        cls.current_pid = os.getpid()
+        cls.current_sid = cls.security_module.resolve_process_user_sid(cls.current_pid)
 
     def _lookup(self, module, *names: str):
         for name in names:
@@ -30,11 +33,17 @@ class IpcServerContractTests(unittest.TestCase):
     def _make_server(self):
         server_cls = self._lookup(self.server_module, "AstraWeaveIpcServer")
         service_cls = getattr(self.service_module, "AstraWeaveService")
-        return server_cls(service_cls())
+        policy_cls = self._lookup(self.security_module, "SecurityPolicy")
+        guard_cls = self._lookup(self.security_module, "SecurityGuard")
+        owner_sid = self.current_sid or getattr(self.service_module, "DEFAULT_SERVICE_OWNER_SID")
+        service = service_cls(security_guard=guard_cls(policy_cls(service_owner_sid=owner_sid)))
+        return server_cls(service)
 
-    def _make_caller(self, user_sid: str = "S-1-5-21-1000", pid: int = 1001):
+    def _make_caller(self, user_sid: str | None = None, pid: int | None = None):
         caller_cls = self._lookup(self.security_module, "CallerIdentity")
-        return caller_cls(user_sid=user_sid, pid=pid)
+        effective_sid = user_sid or self.current_sid or "S-1-5-21-1000"
+        effective_pid = self.current_pid if pid is None else pid
+        return caller_cls(user_sid=effective_sid, pid=effective_pid)
 
     def _make_request(self, method: str, params: dict, caller=None, request_id: str = "req-1"):
         request_cls = self._lookup(self.server_module, "IpcRequestEnvelope")
@@ -48,7 +57,7 @@ class IpcServerContractTests(unittest.TestCase):
 
     def test_create_session_load_model_register_run_close_happy_path(self) -> None:
         server = self._make_server()
-        caller = self._make_caller(user_sid=server.service.security_guard.policy.service_owner_sid, pid=1001)
+        caller = self._make_caller(user_sid=server.service.security_guard.policy.service_owner_sid, pid=self.current_pid)
 
         create_response = self._dispatch(server, self._make_request("CreateSession", {}, caller=caller, request_id="req-1"))
         self.assertTrue(create_response["ok"])
@@ -98,8 +107,8 @@ class IpcServerContractTests(unittest.TestCase):
 
     def test_caller_propagation_and_typed_denial_behavior(self) -> None:
         server = self._make_server()
-        owner = self._make_caller(user_sid=server.service.security_guard.policy.service_owner_sid, pid=101)
-        foreign = self._make_caller(user_sid="S-1-5-21-2000", pid=202)
+        owner = self._make_caller(user_sid=server.service.security_guard.policy.service_owner_sid, pid=self.current_pid)
+        foreign = self._make_caller(user_sid="S-1-5-21-foreign", pid=self.current_pid)
 
         session_response = self._dispatch(
             server,
@@ -138,7 +147,7 @@ class IpcServerContractTests(unittest.TestCase):
 
     def test_server_passes_caller_identity_through_to_service(self) -> None:
         server = self._make_server()
-        caller = self._make_caller(user_sid=server.service.security_guard.policy.service_owner_sid, pid=303)
+        caller = self._make_caller(user_sid=server.service.security_guard.policy.service_owner_sid, pid=self.current_pid)
 
         response = self._dispatch(
             server,
@@ -201,7 +210,7 @@ class IpcServerContractTests(unittest.TestCase):
 
     def test_security_denials_are_recorded_in_telemetry(self) -> None:
         server = self._make_server()
-        foreign = self._make_caller(user_sid="S-1-5-21-9999", pid=601)
+        foreign = self._make_caller(user_sid="S-1-5-21-9999", pid=self.current_pid)
         response = self._dispatch(
             server,
             self._make_request("CreateSession", {}, caller=foreign, request_id="req-security-deny"),
@@ -225,12 +234,37 @@ class IpcServerContractTests(unittest.TestCase):
             id="req-32",
             method="CreateSession",
             params={},
-            caller=CallerEnvelope(user_sid=owner_sid, pid=777),
+            caller=CallerEnvelope(user_sid=owner_sid, pid=self.current_pid),
         )
 
         response = self._dispatch(server, request)
         self.assertTrue(response["ok"])
         self.assertIsInstance(response["result"], str)
+
+    def test_server_rejects_sid_mismatch_for_live_process(self) -> None:
+        server = self._make_server()
+        caller = self._make_caller(user_sid="S-1-5-21-mismatch", pid=self.current_pid)
+
+        response = self._dispatch(
+            server,
+            self._make_request("CreateSession", {}, caller=caller, request_id="req-33"),
+        )
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"]["code"], self.ApiErrorCode.AUTH_DENIED.value)
+
+    def test_server_rejects_inactive_pid_during_attestation(self) -> None:
+        server = self._make_server()
+        caller = self._make_caller(
+            user_sid=server.service.security_guard.policy.service_owner_sid,
+            pid=2_147_483_000,
+        )
+
+        response = self._dispatch(
+            server,
+            self._make_request("CreateSession", {}, caller=caller, request_id="req-34"),
+        )
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"]["code"], self.ApiErrorCode.AUTH_DENIED.value)
 
 
 if __name__ == "__main__":

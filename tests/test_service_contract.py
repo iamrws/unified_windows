@@ -13,7 +13,7 @@ from astrawave.types import MemoryTier
 
 class AstraWeaveServiceLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.service = AstraWeaveService()
+        self.service = AstraWeaveService(runstep_mode="simulation")
         self.session_id = self.service.CreateSession()
 
     def assertApiErrorCode(self, exc: Exception, expected: ApiErrorCode) -> None:
@@ -103,6 +103,7 @@ class AstraWeaveServiceLifecycleTests(unittest.TestCase):
         service.RegisterTensor(session_id, "kv", 1024)
 
         result = service.RunStep(session_id, step_name="decode")
+        self.assertEqual(result["requested_run_mode"], "hardware")
         self.assertEqual(result["run_mode"], "hardware")
         self.assertIsInstance(result["hardware_result"], dict)
         self.assertTrue(result["hardware_result"]["ok"])
@@ -122,9 +123,11 @@ class AstraWeaveServiceLifecycleTests(unittest.TestCase):
         service.RegisterTensor(session_id, "kv", 2048)
 
         result = service.RunStep(session_id, step_name="decode")
-        self.assertEqual(result["run_mode"], "hardware")
+        self.assertEqual(result["requested_run_mode"], "hardware")
+        self.assertEqual(result["run_mode"], "simulation")
         self.assertIsInstance(result["hardware_result"], dict)
         self.assertFalse(result["hardware_result"]["ok"])
+        self.assertTrue(result["hardware_result"]["fallback_to_simulation"])
         self.assertEqual(result["state"].value, "DEGRADED")
 
     def test_env_flag_can_enable_hardware_mode_without_constructor_override(self) -> None:
@@ -137,7 +140,27 @@ class AstraWeaveServiceLifecycleTests(unittest.TestCase):
             service.LoadModel(session_id, "demo-model")
             service.RegisterTensor(session_id, "kv", 4096)
             result = service.RunStep(session_id, step_name="decode")
+            self.assertEqual(result["requested_run_mode"], "hardware")
             self.assertEqual(result["run_mode"], "hardware")
+
+    def test_auto_mode_prefers_hardware_and_falls_back_cleanly(self) -> None:
+        def failing_executor(*, size_bytes: int, device_index: int, hold_ms: int) -> dict[str, object]:
+            return {
+                "ok": False,
+                "error": {"code": "CUDA_POC_DRIVER_MISSING", "message": "nvcuda.dll was not found"},
+            }
+
+        service = AstraWeaveService(hardware_executor=failing_executor)
+        session_id = service.CreateSession()
+        service.LoadModel(session_id, "demo-model")
+        service.RegisterTensor(session_id, "kv", 2048)
+
+        result = service.RunStep(session_id, step_name="decode")
+        self.assertEqual(result["requested_run_mode"], "auto")
+        self.assertEqual(result["run_mode"], "simulation")
+        self.assertFalse(result["hardware_result"]["ok"])
+        self.assertTrue(result["hardware_result"]["fallback_to_simulation"])
+        self.assertEqual(result["state"].value, "DEGRADED")
 
 
 if __name__ == "__main__":

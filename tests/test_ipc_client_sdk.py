@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 import unittest
 
@@ -9,7 +10,7 @@ from astrawave.errors import ApiError, ApiErrorCode
 from astrawave.ipc_client import AstraWeaveIpcClient
 from astrawave.ipc_server import AstraWeaveIpcServer
 from astrawave.sdk import AstraWeaveSDK
-from astrawave.security import CallerIdentity, SecurityGuard, SecurityPolicy
+from astrawave.security import CallerIdentity, SecurityGuard, SecurityPolicy, resolve_process_user_sid
 from astrawave.service import AstraWeaveService
 from astrawave.types import MemoryTier, PolicyProfile
 
@@ -112,8 +113,10 @@ class _SDKBridge:
 
 class IpcClientSdkE2ETests(unittest.TestCase):
     def setUp(self) -> None:
-        self.owner = CallerIdentity(user_sid="S-1-5-21-1000", pid=1001)
-        self.foreign = CallerIdentity(user_sid="S-1-5-21-2000", pid=2002)
+        current_pid = os.getpid()
+        current_sid = resolve_process_user_sid(current_pid) or "S-1-5-21-1000"
+        self.owner = CallerIdentity(user_sid=current_sid, pid=current_pid)
+        self.foreign = CallerIdentity(user_sid="S-1-5-21-2000", pid=current_pid)
 
         service = AstraWeaveService(
             security_guard=SecurityGuard(

@@ -8,16 +8,31 @@ identity, authorization, rate limits, and concurrent-session caps.
 from __future__ import annotations
 
 from collections import deque
+import ctypes
+import errno
 from dataclasses import dataclass, field
 from enum import Enum
+import os
 from threading import RLock
 from time import monotonic
 from typing import Callable, Deque, Dict, FrozenSet, Optional, Tuple
+
+from ctypes import wintypes
 
 from .errors import ApiError, ApiErrorCode
 
 CallerKey = Tuple[str, int]
 Clock = Callable[[], float]
+PidLookup = Callable[[int], bool]
+SidLookup = Callable[[int], str | None]
+
+
+class _SidAndAttributes(ctypes.Structure):
+    _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+
+class _TokenUser(ctypes.Structure):
+    _fields_ = [("User", _SidAndAttributes)]
 
 CREATE_SESSION_LIMIT_PER_MINUTE = 6
 MAX_CONCURRENT_SESSIONS_PER_CALLER = 8
@@ -142,6 +157,136 @@ def is_valid_caller_identity(caller: CallerIdentity) -> bool:
         )
     except AttributeError:
         return False
+
+
+def is_plausible_user_sid(user_sid: str) -> bool:
+    """Return `True` when the caller SID is structurally safe to trust-check."""
+
+    if not isinstance(user_sid, str):
+        return False
+    normalized = user_sid.strip()
+    if not normalized or len(normalized) > 256:
+        return False
+    if any(ord(ch) < 32 for ch in normalized):
+        return False
+    if any(ch.isspace() for ch in normalized):
+        return False
+    return normalized.startswith("S-")
+
+
+def process_exists(pid: int) -> bool:
+    """Return `True` when the PID currently maps to a live local process."""
+
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        process_handle = kernel32.OpenProcess(0x1000, False, pid)
+        if process_handle:
+            kernel32.CloseHandle(process_handle)
+            return True
+        return ctypes.get_last_error() == 5
+    try:
+        os.kill(pid, 0)
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+    return True
+
+
+def resolve_process_user_sid(pid: int) -> str | None:
+    """Return the Windows SID string for a process owner when available."""
+
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    if os.name != "nt":
+        return None
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+
+    process_handle = wintypes.HANDLE()
+    token_handle = wintypes.HANDLE()
+    sid_string = wintypes.LPWSTR()
+    process_handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not process_handle:
+        return None
+
+    try:
+        if not advapi32.OpenProcessToken(process_handle, 0x0008, ctypes.byref(token_handle)):
+            return None
+        try:
+            required = wintypes.DWORD(0)
+            advapi32.GetTokenInformation(token_handle, 1, None, 0, ctypes.byref(required))
+            if required.value <= 0:
+                return None
+
+            buffer = ctypes.create_string_buffer(required.value)
+            if not advapi32.GetTokenInformation(token_handle, 1, buffer, required.value, ctypes.byref(required)):
+                return None
+
+            token_user = _TokenUser.from_buffer_copy(buffer)
+            sid_ptr = ctypes.c_void_p(token_user.User.Sid)
+            if not sid_ptr.value:
+                return None
+            if not advapi32.ConvertSidToStringSidW(sid_ptr, ctypes.byref(sid_string)):
+                return None
+            try:
+                return str(sid_string.value) if sid_string.value else None
+            finally:
+                ctypes.windll.kernel32.LocalFree(sid_string)
+        finally:
+            kernel32.CloseHandle(token_handle)
+    finally:
+        kernel32.CloseHandle(process_handle)
+
+
+def resolve_current_user_sid() -> str | None:
+    """Return the current process owner SID when the platform can provide it."""
+
+    return resolve_process_user_sid(os.getpid())
+
+
+def attest_caller_identity(
+    caller: CallerIdentity,
+    *,
+    pid_lookup: PidLookup | None = None,
+    sid_lookup: SidLookup | None = None,
+) -> SecurityDecision:
+    """Attest the caller against the live process table when possible."""
+
+    if not is_valid_caller_identity(caller) or not is_plausible_user_sid(caller.user_sid):
+        return decision_denied(
+            SecurityDenyReason.INVALID_CALLER,
+            "caller identity is malformed",
+        )
+
+    pid_lookup = pid_lookup or process_exists
+    sid_lookup = sid_lookup or resolve_process_user_sid
+
+    try:
+        pid_is_active = pid_lookup(caller.pid)
+    except Exception:
+        pid_is_active = False
+    if not pid_is_active:
+        return decision_denied(
+            SecurityDenyReason.UNKNOWN_CALLER,
+            "caller PID is not active on this host",
+        )
+
+    try:
+        resolved_sid = sid_lookup(caller.pid)
+    except Exception:
+        resolved_sid = None
+
+    if resolved_sid is not None and resolved_sid.strip() != caller.user_sid.strip():
+        return decision_denied(
+            SecurityDenyReason.UNKNOWN_CALLER,
+            "caller SID does not match the active process owner",
+        )
+
+    if resolved_sid is not None:
+        return decision_allowed("caller attested by PID and process owner SID")
+    return decision_allowed("caller PID verified; OS SID attestation unavailable")
 
 
 class SecurityGuard:
@@ -326,17 +471,24 @@ class SecurityGuard:
 
 
 __all__ = [
+    "attest_caller_identity",
     "CallerIdentity",
     "Clock",
     "CREATE_SESSION_LIMIT_PER_MINUTE",
     "ERROR_CODE_BY_DENY_REASON",
     "MAX_CONCURRENT_SESSIONS_PER_CALLER",
+    "PidLookup",
     "RATE_WINDOW_SECONDS",
     "SecurityDecision",
     "SecurityDenyReason",
     "SecurityGuard",
     "SecurityPolicy",
+    "SidLookup",
     "decision_allowed",
     "decision_denied",
     "is_valid_caller_identity",
+    "is_plausible_user_sid",
+    "process_exists",
+    "resolve_current_user_sid",
+    "resolve_process_user_sid",
 ]

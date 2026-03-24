@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from contextlib import suppress
+import os
 import unittest
 
 from astrawave.errors import ApiError, ApiErrorCode
 from astrawave.ipc_client import AstraWeaveIpcClient
 from astrawave.ipc_server import AstraWeaveIpcServer
 from astrawave.sdk import AstraWeaveSDK
-from astrawave.security import CallerIdentity
+from astrawave.security import CallerIdentity, resolve_process_user_sid
 from astrawave.telemetry import TelemetryReasonCode
 from astrawave.types import MemoryTier
 
@@ -27,8 +28,11 @@ class Phase2EndToEndTests(unittest.TestCase):
         self.addCleanup(self._cleanup)
 
         self.owner_sid = self.server.service.security_guard.policy.service_owner_sid
-        self.owner = CallerIdentity(user_sid=self.owner_sid, pid=1001)
-        self.foreign = CallerIdentity(user_sid="S-1-5-21-2000", pid=2002)
+        self.owner = CallerIdentity(user_sid=self.owner_sid, pid=os.getpid())
+        self.foreign = CallerIdentity(
+            user_sid=(resolve_process_user_sid(os.getpid()) or "S-1-5-21-foreign") + "-foreign",
+            pid=os.getpid(),
+        )
 
         endpoint = self._endpoint_uri(self.server.endpoint)
         self.client = AstraWeaveIpcClient(

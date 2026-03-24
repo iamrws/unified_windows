@@ -12,7 +12,7 @@ from ipaddress import ip_address
 from multiprocessing.connection import Listener
 import os
 from threading import Event, RLock, Thread
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .errors import ApiError, ApiErrorCode
 from .ipc_protocol import (
@@ -28,7 +28,7 @@ from .ipc_protocol import (
     to_json_value,
     validate_request_payload,
 )
-from .security import CallerIdentity
+from .security import CallerIdentity, SecurityDecision, attest_caller_identity
 from .service import AstraWeaveService
 from .telemetry import SecurityEvent, TelemetryReasonCode
 from .types import MemoryTier, PolicyProfile
@@ -240,6 +240,8 @@ class AstraWeaveIpcServer:
         authkey: bytes | None = None,
         require_explicit_caller: bool = True,
         bind_caller_per_connection: bool = True,
+        enforce_runtime_caller_attestation: bool = True,
+        caller_attestor: Callable[[CallerIdentity], SecurityDecision] | None = None,
     ) -> None:
         self._service = service or AstraWeaveService()
         self._prefer_named_pipe = prefer_named_pipe
@@ -249,6 +251,8 @@ class AstraWeaveIpcServer:
         self._authkey = authkey if authkey is not None else _authkey_from_env()
         self._require_explicit_caller = require_explicit_caller
         self._bind_caller_per_connection = bind_caller_per_connection
+        self._enforce_runtime_caller_attestation = enforce_runtime_caller_attestation
+        self._caller_attestor = caller_attestor or attest_caller_identity
         self._listener: Listener | None = None
         self._transport: str | None = None
         self._endpoint: Any = None
@@ -479,6 +483,10 @@ class AstraWeaveIpcServer:
             return None
         if expected_caller is not None and caller != expected_caller:
             raise ApiError(ApiErrorCode.AUTH_DENIED, "caller identity changed within the same IPC connection")
+        if self._enforce_runtime_caller_attestation:
+            attestation = self._caller_attestor(caller)
+            if not attestation.allowed:
+                raise attestation.to_api_error()
         admission = self._service.security_guard.authorize_caller(caller)
         if not admission.allowed:
             raise admission.to_api_error()

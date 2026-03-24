@@ -9,7 +9,25 @@
   },
   "gates": {
     "P0-01": {
-      "note": "Security controls validated by contract/integration tests and abuse drills.",
+      "evidence": {
+        "auth_abuse_drill": "DRILL-AUTH-ABUSE",
+        "security_tests": [
+          "test_security_contract.SecurityContractTests.test_unknown_or_cross_user_caller_is_denied_by_default",
+          "test_security_contract.SecurityContractTests.test_same_user_authorization_is_allowed",
+          "test_security_contract.SecurityContractTests.test_cross_user_allowlist_can_grant_access",
+          "test_security_contract.SecurityContractTests.test_create_session_rate_limit_and_session_cap_are_enforced",
+          "test_integrated_service_contract.IntegratedServiceContractTests.test_session_ownership_isolation_denies_cross_user_access",
+          "test_ipc_client_sdk.IpcClientSdkE2ETests.test_connection_rejects_caller_identity_switch_after_binding",
+          "test_ipc_server.IpcServerContractTests.test_server_requires_explicit_caller_identity_by_default",
+          "test_ipc_server.IpcServerContractTests.test_server_rejects_oversized_request_payload",
+          "test_ipc_server.IpcServerContractTests.test_security_denials_are_recorded_in_telemetry",
+          "test_ipc_protocol.IpcProtocolContractTests.test_request_envelope_validation_rejects_malformed_input",
+          "test_ipc_protocol.IpcProtocolContractTests.test_request_envelope_rejects_payloads_over_max_size",
+          "test_phase3_runtime_smoke.Phase3RuntimeSmokeTests.test_remote_call_smoke_path_denies_foreign_caller"
+        ]
+      },
+      "missing_or_failed": [],
+      "note": "Security controls validated by contract/integration tests and the auth abuse drill.",
       "passed": true
     },
     "P0-02": {
@@ -35,7 +53,69 @@
       "passed": true
     },
     "P1-06": {
-      "note": "Decision log remains aligned with implementation behavior and tests.",
+      "evidence": {
+        "decision_tests": {
+          "D-001": {
+            "missing_or_failed": [],
+            "passed": true,
+            "plan_mentions_decision": true,
+            "problems_mentions_decision": true,
+            "tests": [
+              "test_ipc_server.IpcServerContractTests.test_server_requires_explicit_caller_identity_by_default",
+              "test_ipc_client_sdk.IpcClientSdkE2ETests.test_connection_rejects_caller_identity_switch_after_binding",
+              "test_service_contract.AstraWeaveServiceLifecycleTests.test_invalid_order_rejection_blocks_out_of_sequence_calls"
+            ]
+          },
+          "D-002": {
+            "missing_or_failed": [],
+            "passed": true,
+            "plan_mentions_decision": true,
+            "problems_mentions_decision": true,
+            "tests": [
+              "test_fallback_contract.FallbackContractTests.test_controller_declines_step_changes_inside_cooldown_window",
+              "test_fallback_contract.FallbackContractTests.test_controller_respects_cooldown_before_advancing",
+              "test_fallback_contract.FallbackContractTests.test_anti_oscillation_defaults_are_locked"
+            ]
+          },
+          "D-003": {
+            "missing_or_failed": [],
+            "passed": true,
+            "plan_mentions_decision": true,
+            "problems_mentions_decision": true,
+            "tests": [
+              "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pa_primary_maps_to_numa_dgpu",
+              "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pb_secondary_maps_to_cache_coherent_uma",
+              "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pc_degraded_maps_to_uma",
+              "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pd_unsupported_fails_fast"
+            ]
+          },
+          "D-004": {
+            "missing_or_failed": [],
+            "passed": true,
+            "plan_mentions_decision": true,
+            "problems_mentions_decision": true,
+            "tests": [
+              "test_telemetry_contract.TelemetryContractTests.test_local_only_is_default_and_export_is_disabled",
+              "test_telemetry_contract.TelemetryContractTests.test_export_requires_explicit_opt_in"
+            ]
+          },
+          "D-005": {
+            "missing_or_failed": [],
+            "passed": true,
+            "plan_mentions_decision": true,
+            "problems_mentions_decision": true,
+            "tests": [
+              "test_service_contract.AstraWeaveServiceLifecycleTests.test_env_flag_can_enable_hardware_mode_without_constructor_override",
+              "test_service_contract.AstraWeaveServiceLifecycleTests.test_run_step_hardware_mode_invokes_executor_and_returns_hardware_payload",
+              "test_service_contract.AstraWeaveServiceLifecycleTests.test_run_step_hardware_mode_marks_session_degraded_on_runtime_failure"
+            ]
+          }
+        },
+        "plan": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\plan.md",
+        "problems": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\problems.md"
+      },
+      "missing_or_failed": [],
+      "note": "Decision log D-001 through D-005 is present in the normative docs and backed by the decision-specific tests.",
       "passed": true
     },
     "P1-07": {
@@ -64,7 +144,7 @@
       "passed": true
     }
   },
-  "generated_at": "2026-03-24T19:28:29.551536+00:00",
+  "generated_at": "2026-03-24T20:36:55.000644+00:00",
   "run_id": "2026-03-24",
   "test_suite": {
     "ran_tests": 62,

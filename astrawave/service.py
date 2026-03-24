@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover - optional runtime path
 
 from .errors import ApiError, ApiErrorCode
 from .fallback import FallbackController, FallbackState, FallbackStep
-from .security import CallerIdentity, SecurityGuard, SecurityPolicy
+from .security import CallerIdentity, SecurityGuard, SecurityPolicy, resolve_current_user_sid
 from .telemetry import (
     FallbackEvent as TelemetryFallbackEvent,
     TelemetryEvent,
@@ -41,8 +41,8 @@ from .types import (
 )
 
 HIGH_PRESSURE_THRESHOLD = 0.75
-DEFAULT_SERVICE_OWNER_SID = "S-1-5-21-AstraWeave-Owner"
-DEFAULT_RUNSTEP_MODE = "simulation"
+DEFAULT_SERVICE_OWNER_SID = resolve_current_user_sid() or "S-1-5-21-AstraWeave-Owner"
+DEFAULT_RUNSTEP_MODE = "auto"
 RUNSTEP_MODE_ENV = "ASTRAWEAVE_RUNSTEP_MODE"
 RUNSTEP_MODE_ENABLE_ENV = "ASTRAWEAVE_ENABLE_HARDWARE_RUNSTEP"
 HARDWARE_TRANSFER_BYTES_ENV = "ASTRAWEAVE_HARDWARE_TRANSFER_BYTES"
@@ -302,18 +302,23 @@ class AstraWeaveService:
             now_ms = self._now_ms()
             pressure_level = self._compute_pressure_level(session)
             fallback_result: dict[str, object] | None = None
-            run_mode = self._resolve_runstep_mode()
+            requested_run_mode = self._resolve_runstep_mode()
+            run_mode = "simulation"
             hardware_result: dict[str, object] | None = None
 
             if pressure_level >= HIGH_PRESSURE_THRESHOLD or session.fallback_stability_mode:
                 fallback_result = self._advance_fallback(session=session, caller=caller, now_ms=now_ms)
-            if run_mode == "hardware":
+            if requested_run_mode in {"auto", "hardware"}:
                 hardware_result = self._execute_hardware_runstep(session=session, step_name=step_name)
+                if isinstance(hardware_result, dict) and bool(hardware_result.get("ok")):
+                    run_mode = "hardware"
+                elif isinstance(hardware_result, dict):
+                    hardware_result.setdefault("fallback_to_simulation", True)
 
             with session.lock:
                 if session.state != SessionState.FAILED:
                     if (
-                        run_mode == "hardware"
+                        requested_run_mode in {"auto", "hardware"}
                         and isinstance(hardware_result, dict)
                         and not bool(hardware_result.get("ok"))
                     ):
@@ -337,6 +342,7 @@ class AstraWeaveService:
                     if session.fallback_current_step is not None
                     else None,
                     "fallback_result": fallback_result,
+                    "requested_run_mode": requested_run_mode,
                     "run_mode": run_mode,
                     "hardware_result": hardware_result,
                 }
@@ -446,7 +452,7 @@ class AstraWeaveService:
 
     def _resolve_creation_caller(self, caller_identity: CallerIdentity | None) -> CallerIdentity:
         if caller_identity is None:
-            return CallerIdentity(self._service_owner_sid, 1)
+            return CallerIdentity(self._service_owner_sid, os.getpid())
         if not self._is_valid_caller_identity(caller_identity):
             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "caller identity is malformed")
         return caller_identity
@@ -831,15 +837,25 @@ class AstraWeaveService:
                 mode = "hardware"
         if mode in {"hardware", "cuda", "cuda_transfer_poc"}:
             return "hardware"
+        if mode in {"auto", "hardware_preferred", "preferred"}:
+            return "auto"
         return "simulation"
 
     def _execute_hardware_runstep(self, *, session: _Session, step_name: str) -> dict[str, object]:
-        if self._hardware_executor is None:
-            raise ApiError(ApiErrorCode.INTERNAL, "hardware runstep mode is enabled but CUDA runtime is unavailable")
-
         size_bytes = self._resolve_hardware_transfer_bytes(session)
         device_index = self._env_int(HARDWARE_DEVICE_INDEX_ENV, default=DEFAULT_DEVICE_INDEX, minimum=0)
         hold_ms = self._env_int(HARDWARE_HOLD_MS_ENV, default=DEFAULT_HARDWARE_HOLD_MS, minimum=0)
+
+        if self._hardware_executor is None:
+            return self._hardware_failure_result(
+                code=ApiErrorCode.UNSUPPORTED_CAPABILITY,
+                message="hardware-preferred RunStep could not load the CUDA runtime",
+                session=session,
+                step_name=step_name,
+                size_bytes=size_bytes,
+                device_index=device_index,
+                hold_ms=hold_ms,
+            )
 
         try:
             result = self._hardware_executor(
@@ -848,14 +864,42 @@ class AstraWeaveService:
                 hold_ms=hold_ms,
             )
         except TypeError:
-            result = self._hardware_executor(size_bytes=size_bytes, device_index=device_index)
+            try:
+                result = self._hardware_executor(size_bytes=size_bytes, device_index=device_index)
+            except Exception as exc:  # pragma: no cover - defensive boundary
+                return self._hardware_failure_result(
+                    code=ApiErrorCode.INTERNAL,
+                    message=f"hardware RunStep execution failed unexpectedly: {exc}",
+                    session=session,
+                    step_name=step_name,
+                    size_bytes=size_bytes,
+                    device_index=device_index,
+                    hold_ms=hold_ms,
+                )
         except Exception as exc:  # pragma: no cover - defensive boundary
-            raise ApiError(ApiErrorCode.INTERNAL, "hardware runstep execution failed unexpectedly") from exc
+            return self._hardware_failure_result(
+                code=ApiErrorCode.INTERNAL,
+                message=f"hardware RunStep execution failed unexpectedly: {exc}",
+                session=session,
+                step_name=step_name,
+                size_bytes=size_bytes,
+                device_index=device_index,
+                hold_ms=hold_ms,
+            )
 
         if not isinstance(result, dict):
-            raise ApiError(ApiErrorCode.INTERNAL, "hardware runstep must return a JSON object")
+            return self._hardware_failure_result(
+                code=ApiErrorCode.INTERNAL,
+                message="hardware RunStep must return a JSON object",
+                session=session,
+                step_name=step_name,
+                size_bytes=size_bytes,
+                device_index=device_index,
+                hold_ms=hold_ms,
+            )
 
         merged = dict(result)
+        merged.setdefault("ok", False)
         merged["service_context"] = {
             "session_id": session.session_id,
             "step_name": step_name,
@@ -863,6 +907,11 @@ class AstraWeaveService:
             "device_index": device_index,
             "hold_ms": hold_ms,
         }
+        if not bool(merged.get("ok")) and "error" not in merged:
+            merged["error"] = {
+                "code": ApiErrorCode.INTERNAL.value,
+                "message": "hardware RunStep reported failure without structured error details",
+            }
         return merged
 
     def _resolve_hardware_transfer_bytes(self, session: _Session) -> int:
@@ -872,6 +921,33 @@ class AstraWeaveService:
         if session.tensors:
             return max(DEFAULT_TRANSFER_BYTES, max(item.size_bytes for item in session.tensors.values()))
         return DEFAULT_TRANSFER_BYTES
+
+    @staticmethod
+    def _hardware_failure_result(
+        *,
+        code: ApiErrorCode,
+        message: str,
+        session: _Session,
+        step_name: str,
+        size_bytes: int,
+        device_index: int,
+        hold_ms: int,
+    ) -> dict[str, object]:
+        return {
+            "ok": False,
+            "error": {
+                "code": code.value,
+                "message": message,
+            },
+            "fallback_to_simulation": True,
+            "service_context": {
+                "session_id": session.session_id,
+                "step_name": step_name,
+                "requested_transfer_bytes": size_bytes,
+                "device_index": device_index,
+                "hold_ms": hold_ms,
+            },
+        }
 
     @staticmethod
     def _env_flag_enabled(name: str) -> bool:
