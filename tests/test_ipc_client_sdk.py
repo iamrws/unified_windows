@@ -61,8 +61,9 @@ class _SDKBridge:
         session_id: str,
         model_name: str,
         caller_identity: CallerIdentity | None = None,
+        runtime_backend: str | None = None,
     ) -> None:
-        self._client.LoadModel(session_id, model_name, caller_identity)
+        self._client.LoadModel(session_id, model_name, caller_identity, runtime_backend=runtime_backend)
 
     def RegisterTensor(
         self,
@@ -90,8 +91,18 @@ class _SDKBridge:
         session_id: str,
         step_name: str = "run",
         caller_identity: CallerIdentity | None = None,
+        prompt: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
     ):
-        return self._client.RunStep(session_id, step_name, caller_identity)
+        return self._client.RunStep(
+            session_id,
+            step_name,
+            caller_identity,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
 
     def GetResidency(self, session_id: str, caller_identity: CallerIdentity | None = None):
         return self._client.GetResidency(session_id, caller_identity)
@@ -190,6 +201,41 @@ class IpcClientSdkE2ETests(unittest.TestCase):
         self.assertEqual(sdk.GetResidency(sdk_session_id).session_id, sdk_session_id)
         self.assertEqual(sdk.GetPressure(sdk_session_id).session_id, sdk_session_id)
 
+        sdk.CloseSession(sdk_session_id)
+        sdk.close()
+
+    def test_optional_runtime_backend_and_generation_knobs_round_trip(self) -> None:
+        direct_client = self._make_client(self.owner)
+        session_id = direct_client.CreateSession(self.owner)
+        direct_client.LoadModel(session_id, "demo-model", self.owner, runtime_backend="ollama")
+        direct_client.RegisterTensor(session_id, "kv", 1024, self.owner)
+        direct_client.SetTierHint(session_id, "kv", MemoryTier.HOT, self.owner)
+
+        run_result = direct_client.RunStep(
+            session_id,
+            "decode",
+            self.owner,
+            prompt="hello there",
+            max_tokens=16,
+            temperature=0.2,
+        )
+        self.assertEqual(run_result["session_id"], session_id)
+        self.assertEqual(run_result["step_name"], "decode")
+        direct_client.close()
+
+        sdk = self._make_sdk(self.owner)
+        sdk_session_id = sdk.CreateSession()
+        sdk.LoadModel(sdk_session_id, "sdk-model", runtime_backend="ollama")
+        sdk.RegisterTensor(sdk_session_id, "weights", 2048)
+        sdk.SetTierHint(sdk_session_id, "weights", MemoryTier.WARM)
+        sdk_step = sdk.RunStep(
+            sdk_session_id,
+            "decode",
+            prompt="generate a short response",
+            max_tokens=12,
+            temperature=0.4,
+        )
+        self.assertEqual(sdk_step["session_id"], sdk_session_id)
         sdk.CloseSession(sdk_session_id)
         sdk.close()
 

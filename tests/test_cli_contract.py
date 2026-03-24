@@ -131,6 +131,45 @@ class AstraWeaveCliContractTests(unittest.TestCase):
         close_envelope = self.assert_success_envelope(close.stdout)
         self.assertEqual(close_envelope["result"]["closed"], True)
 
+    def test_local_backend_accepts_runtime_backend_and_generation_flags(self) -> None:
+        create = self.run_cli("--backend", "local", "create-session")
+        self.assertEqual(create.returncode, 0, create.stderr)
+        session_id = self.assert_success_envelope(create.stdout)["result"]["session_id"]
+
+        load = self.run_cli(
+            "--backend",
+            "local",
+            "load-model",
+            str(session_id),
+            "demo-model",
+            "--runtime-backend",
+            "ollama",
+        )
+        self.assertEqual(load.returncode, 0, load.stderr)
+        load_envelope = self.assert_success_envelope(load.stdout)
+        self.assertEqual(load_envelope["result"]["runtime_backend"], "ollama")
+
+        step = self.run_cli(
+            "--backend",
+            "local",
+            "run-step",
+            str(session_id),
+            "--step-name",
+            "decode",
+            "--prompt",
+            "Write a one-line summary.",
+            "--max-tokens",
+            "16",
+            "--temperature",
+            "0.2",
+        )
+        self.assertEqual(step.returncode, 0, step.stderr)
+        step_envelope = self.assert_success_envelope(step.stdout)
+        self.assertEqual(step_envelope["result"]["prompt"], "Write a one-line summary.")
+        self.assertEqual(step_envelope["result"]["generation"]["max_tokens"], 16)
+        self.assertEqual(step_envelope["result"]["generation"]["temperature"], 0.2)
+        self.assertEqual(step_envelope["result"]["inference_result"]["backend"], "ollama")
+
     def test_default_backend_prefers_remote_and_fails_cleanly_without_server(self) -> None:
         auto_state = self._endpoint_path("auto")
         if auto_state.exists():

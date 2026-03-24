@@ -69,7 +69,7 @@ class Phase3RuntimeSmokeTests(unittest.TestCase):
 
         session_id = client.CreateSession(self.owner)
         self.assertIsInstance(session_id, str)
-        client.LoadModel(session_id, "demo-model", self.owner)
+        client.LoadModel(session_id, "demo-model", self.owner, runtime_backend="ollama")
         client.RegisterTensor(session_id, "kv", 1024, self.owner)
         client.SetTierHint(session_id, "kv", MemoryTier.HOT, self.owner)
 
@@ -77,7 +77,14 @@ class Phase3RuntimeSmokeTests(unittest.TestCase):
         self.assertIsInstance(prefetch_plan, list)
         self.assertEqual(len(prefetch_plan), 1)
 
-        result = client.RunStep(session_id, "decode", self.owner)
+        result = client.RunStep(
+            session_id,
+            "decode",
+            self.owner,
+            prompt="hello",
+            max_tokens=8,
+            temperature=0.1,
+        )
         self.assertEqual(result["session_id"], session_id)
         self.assertEqual(result["step_name"], "decode")
         self.assertIn("correlation_id", result)

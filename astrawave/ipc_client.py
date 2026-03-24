@@ -386,8 +386,18 @@ class AstraWeaveIpcClient:
 
         return cast(str, self.call("CreateSession", {}, caller))
 
-    def LoadModel(self, session_id: str, model_name: str, caller: CallerIdentity | None = None) -> None:
-        self.call("LoadModel", {"session_id": session_id, "model_name": model_name}, caller)
+    def LoadModel(
+        self,
+        session_id: str,
+        model_name: str,
+        caller: CallerIdentity | None = None,
+        *,
+        runtime_backend: str | None = None,
+    ) -> None:
+        params: dict[str, Any] = {"session_id": session_id, "model_name": model_name}
+        if runtime_backend is not None:
+            params["runtime_backend"] = runtime_backend
+        self.call("LoadModel", params, caller)
 
     def RegisterTensor(
         self,
@@ -424,11 +434,19 @@ class AstraWeaveIpcClient:
         session_id: str,
         step_name: str = "run",
         caller: CallerIdentity | None = None,
+        *,
+        prompt: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
     ) -> dict[str, Any]:
-        return cast(
-            dict[str, Any],
-            self.call("RunStep", {"session_id": session_id, "step_name": step_name}, caller),
-        )
+        params: dict[str, Any] = {"session_id": session_id, "step_name": step_name}
+        if prompt is not None:
+            params["prompt"] = prompt
+        if max_tokens is not None:
+            params["max_tokens"] = max_tokens
+        if temperature is not None:
+            params["temperature"] = temperature
+        return cast(dict[str, Any], self.call("RunStep", params, caller))
 
     def GetResidency(self, session_id: str, caller: CallerIdentity | None = None) -> ResidencySnapshot:
         return _coerce_residency_snapshot(self.call("GetResidency", {"session_id": session_id}, caller))

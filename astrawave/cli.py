@@ -300,11 +300,12 @@ class LocalBackend:
             "session_id": session_id,
             "owner_sid": caller.user_sid,
             "owner_pid": caller.pid,
-            "state": SessionState.SESSION_CREATED.value,
-            "model_name": None,
-            "policy_profile": PolicyProfile.STABILITY.value,
-            "tensors": {},
-            "active_run": False,
+        "state": SessionState.SESSION_CREATED.value,
+        "model_name": None,
+        "runtime_backend": None,
+        "policy_profile": PolicyProfile.STABILITY.value,
+        "tensors": {},
+        "active_run": False,
             "closed": False,
             "fallback_current_step": None,
             "fallback_last_step_change_ms": None,
@@ -320,15 +321,25 @@ class LocalBackend:
         self._save()
         return {"session_id": session_id, "owner_sid": caller.user_sid, "owner_pid": caller.pid}
 
-    def load_model(self, session_id: str, model_name: str, caller: CallerIdentity) -> dict[str, Any]:
+    def load_model(
+        self,
+        session_id: str,
+        model_name: str,
+        caller: CallerIdentity,
+        runtime_backend: str | None = None,
+    ) -> dict[str, Any]:
         session = self._get_owned_session(session_id, caller, "LoadModel")
         self._require_state(session, {SessionState.SESSION_CREATED}, "LoadModel")
         if not model_name:
             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "model_name must not be empty")
         session["model_name"] = model_name
+        session["runtime_backend"] = runtime_backend
         session["state"] = SessionState.READY.value
         self._save()
-        return {"session_id": session_id, "model_name": model_name, "state": session["state"]}
+        result = {"session_id": session_id, "model_name": model_name, "state": session["state"]}
+        if runtime_backend is not None:
+            result["runtime_backend"] = runtime_backend
+        return result
 
     def register_tensor(self, session_id: str, tensor_name: str, size_bytes: int, caller: CallerIdentity) -> dict[str, Any]:
         session = self._get_owned_session(session_id, caller, "RegisterTensor")
@@ -366,7 +377,15 @@ class LocalBackend:
         self._save()
         return {"session_id": session_id, "migrations": migrations}
 
-    def run_step(self, session_id: str, step_name: str, caller: CallerIdentity) -> dict[str, Any]:
+    def run_step(
+        self,
+        session_id: str,
+        step_name: str,
+        caller: CallerIdentity,
+        prompt: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> dict[str, Any]:
         session = self._get_owned_session(session_id, caller, "RunStep")
         self._require_state(session, {SessionState.READY, SessionState.DEGRADED}, "RunStep")
         if not step_name:
@@ -394,6 +413,20 @@ class LocalBackend:
                 "fallback_step": session["fallback_current_step"],
                 "fallback_result": fallback_result,
             }
+            if prompt is not None:
+                result["prompt"] = prompt
+                result["generation"] = {
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "runtime_backend": session.get("runtime_backend"),
+                }
+                result["inference_result"] = {
+                    "backend": session.get("runtime_backend") or "simulation",
+                    "prompt": prompt,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "text": f"[simulated:{session.get('runtime_backend') or 'default'}] {prompt}",
+                }
             self._save()
             return result
         finally:
@@ -622,9 +655,18 @@ class RemoteBackend:
     def create_session(self, caller: CallerIdentity) -> dict[str, Any]:
         return {"session_id": self.sdk.CreateSession(caller_identity=caller)}
 
-    def load_model(self, session_id: str, model_name: str, caller: CallerIdentity) -> dict[str, Any]:
-        self.sdk.LoadModel(session_id, model_name, caller_identity=caller)
-        return {"session_id": session_id, "model_name": model_name}
+    def load_model(
+        self,
+        session_id: str,
+        model_name: str,
+        caller: CallerIdentity,
+        runtime_backend: str | None = None,
+    ) -> dict[str, Any]:
+        self.sdk.LoadModel(session_id, model_name, runtime_backend=runtime_backend, caller_identity=caller)
+        result = {"session_id": session_id, "model_name": model_name}
+        if runtime_backend is not None:
+            result["runtime_backend"] = runtime_backend
+        return result
 
     def register_tensor(self, session_id: str, tensor_name: str, size_bytes: int, caller: CallerIdentity) -> dict[str, Any]:
         self.sdk.RegisterTensor(session_id, tensor_name, size_bytes, caller_identity=caller)
@@ -637,8 +679,23 @@ class RemoteBackend:
     def prefetch_plan(self, session_id: str, caller: CallerIdentity) -> Any:
         return self.sdk.PrefetchPlan(session_id, caller_identity=caller)
 
-    def run_step(self, session_id: str, step_name: str, caller: CallerIdentity) -> Any:
-        return self.sdk.RunStep(session_id, step_name=step_name, caller_identity=caller)
+    def run_step(
+        self,
+        session_id: str,
+        step_name: str,
+        caller: CallerIdentity,
+        prompt: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> Any:
+        return self.sdk.RunStep(
+            session_id,
+            step_name=step_name,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            caller_identity=caller,
+        )
 
     def get_residency(self, session_id: str, caller: CallerIdentity) -> Any:
         return self.sdk.GetResidency(session_id, caller_identity=caller)
@@ -670,6 +727,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("load-model")
     p.add_argument("session_id")
     p.add_argument("model_name")
+    p.add_argument(
+        "--runtime-backend",
+        default=None,
+        help="Optional runtime backend selector for the loaded model (for example: auto, simulation, ollama).",
+    )
 
     p = sub.add_parser("register-tensor")
     p.add_argument("session_id")
@@ -687,6 +749,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("run-step")
     p.add_argument("session_id")
     p.add_argument("--step-name", default="run")
+    p.add_argument("--prompt", default=None)
+    p.add_argument("--max-tokens", type=int, default=None)
+    p.add_argument("--temperature", type=float, default=None)
 
     p = sub.add_parser("get-residency")
     p.add_argument("session_id")
@@ -719,7 +784,7 @@ def _dispatch(backend: LocalBackend, args: argparse.Namespace, caller: CallerIde
     if args.command == "create-session":
         return backend.create_session(caller)
     if args.command == "load-model":
-        return backend.load_model(args.session_id, args.model_name, caller)
+        return backend.load_model(args.session_id, args.model_name, caller, args.runtime_backend)
     if args.command == "register-tensor":
         return backend.register_tensor(args.session_id, args.tensor_name, args.size_bytes, caller)
     if args.command == "set-tier-hint":
@@ -727,7 +792,14 @@ def _dispatch(backend: LocalBackend, args: argparse.Namespace, caller: CallerIde
     if args.command == "prefetch-plan":
         return backend.prefetch_plan(args.session_id, caller)
     if args.command == "run-step":
-        return backend.run_step(args.session_id, args.step_name, caller)
+        return backend.run_step(
+            args.session_id,
+            args.step_name,
+            caller,
+            args.prompt,
+            args.max_tokens,
+            args.temperature,
+        )
     if args.command == "get-residency":
         return backend.get_residency(args.session_id, caller)
     if args.command == "get-pressure":

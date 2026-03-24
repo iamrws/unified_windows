@@ -96,12 +96,14 @@ class AstraWeaveSDK:
         session_id: str,
         model_name: str,
         *,
+        runtime_backend: str | None = None,
         caller_identity: CallerIdentity | None = None,
     ) -> Any:
         return self._invoke(
             "LoadModel",
             session_id,
             model_name,
+            runtime_backend=runtime_backend,
             caller_identity=caller_identity,
         )
 
@@ -150,12 +152,18 @@ class AstraWeaveSDK:
         session_id: str,
         step_name: str = "run",
         *,
+        prompt: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
         caller_identity: CallerIdentity | None = None,
     ) -> Any:
         return self._invoke(
             "RunStep",
             session_id,
             step_name,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
             caller_identity=caller_identity,
         )
 
@@ -202,21 +210,22 @@ class AstraWeaveSDK:
         method_name: str,
         *args: Any,
         caller_identity: CallerIdentity | None = None,
+        **kwargs: Any,
     ) -> Any:
         caller = self._resolve_caller_identity(caller_identity)
         method = getattr(self._client, method_name, None)
         if callable(method):
             try:
-                return method(*args, caller_identity=caller)
+                return method(*args, **kwargs, caller_identity=caller)
             except TypeError:
                 try:
-                    return method(*args, caller=caller)
+                    return method(*args, **kwargs, caller=caller)
                 except TypeError:
-                    return method(*args)
+                    return method(*args, **kwargs)
 
         call_fn = getattr(self._client, "call", None)
         if callable(call_fn):
-            params = self._build_params(method_name, args)
+            params = self._build_params(method_name, args, kwargs)
             return self._call_transport(call_fn, method_name, params, caller)
 
         raise RuntimeError(
@@ -256,12 +265,16 @@ class AstraWeaveSDK:
                 pass
         raise RuntimeError(f"Transport client cannot dispatch method '{method_name}'.")
 
-    def _build_params(self, method_name: str, args: tuple[Any, ...]) -> dict[str, Any]:
+    def _build_params(self, method_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
         if method_name == "CreateSession":
             return {}
         if method_name == "LoadModel":
             session_id, model_name = args
-            return {"session_id": session_id, "model_name": model_name}
+            params = {"session_id": session_id, "model_name": model_name}
+            runtime_backend = kwargs.get("runtime_backend")
+            if runtime_backend is not None:
+                params["runtime_backend"] = runtime_backend
+            return params
         if method_name == "RegisterTensor":
             session_id, tensor_name, size_bytes = args
             return {
@@ -281,7 +294,17 @@ class AstraWeaveSDK:
             return {"session_id": session_id}
         if method_name == "RunStep":
             session_id, step_name = args
-            return {"session_id": session_id, "step_name": step_name}
+            params = {"session_id": session_id, "step_name": step_name}
+            prompt = kwargs.get("prompt")
+            max_tokens = kwargs.get("max_tokens")
+            temperature = kwargs.get("temperature")
+            if prompt is not None:
+                params["prompt"] = prompt
+            if max_tokens is not None:
+                params["max_tokens"] = max_tokens
+            if temperature is not None:
+                params["temperature"] = temperature
+            return params
         if method_name == "GetResidency":
             (session_id,) = args
             return {"session_id": session_id}

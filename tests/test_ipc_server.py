@@ -49,6 +49,75 @@ class IpcServerContractTests(unittest.TestCase):
         request_cls = self._lookup(self.server_module, "IpcRequestEnvelope")
         return request_cls(id=request_id, method=method, params=params, caller=caller)
 
+    def _make_capturing_service(self):
+        policy_cls = self._lookup(self.security_module, "SecurityPolicy")
+        guard_cls = self._lookup(self.security_module, "SecurityGuard")
+        caller_cls = self._lookup(self.security_module, "CallerIdentity")
+        owner_sid = self.current_sid or getattr(self.service_module, "DEFAULT_SERVICE_OWNER_SID")
+
+        class _TelemetryStub:
+            def __init__(self) -> None:
+                self.records = []
+
+            def record_event(self, *args, **kwargs) -> None:
+                return None
+
+        class _ServiceStub:
+            def __init__(self) -> None:
+                self.security_guard = guard_cls(policy_cls(service_owner_sid=owner_sid))
+                self.telemetry = _TelemetryStub()
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            def CreateSession(self, caller_identity=None):
+                self.calls.append(("CreateSession", {"caller_identity": caller_identity}))
+                return "session-1"
+
+            def LoadModel(self, session_id, model_name, caller_identity=None, runtime_backend=None):
+                self.calls.append(
+                    (
+                        "LoadModel",
+                        {
+                            "session_id": session_id,
+                            "model_name": model_name,
+                            "caller_identity": caller_identity,
+                            "runtime_backend": runtime_backend,
+                        },
+                    )
+                )
+                return None
+
+            def RunStep(
+                self,
+                session_id,
+                step_name="run",
+                caller_identity=None,
+                prompt=None,
+                max_tokens=None,
+                temperature=None,
+            ):
+                self.calls.append(
+                    (
+                        "RunStep",
+                        {
+                            "session_id": session_id,
+                            "step_name": step_name,
+                            "caller_identity": caller_identity,
+                            "prompt": prompt,
+                            "max_tokens": max_tokens,
+                            "temperature": temperature,
+                        },
+                    )
+                )
+                return {
+                    "session_id": session_id,
+                    "step_name": step_name,
+                    "prompt": prompt,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                }
+
+        return _ServiceStub(), caller_cls(user_sid=owner_sid, pid=self.current_pid)
+
     def _dispatch(self, server, envelope):
         for name in ("handle_request", "dispatch", "process_request", "serve_envelope"):
             if hasattr(server, name):
@@ -240,6 +309,48 @@ class IpcServerContractTests(unittest.TestCase):
         response = self._dispatch(server, request)
         self.assertTrue(response["ok"])
         self.assertIsInstance(response["result"], str)
+
+    def test_server_forwards_runtime_backend_on_load_model(self) -> None:
+        service, caller = self._make_capturing_service()
+        server_cls = self._lookup(self.server_module, "AstraWeaveIpcServer")
+        server = server_cls(service, enforce_runtime_caller_attestation=False)
+        response = self._dispatch(
+            server,
+            self._make_request(
+                "LoadModel",
+                {"session_id": "session-1", "model_name": "demo-model", "runtime_backend": "ollama"},
+                caller=caller,
+                request_id="req-40",
+            ),
+        )
+        self.assertTrue(response["ok"])
+        self.assertEqual(service.calls[-1][0], "LoadModel")
+        self.assertEqual(service.calls[-1][1]["runtime_backend"], "ollama")
+
+    def test_server_forwards_prompt_generation_knobs_on_run_step(self) -> None:
+        service, caller = self._make_capturing_service()
+        server_cls = self._lookup(self.server_module, "AstraWeaveIpcServer")
+        server = server_cls(service, enforce_runtime_caller_attestation=False)
+        response = self._dispatch(
+            server,
+            self._make_request(
+                "RunStep",
+                {
+                    "session_id": "session-1",
+                    "step_name": "decode",
+                    "prompt": "hello",
+                    "max_tokens": 32,
+                    "temperature": 0.25,
+                },
+                caller=caller,
+                request_id="req-41",
+            ),
+        )
+        self.assertTrue(response["ok"])
+        self.assertEqual(service.calls[-1][0], "RunStep")
+        self.assertEqual(service.calls[-1][1]["prompt"], "hello")
+        self.assertEqual(service.calls[-1][1]["max_tokens"], 32)
+        self.assertEqual(service.calls[-1][1]["temperature"], 0.25)
 
     def test_server_rejects_sid_mismatch_for_live_process(self) -> None:
         server = self._make_server()

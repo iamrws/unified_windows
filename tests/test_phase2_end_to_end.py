@@ -69,7 +69,7 @@ class Phase2EndToEndTests(unittest.TestCase):
 
     def test_owner_flow_emits_telemetry_and_remote_state(self) -> None:
         session_id = self.sdk.CreateSession()
-        self.sdk.LoadModel(session_id, "demo-model")
+        self.sdk.LoadModel(session_id, "demo-model", runtime_backend="ollama")
         self.sdk.RegisterTensor(session_id, "kv", 1)
         self.sdk.SetTierHint(session_id, "kv", MemoryTier.HOT)
 
@@ -86,7 +86,13 @@ class Phase2EndToEndTests(unittest.TestCase):
         self.assertEqual(pressure.session_id, session_id)
         self.assertAlmostEqual(pressure.pressure_level, 1.0)
 
-        run_result = self.sdk.RunStep(session_id, step_name="decode")
+        run_result = self.sdk.RunStep(
+            session_id,
+            step_name="decode",
+            prompt="hello",
+            max_tokens=8,
+            temperature=0.1,
+        )
         self.assertEqual(run_result["session_id"], session_id)
         self.assertEqual(run_result["step_name"], "decode")
         self.assertEqual(run_result["state"], "DEGRADED")

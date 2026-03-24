@@ -8,6 +8,7 @@ validation and envelope semantics are centralized in the shared protocol layer.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from inspect import Parameter, signature
 from ipaddress import ip_address
 from multiprocessing.connection import Listener
 import os
@@ -512,7 +513,14 @@ class AstraWeaveIpcServer:
         if method == "LoadModel":
             session_id = self._require_str(params, "session_id")
             model_name = self._require_str(params, "model_name")
-            self._service.LoadModel(session_id, model_name, caller_identity=caller)
+            runtime_backend = self._optional_str(params, "runtime_backend")
+            self._call_service_method(
+                "LoadModel",
+                session_id,
+                model_name,
+                caller_identity=caller,
+                runtime_backend=runtime_backend,
+            )
             return None
         if method == "RegisterTensor":
             session_id = self._require_str(params, "session_id")
@@ -534,7 +542,18 @@ class AstraWeaveIpcServer:
             step_name = params.get("step_name", "run")
             if not isinstance(step_name, str) or not step_name.strip():
                 raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "step_name must be a non-empty string")
-            return self._service.RunStep(session_id, step_name=step_name, caller_identity=caller)
+            prompt = self._optional_str(params, "prompt")
+            max_tokens = self._optional_int(params, "max_tokens")
+            temperature = self._optional_float(params, "temperature")
+            return self._call_service_method(
+                "RunStep",
+                session_id,
+                step_name=step_name,
+                caller_identity=caller,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
         if method == "GetResidency":
             session_id = self._require_str(params, "session_id")
             return self._service.GetResidency(session_id, caller_identity=caller)
@@ -566,6 +585,48 @@ class AstraWeaveIpcServer:
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be a positive integer")
         return value
+
+    @staticmethod
+    def _optional_str(params: Mapping[str, Any], key: str) -> str | None:
+        value = params.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be a non-empty string")
+        return value
+
+    @staticmethod
+    def _optional_int(params: Mapping[str, Any], key: str) -> int | None:
+        value = params.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be an integer")
+        if value <= 0:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be a positive integer")
+        return value
+
+    @staticmethod
+    def _optional_float(params: Mapping[str, Any], key: str) -> float | None:
+        value = params.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be a number")
+        return float(value)
+
+    def _call_service_method(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        method = getattr(self._service, method_name)
+        try:
+            params = signature(method).parameters
+        except (TypeError, ValueError):  # pragma: no cover - unusual callable
+            return method(*args, **kwargs)
+
+        if any(param.kind == Parameter.VAR_KEYWORD for param in params.values()):
+            return method(*args, **kwargs)
+
+        filtered_kwargs = {key: value for key, value in kwargs.items() if key in params}
+        return method(*args, **filtered_kwargs)
 
     @staticmethod
     def _parse_memory_tier(value: Any) -> MemoryTier:
