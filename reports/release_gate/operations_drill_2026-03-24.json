@@ -1,0 +1,59 @@
+{
+  "drills": [
+    {
+      "details": {
+        "error_code": "AW_ERR_AUTH_DENIED",
+        "error_message": "AW_ERR_AUTH_DENIED: caller is not authorized for this local service",
+        "session_id": "bd105d80-22b1-45aa-b964-b6846cdd867b"
+      },
+      "drill_id": "DRILL-AUTH-ABUSE",
+      "ended_at": "2026-03-24T14:16:43.493154+00:00",
+      "expected": "Foreign caller is denied when attempting session access",
+      "observed": "Foreign caller denied with AW_ERR_AUTH_DENIED as expected",
+      "owner": "Security owner",
+      "passed": true,
+      "started_at": "2026-03-24T14:16:43.492885+00:00",
+      "title": "Unauthorized caller rejection"
+    },
+    {
+      "details": {
+        "contracted_budget_bytes": 16777216,
+        "correlation_id": "81ac52c8-38ee-4d89-a48d-c025384e9c7d:decode:run-bedd63de-402f-4fef-990e-4027aa0331f8",
+        "fallback_reason_code": "FALLBACK_INITIAL_STEP",
+        "original_budget_bytes": 8589934592,
+        "pressure_before": 0.0078125,
+        "pressure_contracted": 1.0,
+        "pressure_recovered": 0.0,
+        "session_id": "81ac52c8-38ee-4d89-a48d-c025384e9c7d"
+      },
+      "drill_id": "DRILL-BUDGET-CONTRACTION",
+      "ended_at": "2026-03-24T14:16:43.493633+00:00",
+      "expected": "Synthetic budget contraction raises pressure and emits reason-coded fallback; restored budget lowers pressure without hard failure",
+      "observed": "Budget contraction elevated pressure and triggered reason-coded fallback; pressure dropped after restoring budget",
+      "owner": "Platform owner",
+      "passed": true,
+      "started_at": "2026-03-24T14:16:43.493164+00:00",
+      "title": "Budget contraction and recovery"
+    },
+    {
+      "details": {
+        "candidate_endpoint": "tcp://127.0.0.1:52618",
+        "candidate_served_requests": 3,
+        "rollback_endpoint": "tcp://127.0.0.1:52620",
+        "rollback_served_requests": 3
+      },
+      "drill_id": "DRILL-ROLLBACK",
+      "ended_at": "2026-03-24T14:16:43.500326+00:00",
+      "expected": "Rollback path serves successful probe traffic after candidate shutdown",
+      "observed": "Candidate runtime served traffic, was stopped, and replacement runtime served traffic",
+      "owner": "Release owner",
+      "passed": true,
+      "started_at": "2026-03-24T14:16:43.493643+00:00",
+      "title": "Candidate-to-previous rollback validation"
+    }
+  ],
+  "ended_at": "2026-03-24T14:16:43.500345+00:00",
+  "run_id": "2026-03-24",
+  "started_at": "2026-03-24T14:16:43.492876+00:00",
+  "verdict": "pass"
+}

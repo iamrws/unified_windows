@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-03-24T14:25:18.844583+00:00",
+  "profiles": {
+    "P-A": {
+      "passed": true,
+      "status": "ok",
+      "test": "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pa_primary_maps_to_numa_dgpu"
+    },
+    "P-B": {
+      "passed": true,
+      "status": "ok",
+      "test": "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pb_secondary_maps_to_cache_coherent_uma"
+    },
+    "P-C": {
+      "passed": true,
+      "status": "ok",
+      "test": "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pc_degraded_maps_to_uma"
+    },
+    "P-D": {
+      "passed": true,
+      "status": "ok",
+      "test": "test_capability_matrix_contract.CapabilityMatrixContractTests.test_profile_pd_unsupported_fails_fast"
+    }
+  },
+  "run_id": "2026-03-24",
+  "source_unittest_log": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\runlogs\\unittest_rc_2026-03-24.txt",
+  "verdict": "pass"
+}

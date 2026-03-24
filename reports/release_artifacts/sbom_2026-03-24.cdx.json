@@ -1,0 +1,36 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [],
+  "dependencies": [
+    {
+      "dependsOn": [],
+      "ref": "pkg:pypi/astrawave@0.1.0-rc"
+    }
+  ],
+  "metadata": {
+    "component": {
+      "bom-ref": "pkg:pypi/astrawave@0.1.0-rc",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "name": "astrawave",
+      "type": "application",
+      "version": "0.1.0-rc"
+    },
+    "timestamp": "2026-03-24T14:18:33.894911+00:00",
+    "tools": [
+      {
+        "name": "generate_compliance_artifacts.py",
+        "vendor": "AstraWeave",
+        "version": "1"
+      }
+    ]
+  },
+  "serialNumber": "urn:uuid:40e70133-eb11-4c44-9088-03fa7cb14a58",
+  "specVersion": "1.5",
+  "version": 1
+}

@@ -1,0 +1,14 @@
+{
+  "artifacts": {
+    "attribution": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\release_artifacts\\attribution_2026-03-24.json",
+    "checksums": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\release_artifacts\\checksums_2026-03-24.json",
+    "sbom": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\release_artifacts\\sbom_2026-03-24.cdx.json",
+    "signing_verification": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\release_artifacts\\signing_verification_2026-03-24.json"
+  },
+  "generated_at": "2026-03-24T14:18:33.897065+00:00",
+  "run_id": "2026-03-24",
+  "summary": {
+    "source_only_rc": true,
+    "third_party_dependency_count": 0
+  }
+}

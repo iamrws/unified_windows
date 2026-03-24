@@ -1,0 +1,19 @@
+{
+  "algorithm": "sha256",
+  "files": [
+    {
+      "path": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\release_artifacts\\sbom_2026-03-24.cdx.json",
+      "sha256": "2a84b9921667bd1dea359214bfd151c92e48e02dab3ba6eae661f8457d972c44"
+    },
+    {
+      "path": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\release_artifacts\\attribution_2026-03-24.json",
+      "sha256": "40617f30a4bb907ed39c20aa13e91c962a4a1a1f623cc268f13081529b01afa5"
+    },
+    {
+      "path": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\release_artifacts\\signing_verification_2026-03-24.json",
+      "sha256": "fc8173b83e43a7e8d25f561f904a5128b764291eb613e6e0c2b5623117fbb74c"
+    }
+  ],
+  "generated_at": "2026-03-24T14:18:33.896395+00:00",
+  "run_id": "2026-03-24"
+}

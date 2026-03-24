@@ -1,0 +1,94 @@
+{
+  "gates": {
+    "explainability_reason_code_and_correlation": {
+      "missing_or_failed": [],
+      "passed": true,
+      "tests": [
+        "test_integrated_service_contract.IntegratedServiceContractTests.test_service_emits_telemetry_events_with_stable_reason_codes_and_correlation_ids"
+      ]
+    },
+    "latency_p95_le_250ms": {
+      "measured_p95_ms": 183.845,
+      "passed": true,
+      "threshold_ms": 250.0
+    },
+    "reliability_zero_hard_oom": {
+      "details": "Both workloads completed >=100 iterations with zero failures.",
+      "passed": true
+    },
+    "stability_anti_oscillation": {
+      "missing_or_failed": [],
+      "passed": true,
+      "tests": [
+        "test_fallback_contract.FallbackContractTests.test_controller_declines_step_changes_inside_cooldown_window",
+        "test_fallback_contract.FallbackContractTests.test_controller_respects_cooldown_before_advancing",
+        "test_fallback_contract.FallbackContractTests.test_anti_oscillation_defaults_are_locked"
+      ]
+    }
+  },
+  "generated_at": "2026-03-24T14:25:18.845255+00:00",
+  "run_id": "2026-03-24",
+  "verdict": "pass",
+  "workloads": {
+    "W-13B-CHAT": {
+      "elapsed_seconds": 88.039,
+      "ended_at": "2026-03-24T09:14:38.5795813-05:00",
+      "endpoint": "tcp://127.0.0.1:8765",
+      "failure_count": 0,
+      "files": {
+        "gpu_log": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\runlogs\\gpu_rc_w13b_chat_2026-03-24.csv",
+        "service_stderr": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\runlogs\\service_stderr_rc_w13b_chat_2026-03-24.log",
+        "service_stdout": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\runlogs\\service_stdout_rc_w13b_chat_2026-03-24.log",
+        "soak_log": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\runlogs\\soak_rc_w13b_chat_2026-03-24.jsonl",
+        "summary_log": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\runlogs\\summary_rc_w13b_chat_2026-03-24.json",
+        "unit_test_log": null
+      },
+      "first_failure": null,
+      "iterations": 100,
+      "model_name": "W-13B-CHAT",
+      "run_id": "rc_w13b_chat_2026-03-24",
+      "run_step_p50_ms": 177.818,
+      "run_step_p95_ms": 183.845,
+      "started_at": "2026-03-24T09:13:10.5404944-05:00",
+      "step_name": "decode",
+      "success_count": 100,
+      "success_rate": 100,
+      "tensor_bytes": 2097152,
+      "tensor_name": "kv",
+      "unit_test_exit_code": null,
+      "unit_tests_skipped": true,
+      "verdict": "pass",
+      "workload_id": "W-13B-CHAT"
+    },
+    "W-7B-CHAT": {
+      "elapsed_seconds": 87.934,
+      "ended_at": "2026-03-24T09:12:57.1790920-05:00",
+      "endpoint": "tcp://127.0.0.1:8765",
+      "failure_count": 0,
+      "files": {
+        "gpu_log": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\runlogs\\gpu_rc_w7b_chat_2026-03-24.csv",
+        "service_stderr": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\runlogs\\service_stderr_rc_w7b_chat_2026-03-24.log",
+        "service_stdout": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\runlogs\\service_stdout_rc_w7b_chat_2026-03-24.log",
+        "soak_log": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\runlogs\\soak_rc_w7b_chat_2026-03-24.jsonl",
+        "summary_log": "C:\\Users\\grzeg\\Documents\\Jito\\testmarch24\\unified_windows\\reports\\runlogs\\summary_rc_w7b_chat_2026-03-24.json",
+        "unit_test_log": null
+      },
+      "first_failure": null,
+      "iterations": 100,
+      "model_name": "W-7B-CHAT",
+      "run_id": "rc_w7b_chat_2026-03-24",
+      "run_step_p50_ms": 176.45,
+      "run_step_p95_ms": 181.811,
+      "started_at": "2026-03-24T09:11:29.2446785-05:00",
+      "step_name": "decode",
+      "success_count": 100,
+      "success_rate": 100,
+      "tensor_bytes": 1048576,
+      "tensor_name": "kv",
+      "unit_test_exit_code": null,
+      "unit_tests_skipped": true,
+      "verdict": "pass",
+      "workload_id": "W-7B-CHAT"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "artifact_type": "source-only",
+  "binary_artifacts_discovered": [],
+  "channel": "rc",
+  "generated_at": "2026-03-24T14:18:33.896031+00:00",
+  "run_id": "2026-03-24",
+  "signing_policy_for_binaries": "required",
+  "verification_notes": [
+    "No compiled binaries were generated in this RC evidence bundle.",
+    "If binary artifacts are later produced, code-sign verification becomes mandatory."
+  ],
+  "verification_status": "not_applicable_for_source_only_rc"
+}
