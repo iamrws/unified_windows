@@ -514,12 +514,16 @@ class AstraWeaveIpcServer:
             session_id = self._require_str(params, "session_id")
             model_name = self._require_str(params, "model_name")
             runtime_backend = self._optional_str(params, "runtime_backend")
+            runtime_profile = self._optional_str(params, "runtime_profile")
+            runtime_backend_options = self._optional_tuning_options(params, "runtime_backend_options")
             self._call_service_method(
                 "LoadModel",
                 session_id,
                 model_name,
                 caller_identity=caller,
                 runtime_backend=runtime_backend,
+                runtime_profile=runtime_profile,
+                runtime_backend_options=runtime_backend_options,
             )
             return None
         if method == "RegisterTensor":
@@ -545,6 +549,11 @@ class AstraWeaveIpcServer:
             prompt = self._optional_str(params, "prompt")
             max_tokens = self._optional_int(params, "max_tokens")
             temperature = self._optional_float(params, "temperature")
+            runtime_profile_override = self._optional_str(params, "runtime_profile_override")
+            runtime_backend_options_override = self._optional_tuning_options(
+                params,
+                "runtime_backend_options_override",
+            )
             return self._call_service_method(
                 "RunStep",
                 session_id,
@@ -553,6 +562,8 @@ class AstraWeaveIpcServer:
                 prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                runtime_profile_override=runtime_profile_override,
+                runtime_backend_options_override=runtime_backend_options_override,
             )
         if method == "GetResidency":
             session_id = self._require_str(params, "session_id")
@@ -614,6 +625,21 @@ class AstraWeaveIpcServer:
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be a number")
         return float(value)
+
+    @staticmethod
+    def _optional_tuning_options(params: Mapping[str, Any], key: str) -> dict[str, Any] | None:
+        value = params.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, Mapping):
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} must be a JSON object")
+
+        normalized: dict[str, Any] = {}
+        for option_key, option_value in value.items():
+            if not isinstance(option_key, str) or not option_key.strip():
+                raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{key} keys must be non-empty strings")
+            normalized[option_key.strip()] = option_value
+        return normalized
 
     def _call_service_method(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
         method = getattr(self._service, method_name)

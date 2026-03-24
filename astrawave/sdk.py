@@ -97,6 +97,8 @@ class AstraWeaveSDK:
         model_name: str,
         *,
         runtime_backend: str | None = None,
+        runtime_profile: str | None = None,
+        runtime_backend_options: dict[str, Any] | None = None,
         caller_identity: CallerIdentity | None = None,
     ) -> Any:
         return self._invoke(
@@ -104,6 +106,8 @@ class AstraWeaveSDK:
             session_id,
             model_name,
             runtime_backend=runtime_backend,
+            runtime_profile=runtime_profile,
+            runtime_backend_options=runtime_backend_options,
             caller_identity=caller_identity,
         )
 
@@ -155,6 +159,8 @@ class AstraWeaveSDK:
         prompt: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        runtime_profile_override: str | None = None,
+        runtime_backend_options_override: dict[str, Any] | None = None,
         caller_identity: CallerIdentity | None = None,
     ) -> Any:
         return self._invoke(
@@ -164,6 +170,8 @@ class AstraWeaveSDK:
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
+            runtime_profile_override=runtime_profile_override,
+            runtime_backend_options_override=runtime_backend_options_override,
             caller_identity=caller_identity,
         )
 
@@ -274,6 +282,12 @@ class AstraWeaveSDK:
             runtime_backend = kwargs.get("runtime_backend")
             if runtime_backend is not None:
                 params["runtime_backend"] = runtime_backend
+            runtime_profile = kwargs.get("runtime_profile")
+            if runtime_profile is not None:
+                params["runtime_profile"] = runtime_profile
+            runtime_backend_options = kwargs.get("runtime_backend_options")
+            if runtime_backend_options is not None:
+                params["runtime_backend_options"] = runtime_backend_options
             return params
         if method_name == "RegisterTensor":
             session_id, tensor_name, size_bytes = args
@@ -298,12 +312,18 @@ class AstraWeaveSDK:
             prompt = kwargs.get("prompt")
             max_tokens = kwargs.get("max_tokens")
             temperature = kwargs.get("temperature")
+            runtime_profile_override = kwargs.get("runtime_profile_override")
+            runtime_backend_options_override = kwargs.get("runtime_backend_options_override")
             if prompt is not None:
                 params["prompt"] = prompt
             if max_tokens is not None:
                 params["max_tokens"] = max_tokens
             if temperature is not None:
                 params["temperature"] = temperature
+            if runtime_profile_override is not None:
+                params["runtime_profile_override"] = runtime_profile_override
+            if runtime_backend_options_override is not None:
+                params["runtime_backend_options_override"] = runtime_backend_options_override
             return params
         if method_name == "GetResidency":
             (session_id,) = args

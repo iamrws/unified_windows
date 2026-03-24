@@ -72,7 +72,15 @@ class IpcServerContractTests(unittest.TestCase):
                 self.calls.append(("CreateSession", {"caller_identity": caller_identity}))
                 return "session-1"
 
-            def LoadModel(self, session_id, model_name, caller_identity=None, runtime_backend=None):
+            def LoadModel(
+                self,
+                session_id,
+                model_name,
+                caller_identity=None,
+                runtime_backend=None,
+                runtime_profile=None,
+                runtime_backend_options=None,
+            ):
                 self.calls.append(
                     (
                         "LoadModel",
@@ -81,6 +89,8 @@ class IpcServerContractTests(unittest.TestCase):
                             "model_name": model_name,
                             "caller_identity": caller_identity,
                             "runtime_backend": runtime_backend,
+                            "runtime_profile": runtime_profile,
+                            "runtime_backend_options": runtime_backend_options,
                         },
                     )
                 )
@@ -94,6 +104,8 @@ class IpcServerContractTests(unittest.TestCase):
                 prompt=None,
                 max_tokens=None,
                 temperature=None,
+                runtime_profile_override=None,
+                runtime_backend_options_override=None,
             ):
                 self.calls.append(
                     (
@@ -105,6 +117,8 @@ class IpcServerContractTests(unittest.TestCase):
                             "prompt": prompt,
                             "max_tokens": max_tokens,
                             "temperature": temperature,
+                            "runtime_profile_override": runtime_profile_override,
+                            "runtime_backend_options_override": runtime_backend_options_override,
                         },
                     )
                 )
@@ -114,6 +128,8 @@ class IpcServerContractTests(unittest.TestCase):
                     "prompt": prompt,
                     "max_tokens": max_tokens,
                     "temperature": temperature,
+                    "runtime_profile_override": runtime_profile_override,
+                    "runtime_backend_options_override": runtime_backend_options_override,
                 }
 
         return _ServiceStub(), caller_cls(user_sid=owner_sid, pid=self.current_pid)
@@ -326,6 +342,31 @@ class IpcServerContractTests(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(service.calls[-1][0], "LoadModel")
         self.assertEqual(service.calls[-1][1]["runtime_backend"], "ollama")
+        self.assertIsNone(service.calls[-1][1]["runtime_profile"])
+        self.assertIsNone(service.calls[-1][1]["runtime_backend_options"])
+
+    def test_server_forwards_runtime_tuning_controls_on_load_model(self) -> None:
+        service, caller = self._make_capturing_service()
+        server_cls = self._lookup(self.server_module, "AstraWeaveIpcServer")
+        server = server_cls(service, enforce_runtime_caller_attestation=False)
+        response = self._dispatch(
+            server,
+            self._make_request(
+                "LoadModel",
+                {
+                    "session_id": "session-1",
+                    "model_name": "qwen2.5:14b",
+                    "runtime_backend": "ollama",
+                    "runtime_profile": "vram_constrained",
+                    "runtime_backend_options": {"num_ctx": 4096, "num_batch": 1},
+                },
+                caller=caller,
+                request_id="req-40b",
+            ),
+        )
+        self.assertTrue(response["ok"])
+        self.assertEqual(service.calls[-1][1]["runtime_profile"], "vram_constrained")
+        self.assertEqual(service.calls[-1][1]["runtime_backend_options"], {"num_ctx": 4096, "num_batch": 1})
 
     def test_server_forwards_prompt_generation_knobs_on_run_step(self) -> None:
         service, caller = self._make_capturing_service()
@@ -351,6 +392,34 @@ class IpcServerContractTests(unittest.TestCase):
         self.assertEqual(service.calls[-1][1]["prompt"], "hello")
         self.assertEqual(service.calls[-1][1]["max_tokens"], 32)
         self.assertEqual(service.calls[-1][1]["temperature"], 0.25)
+        self.assertIsNone(service.calls[-1][1]["runtime_profile_override"])
+        self.assertIsNone(service.calls[-1][1]["runtime_backend_options_override"])
+
+    def test_server_forwards_step_runtime_tuning_controls(self) -> None:
+        service, caller = self._make_capturing_service()
+        server_cls = self._lookup(self.server_module, "AstraWeaveIpcServer")
+        server = server_cls(service, enforce_runtime_caller_attestation=False)
+        response = self._dispatch(
+            server,
+            self._make_request(
+                "RunStep",
+                {
+                    "session_id": "session-1",
+                    "step_name": "decode",
+                    "prompt": "hello",
+                    "runtime_profile_override": "memory_saver",
+                    "runtime_backend_options_override": {"num_predict": 64, "top_p": 0.9},
+                },
+                caller=caller,
+                request_id="req-41b",
+            ),
+        )
+        self.assertTrue(response["ok"])
+        self.assertEqual(service.calls[-1][1]["runtime_profile_override"], "memory_saver")
+        self.assertEqual(
+            service.calls[-1][1]["runtime_backend_options_override"],
+            {"num_predict": 64, "top_p": 0.9},
+        )
 
     def test_server_rejects_sid_mismatch_for_live_process(self) -> None:
         server = self._make_server()

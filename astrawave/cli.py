@@ -53,6 +53,10 @@ DEFAULT_ENDPOINT = "auto"
 HIGH_PRESSURE_THRESHOLD = 0.75
 DEFAULT_SERVE_ENDPOINT = "auto"
 DEFAULT_SERVE_DURATION_SECONDS: float | None = None
+_POSITIVE_INT_OPTION_KEYS = {"num_ctx", "num_batch", "num_predict", "num_keep", "top_k"}
+_NONNEGATIVE_INT_OPTION_KEYS = {"gpu_layers", "num_gpu"}
+_NONNEGATIVE_FLOAT_OPTION_KEYS = {"temperature"}
+_OPEN_INTERVAL_FLOAT_OPTION_KEYS = {"top_p", "repeat_penalty"}
 
 
 def _now_ms() -> int:
@@ -173,6 +177,68 @@ def _parse_port_value(text: str, *, allow_zero: bool) -> int:
         bound = "0-65535" if allow_zero else "1-65535"
         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"TCP port must be in range {bound}")
     return port
+
+
+def _parse_runtime_option_pairs(
+    raw_options: Sequence[str] | None,
+    *,
+    field_name: str,
+) -> dict[str, Any] | None:
+    if raw_options is None:
+        return None
+    parsed: dict[str, Any] = {}
+    for raw_item in raw_options:
+        if "=" not in raw_item:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name} entries must use key=value syntax")
+        key_text, raw_value = raw_item.split("=", 1)
+        key = key_text.strip()
+        if not key:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name} keys must be non-empty strings")
+        parsed[key] = _parse_runtime_option_value(field_name, key, raw_value.strip())
+    return parsed
+
+
+def _parse_runtime_option_value(field_name: str, key: str, raw_value: str) -> Any:
+    try:
+        value = json.loads(raw_value)
+    except json.JSONDecodeError:
+        value = raw_value
+
+    if key in _POSITIVE_INT_OPTION_KEYS:
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be a positive integer")
+        return value
+    if key in _NONNEGATIVE_INT_OPTION_KEYS:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be a non-negative integer")
+        return value
+    if key in _NONNEGATIVE_FLOAT_OPTION_KEYS:
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or float(value) < 0.0:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be a non-negative number")
+        return float(value)
+    if key == "top_p":
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be a number")
+        numeric_value = float(value)
+        if numeric_value <= 0.0 or numeric_value > 1.0:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be between 0 and 1")
+        return numeric_value
+    if key in _OPEN_INTERVAL_FLOAT_OPTION_KEYS:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be a number")
+        numeric_value = float(value)
+        if numeric_value <= 0.0:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be greater than 0")
+        return numeric_value
+    return value
+
+
+def _normalize_runtime_profile(field_name: str, value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name} must be a non-empty string")
+    return value.strip()
 
 
 def _parse_serve_endpoint(endpoint: str, transport: str) -> dict[str, Any]:
@@ -327,18 +393,27 @@ class LocalBackend:
         model_name: str,
         caller: CallerIdentity,
         runtime_backend: str | None = None,
+        runtime_profile: str | None = None,
+        runtime_backend_options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         session = self._get_owned_session(session_id, caller, "LoadModel")
         self._require_state(session, {SessionState.SESSION_CREATED}, "LoadModel")
         if not model_name:
             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "model_name must not be empty")
+        normalized_profile = _normalize_runtime_profile("runtime_profile", runtime_profile)
         session["model_name"] = model_name
         session["runtime_backend"] = runtime_backend
+        session["runtime_profile"] = normalized_profile
+        session["runtime_backend_options"] = runtime_backend_options or {}
         session["state"] = SessionState.READY.value
         self._save()
         result = {"session_id": session_id, "model_name": model_name, "state": session["state"]}
         if runtime_backend is not None:
             result["runtime_backend"] = runtime_backend
+        if normalized_profile is not None:
+            result["runtime_profile"] = normalized_profile
+        if runtime_backend_options is not None:
+            result["runtime_backend_options"] = runtime_backend_options
         return result
 
     def register_tensor(self, session_id: str, tensor_name: str, size_bytes: int, caller: CallerIdentity) -> dict[str, Any]:
@@ -385,11 +460,17 @@ class LocalBackend:
         prompt: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        runtime_profile_override: str | None = None,
+        runtime_backend_options_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         session = self._get_owned_session(session_id, caller, "RunStep")
         self._require_state(session, {SessionState.READY, SessionState.DEGRADED}, "RunStep")
         if not step_name:
             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "step_name must not be empty")
+        normalized_profile_override = _normalize_runtime_profile(
+            "runtime_profile_override",
+            runtime_profile_override,
+        )
         if session["active_run"]:
             raise ApiError(ApiErrorCode.CONFLICT_RUN_IN_PROGRESS, "a RunStep is already active")
         session["active_run"] = True
@@ -419,14 +500,26 @@ class LocalBackend:
                     "max_tokens": max_tokens,
                     "temperature": temperature,
                     "runtime_backend": session.get("runtime_backend"),
+                    "runtime_profile": session.get("runtime_profile"),
+                    "runtime_backend_options": session.get("runtime_backend_options", {}),
+                    "runtime_profile_override": normalized_profile_override,
+                    "runtime_backend_options_override": runtime_backend_options_override,
                 }
                 result["inference_result"] = {
                     "backend": session.get("runtime_backend") or "simulation",
                     "prompt": prompt,
                     "max_tokens": max_tokens,
                     "temperature": temperature,
+                    "runtime_profile": session.get("runtime_profile"),
+                    "runtime_backend_options": session.get("runtime_backend_options", {}),
+                    "runtime_profile_override": normalized_profile_override,
+                    "runtime_backend_options_override": runtime_backend_options_override,
                     "text": f"[simulated:{session.get('runtime_backend') or 'default'}] {prompt}",
                 }
+            if normalized_profile_override is not None:
+                result["runtime_profile_override"] = normalized_profile_override
+            if runtime_backend_options_override is not None:
+                result["runtime_backend_options_override"] = runtime_backend_options_override
             self._save()
             return result
         finally:
@@ -661,11 +754,24 @@ class RemoteBackend:
         model_name: str,
         caller: CallerIdentity,
         runtime_backend: str | None = None,
+        runtime_profile: str | None = None,
+        runtime_backend_options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        self.sdk.LoadModel(session_id, model_name, runtime_backend=runtime_backend, caller_identity=caller)
+        self.sdk.LoadModel(
+            session_id,
+            model_name,
+            runtime_backend=runtime_backend,
+            runtime_profile=runtime_profile,
+            runtime_backend_options=runtime_backend_options,
+            caller_identity=caller,
+        )
         result = {"session_id": session_id, "model_name": model_name}
         if runtime_backend is not None:
             result["runtime_backend"] = runtime_backend
+        if runtime_profile is not None:
+            result["runtime_profile"] = runtime_profile
+        if runtime_backend_options is not None:
+            result["runtime_backend_options"] = runtime_backend_options
         return result
 
     def register_tensor(self, session_id: str, tensor_name: str, size_bytes: int, caller: CallerIdentity) -> dict[str, Any]:
@@ -687,6 +793,8 @@ class RemoteBackend:
         prompt: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        runtime_profile_override: str | None = None,
+        runtime_backend_options_override: dict[str, Any] | None = None,
     ) -> Any:
         return self.sdk.RunStep(
             session_id,
@@ -694,6 +802,8 @@ class RemoteBackend:
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
+            runtime_profile_override=runtime_profile_override,
+            runtime_backend_options_override=runtime_backend_options_override,
             caller_identity=caller,
         )
 
@@ -732,6 +842,19 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional runtime backend selector for the loaded model (for example: auto, simulation, ollama).",
     )
+    p.add_argument(
+        "--runtime-profile",
+        default=None,
+        help="Optional load-time tuning profile (for example: auto or vram_constrained).",
+    )
+    p.add_argument(
+        "--runtime-option",
+        dest="runtime_options",
+        action="append",
+        default=None,
+        metavar="KEY=VALUE",
+        help="Optional load-time backend tuning option; may be repeated.",
+    )
 
     p = sub.add_parser("register-tensor")
     p.add_argument("session_id")
@@ -752,6 +875,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prompt", default=None)
     p.add_argument("--max-tokens", type=int, default=None)
     p.add_argument("--temperature", type=float, default=None)
+    p.add_argument(
+        "--runtime-profile-override",
+        default=None,
+        help="Optional per-step tuning profile override.",
+    )
+    p.add_argument(
+        "--runtime-option-override",
+        dest="runtime_option_overrides",
+        action="append",
+        default=None,
+        metavar="KEY=VALUE",
+        help="Optional per-step backend tuning option override; may be repeated.",
+    )
 
     p = sub.add_parser("get-residency")
     p.add_argument("session_id")
@@ -784,7 +920,15 @@ def _dispatch(backend: LocalBackend, args: argparse.Namespace, caller: CallerIde
     if args.command == "create-session":
         return backend.create_session(caller)
     if args.command == "load-model":
-        return backend.load_model(args.session_id, args.model_name, caller, args.runtime_backend)
+        runtime_backend_options = _parse_runtime_option_pairs(args.runtime_options, field_name="runtime_options")
+        return backend.load_model(
+            args.session_id,
+            args.model_name,
+            caller,
+            args.runtime_backend,
+            args.runtime_profile,
+            runtime_backend_options,
+        )
     if args.command == "register-tensor":
         return backend.register_tensor(args.session_id, args.tensor_name, args.size_bytes, caller)
     if args.command == "set-tier-hint":
@@ -792,6 +936,10 @@ def _dispatch(backend: LocalBackend, args: argparse.Namespace, caller: CallerIde
     if args.command == "prefetch-plan":
         return backend.prefetch_plan(args.session_id, caller)
     if args.command == "run-step":
+        runtime_backend_options_override = _parse_runtime_option_pairs(
+            args.runtime_option_overrides,
+            field_name="runtime_option_overrides",
+        )
         return backend.run_step(
             args.session_id,
             args.step_name,
@@ -799,6 +947,8 @@ def _dispatch(backend: LocalBackend, args: argparse.Namespace, caller: CallerIde
             args.prompt,
             args.max_tokens,
             args.temperature,
+            args.runtime_profile_override,
+            runtime_backend_options_override,
         )
     if args.command == "get-residency":
         return backend.get_residency(args.session_id, caller)

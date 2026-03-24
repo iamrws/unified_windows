@@ -170,6 +170,73 @@ class AstraWeaveCliContractTests(unittest.TestCase):
         self.assertEqual(step_envelope["result"]["generation"]["temperature"], 0.2)
         self.assertEqual(step_envelope["result"]["inference_result"]["backend"], "ollama")
 
+    def test_local_backend_accepts_runtime_tuning_flags(self) -> None:
+        create = self.run_cli("--backend", "local", "create-session")
+        self.assertEqual(create.returncode, 0, create.stderr)
+        session_id = self.assert_success_envelope(create.stdout)["result"]["session_id"]
+
+        load = self.run_cli(
+            "--backend",
+            "local",
+            "load-model",
+            str(session_id),
+            "qwen2.5:14b",
+            "--runtime-profile",
+            "vram_constrained",
+            "--runtime-option",
+            "num_ctx=4096",
+            "--runtime-option",
+            "num_batch=1",
+        )
+        self.assertEqual(load.returncode, 0, load.stderr)
+        load_envelope = self.assert_success_envelope(load.stdout)
+        self.assertEqual(load_envelope["result"]["runtime_profile"], "vram_constrained")
+        self.assertEqual(load_envelope["result"]["runtime_backend_options"], {"num_ctx": 4096, "num_batch": 1})
+
+        step = self.run_cli(
+            "--backend",
+            "local",
+            "run-step",
+            str(session_id),
+            "--step-name",
+            "decode",
+            "--prompt",
+            "Write a one-line summary.",
+            "--runtime-profile-override",
+            "memory_saver",
+            "--runtime-option-override",
+            "num_predict=64",
+            "--runtime-option-override",
+            "top_p=0.9",
+        )
+        self.assertEqual(step.returncode, 0, step.stderr)
+        step_envelope = self.assert_success_envelope(step.stdout)
+        self.assertEqual(step_envelope["result"]["generation"]["runtime_profile"], "vram_constrained")
+        self.assertEqual(step_envelope["result"]["generation"]["runtime_profile_override"], "memory_saver")
+        self.assertEqual(
+            step_envelope["result"]["generation"]["runtime_backend_options_override"],
+            {"num_predict": 64, "top_p": 0.9},
+        )
+        self.assertEqual(step_envelope["result"]["inference_result"]["runtime_profile"], "vram_constrained")
+
+    def test_runtime_option_validation_is_typed_for_cli(self) -> None:
+        create = self.run_cli("--backend", "local", "create-session")
+        self.assertEqual(create.returncode, 0, create.stderr)
+        session_id = self.assert_success_envelope(create.stdout)["result"]["session_id"]
+
+        completed = self.run_cli(
+            "--backend",
+            "local",
+            "load-model",
+            str(session_id),
+            "demo-model",
+            "--runtime-option",
+            "num_ctx=0",
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        envelope = self.assert_error_envelope(completed.stderr)
+        self.assertEqual(envelope["error"]["code"], "AW_ERR_INVALID_ARGUMENT")
+
     def test_default_backend_prefers_remote_and_fails_cleanly_without_server(self) -> None:
         auto_state = self._endpoint_path("auto")
         if auto_state.exists():

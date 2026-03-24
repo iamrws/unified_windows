@@ -33,6 +33,10 @@ from .types import MemoryTier, PolicyProfile, PressureSnapshot, ResidencySnapsho
 
 DEFAULT_TCP_ENDPOINT = "tcp://127.0.0.1:8765"
 DEFAULT_PIPE_NAME = r"\\.\pipe\astrawave"
+_POSITIVE_INT_OPTION_KEYS = {"num_ctx", "num_batch", "num_predict", "num_keep", "top_k"}
+_NONNEGATIVE_INT_OPTION_KEYS = {"gpu_layers", "num_gpu"}
+_NONNEGATIVE_FLOAT_OPTION_KEYS = {"temperature"}
+_OPEN_INTERVAL_FLOAT_OPTION_KEYS = {"top_p", "repeat_penalty"}
 
 
 def _authkey_from_env() -> bytes | None:
@@ -104,6 +108,59 @@ def _jsonify(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonify(item) for item in value]
     return value
+
+
+def _validate_tuning_profile(field_name: str, value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name} must be a non-empty string")
+    return value.strip()
+
+
+def _validate_tuning_options(field_name: str, options: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if options is None:
+        return None
+    if not isinstance(options, Mapping):
+        raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name} must be a JSON object")
+
+    normalized: dict[str, Any] = {}
+    for raw_key, raw_value in options.items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name} keys must be non-empty strings")
+        key = raw_key.strip()
+        normalized[key] = _validate_tuning_option_value(field_name, key, raw_value)
+    return normalized
+
+
+def _validate_tuning_option_value(field_name: str, key: str, value: Any) -> Any:
+    if key in _POSITIVE_INT_OPTION_KEYS:
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be a positive integer")
+        return value
+    if key in _NONNEGATIVE_INT_OPTION_KEYS:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be a non-negative integer")
+        return value
+    if key in _NONNEGATIVE_FLOAT_OPTION_KEYS:
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or float(value) < 0.0:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be a non-negative number")
+        return float(value)
+    if key == "top_p":
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be a number")
+        numeric_value = float(value)
+        if numeric_value <= 0.0 or numeric_value > 1.0:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be between 0 and 1")
+        return numeric_value
+    if key in _OPEN_INTERVAL_FLOAT_OPTION_KEYS:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be a number")
+        numeric_value = float(value)
+        if numeric_value <= 0.0:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"{field_name}.{key} must be greater than 0")
+        return numeric_value
+    return _jsonify(value)
 
 
 def _coerce_pressure_snapshot(value: Any) -> PressureSnapshot:
@@ -393,10 +450,18 @@ class AstraWeaveIpcClient:
         caller: CallerIdentity | None = None,
         *,
         runtime_backend: str | None = None,
+        runtime_profile: str | None = None,
+        runtime_backend_options: Mapping[str, Any] | None = None,
     ) -> None:
         params: dict[str, Any] = {"session_id": session_id, "model_name": model_name}
         if runtime_backend is not None:
             params["runtime_backend"] = runtime_backend
+        normalized_profile = _validate_tuning_profile("runtime_profile", runtime_profile)
+        if normalized_profile is not None:
+            params["runtime_profile"] = normalized_profile
+        normalized_options = _validate_tuning_options("runtime_backend_options", runtime_backend_options)
+        if normalized_options is not None:
+            params["runtime_backend_options"] = normalized_options
         self.call("LoadModel", params, caller)
 
     def RegisterTensor(
@@ -438,6 +503,8 @@ class AstraWeaveIpcClient:
         prompt: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        runtime_profile_override: str | None = None,
+        runtime_backend_options_override: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"session_id": session_id, "step_name": step_name}
         if prompt is not None:
@@ -446,6 +513,15 @@ class AstraWeaveIpcClient:
             params["max_tokens"] = max_tokens
         if temperature is not None:
             params["temperature"] = temperature
+        normalized_profile = _validate_tuning_profile("runtime_profile_override", runtime_profile_override)
+        if normalized_profile is not None:
+            params["runtime_profile_override"] = normalized_profile
+        normalized_options = _validate_tuning_options(
+            "runtime_backend_options_override",
+            runtime_backend_options_override,
+        )
+        if normalized_options is not None:
+            params["runtime_backend_options_override"] = normalized_options
         return cast(dict[str, Any], self.call("RunStep", params, caller))
 
     def GetResidency(self, session_id: str, caller: CallerIdentity | None = None) -> ResidencySnapshot:
