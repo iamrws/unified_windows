@@ -6,6 +6,7 @@ persisting them, and only allows export bundles after explicit opt-in.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -177,6 +178,7 @@ class TelemetryEventType(str, Enum):
     PRESSURE = "pressure_snapshot"
     SECURITY = "security_event"
     POLICY = "policy_event"
+    COMPRESSION = "compression_event"
 
 
 class TelemetryReasonCode(str, Enum):
@@ -187,6 +189,7 @@ class TelemetryReasonCode(str, Enum):
     RESIDENCY_DEMOTED = "AW_TEL_REASON_RESIDENCY_DEMOTED"
     TRANSFER_PREFETCH = "AW_TEL_REASON_TRANSFER_PREFETCH"
     TRANSFER_EVICTION = "AW_TEL_REASON_TRANSFER_EVICTION"
+    FALLBACK_KV_QUANTIZATION_UPGRADE = "AW_TEL_REASON_FALLBACK_KV_QUANTIZATION_UPGRADE"
     FALLBACK_KV_REDUCTION = "AW_TEL_REASON_FALLBACK_KV_REDUCTION"
     FALLBACK_BATCH_REDUCTION = "AW_TEL_REASON_FALLBACK_BATCH_REDUCTION"
     FALLBACK_PRECISION_REDUCTION = "AW_TEL_REASON_FALLBACK_PRECISION_REDUCTION"
@@ -198,6 +201,8 @@ class TelemetryReasonCode(str, Enum):
     POLICY_CHANGED = "AW_TEL_REASON_POLICY_CHANGED"
     EXPORT_BLOCKED = "AW_TEL_REASON_EXPORT_BLOCKED"
     RETENTION_CLEANUP = "AW_TEL_REASON_RETENTION_CLEANUP"
+    COMPRESSION_APPLIED = "AW_TEL_REASON_COMPRESSION_APPLIED"
+    COMPRESSION_UPGRADED = "AW_TEL_REASON_COMPRESSION_UPGRADED"
 
 
 class TelemetryRecordClass(str, Enum):
@@ -292,6 +297,19 @@ class PolicyEvent(TelemetryEvent):
     event_type: ClassVar[TelemetryEventType] = TelemetryEventType.POLICY
     previous_profile: str
     new_profile: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CompressionEvent(TelemetryEvent):
+    """Telemetry event emitted when quantization is applied to a tensor."""
+
+    event_type: ClassVar[TelemetryEventType] = TelemetryEventType.COMPRESSION
+    tensor_id: str
+    backend: str
+    original_bytes: int
+    compressed_bytes: int
+    compression_ratio: float
+    bit_width: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,13 +425,16 @@ class TelemetryPolicy:
         }
 
 
+TELEMETRY_RING_BUFFER_SIZE = 50_000
+
+
 @dataclass(slots=True)
 class TelemetryPipeline:
     """In-memory telemetry pipeline with redaction, retention, and export."""
 
     policy: TelemetryPolicy = field(default_factory=TelemetryPolicy)
     schema_version: str = "1.0"
-    _records: list[TelemetryRecord] = field(default_factory=list, init=False, repr=False)
+    _records: deque[TelemetryRecord] = field(default_factory=lambda: deque(maxlen=TELEMETRY_RING_BUFFER_SIZE), init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.policy.validate()
@@ -508,7 +529,7 @@ class TelemetryPipeline:
             else:
                 kept.append(record)
 
-        self._records = kept
+        self._records = deque(kept, maxlen=TELEMETRY_RING_BUFFER_SIZE)
         return tuple(removed)
 
     def build_export_bundle(self, *, now: datetime | None = None) -> TelemetryExportBundle:
@@ -560,6 +581,7 @@ def _json_safe(value: Any) -> Any:
 
 
 __all__ = [
+    "CompressionEvent",
     "FallbackEvent",
     "PolicyEvent",
     "PressureSnapshotEvent",

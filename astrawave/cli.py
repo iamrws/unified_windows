@@ -827,7 +827,7 @@ def _build_parser() -> argparse.ArgumentParser:
     common.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
     common.add_argument("--backend", choices=["auto", "remote", "local"], default="auto")
     common.add_argument("--caller-sid", default=DEFAULT_SERVICE_OWNER_SID)
-    common.add_argument("--caller-pid", type=int, default=1)
+    common.add_argument("--caller-pid", type=int, default=None)
 
     parser = argparse.ArgumentParser(prog="astrawave", description="AstraWeave CLI", parents=[common])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1082,7 +1082,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         except ApiError as exc:
             _emit_error(exc)
             return 1
-    caller = CallerIdentity(user_sid=args.caller_sid, pid=args.caller_pid)
+    caller = CallerIdentity(user_sid=args.caller_sid, pid=args.caller_pid if args.caller_pid is not None else os.getpid())
     try:
         backend = _resolve_backend(args.endpoint, caller, args.backend)
         result = _dispatch(backend, args, caller)

@@ -10,6 +10,7 @@ from typing import Iterable, Sequence
 class FallbackStep(str, Enum):
     """Mandatory fallback ladder steps in execution order."""
 
+    KV_QUANTIZATION_UPGRADE = "kv_quantization_upgrade"
     KV_CONTEXT_REDUCTION = "kv_context_reduction"
     BATCH_REDUCTION = "batch_reduction"
     PRECISION_REDUCTION = "precision_reduction"
@@ -18,6 +19,7 @@ class FallbackStep(str, Enum):
 
 
 DEFAULT_FALLBACK_LADDER: tuple[FallbackStep, ...] = (
+    FallbackStep.KV_QUANTIZATION_UPGRADE,
     FallbackStep.KV_CONTEXT_REDUCTION,
     FallbackStep.BATCH_REDUCTION,
     FallbackStep.PRECISION_REDUCTION,

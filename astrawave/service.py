@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import hmac
 from inspect import Parameter, signature
+import json
 import os
 from threading import RLock
 from time import time_ns
@@ -48,6 +51,7 @@ from .types import (
 )
 
 HIGH_PRESSURE_THRESHOLD = 0.75
+MAX_CLOSED_SESSIONS = 256
 DEFAULT_SERVICE_OWNER_SID = resolve_current_user_sid() or "S-1-5-21-AstraWeave-Owner"
 DEFAULT_RUNSTEP_MODE = "auto"
 RUNSTEP_MODE_ENV = "ASTRAWEAVE_RUNSTEP_MODE"
@@ -78,6 +82,9 @@ class _TensorRecord:
     size_bytes: int
     tier_hint: MemoryTier = MemoryTier.WARM
     residency: ResidencyState = ResidencyState.PINNED_RAM
+    quantization_backend: str = "none"
+    compression_ratio: float = 1.0
+    effective_bytes: int = 0
 
 
 @dataclass(slots=True)
@@ -107,6 +114,7 @@ class _Session:
     pinned_ram_used_bytes: int = 0
     pageable_ram_used_bytes: int = 0
     cpu_only_used_bytes: int = 0
+    state_hmac: str = ""
 
 
 class AstraWeaveService:
@@ -175,6 +183,7 @@ class AstraWeaveService:
 
         session_id = str(uuid4())
         session = _Session(session_id=session_id, owner_identity=caller)
+        self._sign_session(session)
         with self._lock:
             self._sessions[session_id] = session
 
@@ -239,6 +248,7 @@ class AstraWeaveService:
             )
             session.state = SessionState.MODEL_LOADED
             session.state = SessionState.READY
+        self._sign_session(session)
 
     def RegisterTensor(
         self,
@@ -341,6 +351,7 @@ class AstraWeaveService:
         if not step_name:
             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "step_name must not be empty")
 
+        previous_state = session.state
         with session.lock:
             if session.active_run:
                 raise ApiError(ApiErrorCode.CONFLICT_RUN_IN_PROGRESS, "a RunStep is already active")
@@ -416,10 +427,17 @@ class AstraWeaveService:
                 }
                 if prompt is not None:
                     response["inference_result"] = inference_result
+                self._sign_session(session)
                 return response
         finally:
             with session.lock:
                 session.active_run = False
+                # AUD-001 fix: if an exception interrupted RunStep before
+                # the normal state transition, restore the previous state
+                # so the session is not permanently stuck in RUNNING.
+                if session.state == SessionState.RUNNING:
+                    session.state = previous_state
+                self._sign_session(session)
 
     def GetResidency(
         self,
@@ -507,6 +525,7 @@ class AstraWeaveService:
                 session.state = SessionState.CLOSED
                 session.closed = True
                 session.active_run = False
+                self._sign_session(session)
 
         if was_open:
             self._record_lifecycle_event(
@@ -519,6 +538,10 @@ class AstraWeaveService:
             with self._lock:
                 self._closed_sessions[session_id] = session
                 self._sessions.pop(session_id, None)
+                # AUD-004 fix: evict oldest closed sessions to cap memory.
+                while len(self._closed_sessions) > MAX_CLOSED_SESSIONS:
+                    oldest_key = next(iter(self._closed_sessions))
+                    self._closed_sessions.pop(oldest_key)
             self._security.release_session(session.owner_identity)
 
     def _resolve_creation_caller(self, caller_identity: CallerIdentity | None) -> CallerIdentity:
@@ -554,6 +577,8 @@ class AstraWeaveService:
         session = self._get_session(session_id)
         if session.closed or session.state == SessionState.CLOSED:
             raise ApiError(ApiErrorCode.INVALID_STATE, "session is closed")
+        if not self._verify_session(session):
+            raise ApiError(ApiErrorCode.INTERNAL, "session state integrity check failed")
         caller = self._resolve_session_caller(session, caller_identity, api_name)
         return session, caller
 
@@ -597,6 +622,60 @@ class AstraWeaveService:
         if tensor_name not in session.tensors:
             raise ApiError(ApiErrorCode.NOT_FOUND, "tensor not registered")
         return session.tensors[tensor_name]
+
+    # ------------------------------------------------------------------
+    # AUD-008: Session state HMAC integrity
+    # ------------------------------------------------------------------
+    _STATE_HMAC_KEY = b"astrawave-state-integrity-v1"
+
+    def _compute_session_hmac(self, session: _Session) -> str:
+        payload = json.dumps({
+            "session_id": session.session_id,
+            "state": session.state.value,
+            "model_name": session.model_name or "",
+            "closed": session.closed,
+            "policy_profile": session.policy_profile.value,
+        }, sort_keys=True)
+        return hmac.new(self._STATE_HMAC_KEY, payload.encode(), hashlib.sha256).hexdigest()
+
+    def _sign_session(self, session: _Session) -> None:
+        session.state_hmac = self._compute_session_hmac(session)
+
+    def _verify_session(self, session: _Session) -> bool:
+        if not session.state_hmac:
+            return True  # unsigned sessions allowed during migration
+        expected = self._compute_session_hmac(session)
+        return hmac.compare_digest(session.state_hmac, expected)
+
+    # ------------------------------------------------------------------
+    # Pillar 2+3: Quantization-aware tensor management
+    # ------------------------------------------------------------------
+
+    def _apply_tier_quantization(self, session: _Session, tensor: _TensorRecord) -> None:
+        """Apply the appropriate quantization for the tensor's current tier."""
+
+        from .quantization import provider_for_tier
+        from .telemetry import CompressionEvent
+
+        provider = provider_for_tier(tensor.tier_hint.value)
+        result = provider.quantize(tensor.name, tensor.size_bytes)
+        tensor.quantization_backend = result.backend.value
+        tensor.compression_ratio = result.compression_ratio
+        tensor.effective_bytes = result.compressed_bytes
+
+        self._telemetry.record_event(CompressionEvent(
+            reason_code=TelemetryReasonCode.COMPRESSION_APPLIED,
+            session_id=session.session_id,
+            tensor_id=tensor.name,
+            backend=result.backend.value,
+            original_bytes=result.original_bytes,
+            compressed_bytes=result.compressed_bytes,
+            compression_ratio=result.compression_ratio,
+            bit_width=result.bit_width,
+        ))
+
+    def _session_has_active_quantization(self, session: _Session) -> bool:
+        return any(t.quantization_backend != "none" for t in session.tensors.values())
 
     def _migrate_tensor(
         self,
@@ -768,7 +847,11 @@ class AstraWeaveService:
         if tensor is None:
             return
 
-        if next_step is FallbackStep.KV_CONTEXT_REDUCTION:
+        if next_step is FallbackStep.KV_QUANTIZATION_UPGRADE:
+            # Phase 7: upgrade quantization in-place rather than moving.
+            self._apply_tier_quantization(session, tensor)
+            return
+        elif next_step is FallbackStep.KV_CONTEXT_REDUCTION:
             destination = self._fallback_destination(tensor.residency, preferred=ResidencyState.PINNED_RAM)
         elif next_step is FallbackStep.BATCH_REDUCTION:
             destination = self._fallback_destination(tensor.residency, preferred=ResidencyState.PAGEABLE_RAM)
@@ -852,6 +935,8 @@ class AstraWeaveService:
 
     @staticmethod
     def _telemetry_reason_for_step(step: FallbackStep) -> TelemetryReasonCode:
+        if step is FallbackStep.KV_QUANTIZATION_UPGRADE:
+            return TelemetryReasonCode.FALLBACK_KV_QUANTIZATION_UPGRADE
         if step is FallbackStep.KV_CONTEXT_REDUCTION:
             return TelemetryReasonCode.FALLBACK_KV_REDUCTION
         if step is FallbackStep.BATCH_REDUCTION:

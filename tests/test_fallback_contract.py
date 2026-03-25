@@ -22,6 +22,7 @@ class FallbackContractTests(unittest.TestCase):
 
     def test_fallback_ladder_order_is_mandatory(self) -> None:
         expected = [
+            "KV_QUANTIZATION_UPGRADE",
             "KV_CONTEXT_REDUCTION",
             "BATCH_REDUCTION",
             "PRECISION_REDUCTION",

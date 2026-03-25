@@ -70,6 +70,8 @@ class ResidencySnapshot:
     pageable_ram_bytes: int = 0
     cpu_only_bytes: int = 0
     active_run_in_progress: bool = False
+    quantization_backend: str = "none"
+    compression_ratio: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)

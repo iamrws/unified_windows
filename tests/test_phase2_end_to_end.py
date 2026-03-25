@@ -96,12 +96,14 @@ class Phase2EndToEndTests(unittest.TestCase):
         self.assertEqual(run_result["session_id"], session_id)
         self.assertEqual(run_result["step_name"], "decode")
         self.assertEqual(run_result["state"], "DEGRADED")
-        self.assertEqual(run_result["fallback_result"]["next_step"], "kv_context_reduction")
+        self.assertEqual(run_result["fallback_result"]["next_step"], "kv_quantization_upgrade")
 
         residency = self.sdk.GetResidency(session_id)
         self.assertEqual(residency.session_state.value, "DEGRADED")
-        self.assertEqual(residency.primary_tier.value, "WARM")
-        self.assertEqual(residency.tensor_residency["kv"].value, "PINNED_RAM")
+        # Phase 7: first fallback step is KV_QUANTIZATION_UPGRADE which
+        # compresses in-place (no demotion), so tensor stays in VRAM/HOT.
+        self.assertEqual(residency.primary_tier.value, "HOT")
+        self.assertEqual(residency.tensor_residency["kv"].value, "VRAM")
 
         with self.assertRaises(ApiError) as cm:
             self.client.GetResidency(session_id, caller=self.foreign)
@@ -112,7 +114,7 @@ class Phase2EndToEndTests(unittest.TestCase):
         self.assertGreaterEqual(len(telemetry_records), 4)
         self.assertIn(TelemetryReasonCode.UNKNOWN, reason_codes)
         self.assertIn(TelemetryReasonCode.TRANSFER_PREFETCH, reason_codes)
-        self.assertIn(TelemetryReasonCode.FALLBACK_KV_REDUCTION, reason_codes)
+        self.assertIn(TelemetryReasonCode.FALLBACK_KV_QUANTIZATION_UPGRADE, reason_codes)
         for record in telemetry_records:
             self.assertTrue(record.correlation_id.startswith("tel-"))
             self.assertIsNotNone(record.session_id_hash)

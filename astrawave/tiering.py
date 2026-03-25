@@ -70,14 +70,27 @@ class PlacementPlanner:
         request: PlacementRequest,
         hot_budget_bytes: int,
         hot_used_bytes: int = 0,
+        *,
+        hot_compression_ratio: float = 1.0,
     ) -> PlacementDecision:
-        """Classify one resource into a residency tier."""
+        """Classify one resource into a residency tier.
+
+        When *hot_compression_ratio* > 1.0, the planner treats the
+        resource as requiring fewer effective bytes in the HOT tier,
+        modelling the effect of KV cache quantization (e.g. TurboQuant).
+        """
+
+        effective_bytes = (
+            max(1, int(request.bytes_required / hot_compression_ratio))
+            if hot_compression_ratio > 1.0
+            else request.bytes_required
+        )
 
         if request.preferred_tier is not None:
             tier = request.preferred_tier
             reason_code = "PLACEMENT_PREFERRED_TIER"
         elif request.is_active or request.reuse_score >= self._policy.hot_reuse_score:
-            if hot_used_bytes + request.bytes_required <= self._reserve_limit(hot_budget_bytes):
+            if hot_used_bytes + effective_bytes <= self._reserve_limit(hot_budget_bytes):
                 tier = MemoryTier.HOT
                 reason_code = "PLACEMENT_HOT_ACTIVE_OR_HIGH_REUSE"
             else:
@@ -101,8 +114,15 @@ class PlacementPlanner:
         self,
         requests: Sequence[PlacementRequest],
         hot_budget_bytes: int,
+        *,
+        hot_compression_ratio: float = 1.0,
     ) -> PlacementPlan:
-        """Create a deterministic placement plan for a collection of resources."""
+        """Create a deterministic placement plan for a collection of resources.
+
+        When *hot_compression_ratio* > 1.0 the planner accounts for KV
+        cache quantization by treating each resource as requiring fewer
+        effective bytes in the HOT tier.
+        """
 
         decisions: list[PlacementDecision] = []
         hot_used_bytes = 0
@@ -114,11 +134,18 @@ class PlacementPlanner:
                 request,
                 hot_budget_bytes=hot_budget_bytes,
                 hot_used_bytes=hot_used_bytes,
+                hot_compression_ratio=hot_compression_ratio,
             )
             decisions.append(decision)
 
+            effective = (
+                max(1, int(decision.bytes_required / hot_compression_ratio))
+                if decision.tier == MemoryTier.HOT and hot_compression_ratio > 1.0
+                else decision.bytes_required
+            )
+
             if decision.tier == MemoryTier.HOT:
-                hot_used_bytes += decision.bytes_required
+                hot_used_bytes += effective
             elif decision.tier == MemoryTier.WARM:
                 warm_bytes += decision.bytes_required
             else:

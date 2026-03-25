@@ -339,14 +339,18 @@ class AstraWeaveIpcClient:
         default_caller: CallerIdentity | None = None,
         prefer_named_pipe: bool = True,
         authkey: bytes | None = None,
+        transport_policy: str = "prefer_pipe",
     ) -> None:
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive or None")
+        if transport_policy not in {"prefer_pipe", "pipe_only", "tcp_only"}:
+            raise ValueError("transport_policy must be 'prefer_pipe', 'pipe_only', or 'tcp_only'")
         self.endpoint = endpoint or os.environ.get("ASTRAWEAVE_IPC_ENDPOINT") or "auto"
         self.timeout = timeout
         self.default_caller = default_caller
         self.prefer_named_pipe = prefer_named_pipe
         self.authkey = authkey if authkey is not None else _authkey_from_env()
+        self.transport_policy = transport_policy
         self._transport: _Transport | None = None
         self._request_counter = 0
 
@@ -373,6 +377,12 @@ class AstraWeaveIpcClient:
             transport.connect()
         except OSError as exc:
             if family == "AF_PIPE":
+                # AUD-003 fix: respect transport_policy instead of silent fallback.
+                if self.transport_policy == "pipe_only":
+                    raise ApiError(
+                        ApiErrorCode.INTERNAL,
+                        "named pipe transport required by policy but connection failed",
+                    ) from exc
                 fallback = _ConnectionTransport(
                     "AF_INET",
                     ("127.0.0.1", 8765),
