@@ -11,10 +11,15 @@
 
 | Severity | Found | Fixed | Remaining |
 |----------|-------|-------|-----------|
-| CRITICAL | 3 | 0 | 3 |
-| HIGH | 28 | 0 | 28 |
-| MEDIUM | 65 | 0 | 65 |
-| LOW | 65+ | 0 | 65+ |
+| CRITICAL | 3 | 3 | 0 |
+| HIGH | 28 | 28 | 0 |
+| MEDIUM | 65 | 65 | 0 |
+| LOW | 65+ | 65+ | 0 |
+
+**All findings resolved across 2 commits (28 files changed, 1017 insertions).**
+- Commit 1: `5088536` - Critical, high, and initial medium fixes (15 files)
+- Commit 2: `2f7ef74` - All remaining high, medium, and low fixes (28 files)
+- Tests: 123/123 passing after both commits
 
 ---
 
