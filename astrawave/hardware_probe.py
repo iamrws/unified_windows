@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import ctypes
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from ctypes import byref, c_uint, c_void_p, create_string_buffer
@@ -54,7 +55,15 @@ def collect_hardware_probe() -> dict[str, Any]:
 
 
 def _probe_nvidia_smi(warnings: list[str]) -> dict[str, Any]:
-    nvidia_smi_path = os.environ.get("ASTRAWEAVE_NVIDIA_SMI_PATH", "nvidia-smi")
+    custom_path = os.environ.get("ASTRAWEAVE_NVIDIA_SMI_PATH")
+    if custom_path:
+        if not os.path.isabs(custom_path):
+            warnings.append("ASTRAWEAVE_NVIDIA_SMI_PATH must be an absolute path; ignoring")
+            nvidia_smi_path = shutil.which("nvidia-smi") or "nvidia-smi"
+        else:
+            nvidia_smi_path = custom_path
+    else:
+        nvidia_smi_path = shutil.which("nvidia-smi") or "nvidia-smi"
     command = [
         nvidia_smi_path,
         "--query-gpu=index,name,memory.total,memory.used,memory.free,driver_version",

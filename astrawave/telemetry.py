@@ -13,6 +13,7 @@ from enum import Enum
 import hashlib
 import hmac
 import json
+import os
 import re
 import uuid
 from typing import Any, Callable, ClassVar, Mapping
@@ -35,16 +36,18 @@ def new_correlation_id(prefix: str = "tel") -> str:
 _TELEMETRY_HMAC_APP_KEY = b"AstraWeave-Telemetry-v1"
 
 
-def hash_identifier(value: object, salt: str = "") -> str:
+def hash_identifier(value: object, salt: str = "", *, key: bytes | None = None) -> str:
     """Hash an identifier for persisted telemetry records.
 
-    Uses HMAC-SHA256 with a fixed application key so that the output is
-    deterministic for the same input and salt, but the raw value is not
-    preserved in persisted telemetry.  (M20: HMAC instead of plain SHA-256.)
+    Uses HMAC-SHA256 so that the raw value is not preserved in persisted
+    telemetry.  When *key* is provided it is used as the HMAC key; otherwise
+    the module-level fallback ``_TELEMETRY_HMAC_APP_KEY`` is used.
+    (M20: HMAC instead of plain SHA-256.)
     """
 
+    hmac_key = key if key is not None else _TELEMETRY_HMAC_APP_KEY
     msg = f"{salt}|{value!s}".encode("utf-8")
-    digest = hmac.new(_TELEMETRY_HMAC_APP_KEY, msg, hashlib.sha256).hexdigest()
+    digest = hmac.new(hmac_key, msg, hashlib.sha256).hexdigest()
     return f"hmac-sha256:{digest}"
 
 
@@ -433,6 +436,7 @@ class TelemetryPipeline:
     policy: TelemetryPolicy = field(default_factory=TelemetryPolicy)
     schema_version: str = "1.0"
     _records: deque[TelemetryRecord] = field(default_factory=lambda: deque(maxlen=TELEMETRY_RING_BUFFER_SIZE), init=False, repr=False)
+    _hmac_key: bytes = field(default_factory=lambda: os.urandom(32), init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.policy.validate()
@@ -483,13 +487,13 @@ class TelemetryPipeline:
             key: (
                 value
                 if self.policy.allow_debug_identifiers
-                else hash_identifier(value, salt=self.policy.identifier_hash_salt)
+                else hash_identifier(value, salt=self.policy.identifier_hash_salt, key=self._hmac_key)
             )
             for key, value in (extra_identifiers or {}).items()
             if value is not None
         }
         session_id_hash = (
-            hash_identifier(event.session_id, salt=self.policy.identifier_hash_salt)
+            hash_identifier(event.session_id, salt=self.policy.identifier_hash_salt, key=self._hmac_key)
             if event.session_id is not None and not self.policy.allow_debug_identifiers
             else event.session_id
         )

@@ -10,8 +10,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from inspect import Parameter, signature
 from ipaddress import ip_address
+import logging
 from multiprocessing.connection import Listener
 import os
+import tempfile
 from threading import Event, RLock, Thread
 from typing import Any, Callable, Mapping
 
@@ -31,6 +33,8 @@ from .ipc_protocol import (
 )
 from .security import CallerIdentity, SecurityDecision, attest_caller_identity
 from .service import AstraWeaveService
+
+_logger = logging.getLogger(__name__)
 from .telemetry import SecurityEvent, TelemetryReasonCode
 from .types import MemoryTier, PolicyProfile
 
@@ -181,6 +185,7 @@ def serialize_response(
 def _error_from_exception(exc: BaseException) -> ApiError:
     if isinstance(exc, ApiError):
         return exc
+    logging.getLogger(__name__).error("Unhandled exception in IPC request", exc_info=True)
     return ApiError(ApiErrorCode.INTERNAL, "internal server error")
 
 
@@ -210,11 +215,46 @@ def _to_protocol_request(
         raise IpcProtocolError(exc.code, exc.message) from exc
 
 
-def _authkey_from_env() -> bytes | None:
+def _authkey_from_env() -> bytes:
     value = os.environ.get("ASTRAWEAVE_IPC_AUTHKEY", "").strip()
-    if not value:
-        return None
-    return value.encode("utf-8")
+    if value:
+        return value.encode("utf-8")
+    # No explicit authkey configured. Check for a shared key file so that
+    # server and client can agree on the same auto-generated key.
+    key_file = os.path.join(tempfile.gettempdir(), "astrawave_ipc.key")
+    if os.path.isfile(key_file):
+        try:
+            with open(key_file, "rb") as fh:
+                existing = fh.read()
+            if len(existing) == 32:
+                _logger.warning(
+                    "ASTRAWEAVE_IPC_AUTHKEY is not set; reusing auto-generated "
+                    "key from %s. Set the env var for production use.",
+                    key_file,
+                )
+                return existing
+        except OSError:
+            pass
+    # Generate a new random key and persist it for the client to read.
+    key = os.urandom(32)
+    try:
+        fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, key)
+        finally:
+            os.close(fd)
+    except OSError:
+        _logger.warning(
+            "ASTRAWEAVE_IPC_AUTHKEY is not set and failed to write key file %s. "
+            "Using ephemeral key; client will not be able to connect.",
+            key_file,
+        )
+    _logger.warning(
+        "ASTRAWEAVE_IPC_AUTHKEY is not set; auto-generated a random 32-byte "
+        "authkey and wrote it to %s. Set the env var for production use.",
+        key_file,
+    )
+    return key
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -411,6 +451,11 @@ class AstraWeaveIpcServer:
 
         while not self._stop_event.is_set():
             try:
+                # SECURITY: connection.recv() deserializes via pickle, which is
+                # vulnerable to arbitrary code execution from a malicious peer.
+                # The authkey handshake mitigates unauthenticated access, but
+                # this transport should be replaced with JSON framing in a
+                # future version to eliminate the pickle RCE surface entirely.
                 payload = connection.recv()
             except EOFError:
                 break

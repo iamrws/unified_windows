@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import os
 import ssl
 from typing import Any, Callable, Mapping, Protocol
 from urllib import error, request
+from urllib.parse import urlparse
 
 from .errors import ApiError, ApiErrorCode
 from .runtime_tuning import merge_backend_options, resolve_runtime_tuning
@@ -143,6 +145,9 @@ class OllamaInferenceRuntime:
 
     backend_name = "ollama"
 
+    _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+    _logger = logging.getLogger("astrawave.inference_runtime")
+
     def __init__(
         self,
         *,
@@ -150,7 +155,22 @@ class OllamaInferenceRuntime:
         timeout_seconds: float | None = None,
         transport: InferenceTransport | None = None,
     ) -> None:
-        self._base_url = (base_url or _get_ollama_base_url()).rstrip("/")
+        raw_url = (base_url or _get_ollama_base_url()).rstrip("/")
+        parsed = urlparse(raw_url)
+        if parsed.scheme not in ("http", "https"):
+            raise ApiError(
+                ApiErrorCode.INVALID_ARGUMENT,
+                f"ASTRAWEAVE_OLLAMA_BASE_URL must use http or https scheme, got: {parsed.scheme!r}",
+            )
+        hostname = (parsed.hostname or "").lower()
+        is_loopback = hostname in self._LOOPBACK_HOSTS or hostname.startswith("127.")
+        if not is_loopback:
+            self._logger.warning(
+                "Ollama base URL %r does not resolve to a loopback address; "
+                "ensure this is intentional to avoid SSRF risks.",
+                raw_url,
+            )
+        self._base_url = raw_url
         self._timeout_seconds = timeout_seconds if timeout_seconds is not None else _get_ollama_timeout()
         self._transport = transport or _post_json
 

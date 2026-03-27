@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, is_dataclass
 from contextlib import suppress
-import getpass
 import hashlib
 import hmac
 from ipaddress import ip_address
@@ -83,7 +82,20 @@ try:
 except ImportError:  # pragma: no cover - future-proof fallback
     DEFAULT_SERVICE_OWNER_SID = "S-1-5-21-AstraWeave-Owner"
 
-STATE_DIR = Path(tempfile.gettempdir()) / "astrawave_cli_state"
+def _default_state_dir() -> Path:
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "astrawave" / "state"
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg:
+        return Path(xdg) / "astrawave"
+    home = Path.home()
+    if home != Path("/"):
+        return home / ".local" / "state" / "astrawave"
+    return Path(tempfile.gettempdir()) / "astrawave_cli_state"
+
+STATE_DIR = _default_state_dir()
 STATE_VERSION = 1
 DEFAULT_ENDPOINT = "auto"
 HIGH_PRESSURE_THRESHOLD = 0.75
@@ -95,11 +107,18 @@ _NONNEGATIVE_FLOAT_OPTION_KEYS = {"temperature"}
 _OPEN_INTERVAL_FLOAT_OPTION_KEYS = {"top_p", "repeat_penalty"}
 
 
+_HMAC_KEY_FILE = STATE_DIR / ".hmac_key"
+
 def _derive_state_hmac_key() -> bytes:
-    """Derive a per-user HMAC key from the username and state directory path."""
-    user = getpass.getuser()
-    material = f"{user}|{STATE_DIR}".encode("utf-8")
-    return hashlib.sha256(material).digest()
+    """Load or generate a per-installation HMAC key."""
+    _HMAC_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if _HMAC_KEY_FILE.exists():
+        key = _HMAC_KEY_FILE.read_bytes()
+        if len(key) == 32:
+            return key
+    key = os.urandom(32)
+    _HMAC_KEY_FILE.write_bytes(key)
+    return key
 
 
 def _compute_state_hmac(json_bytes: bytes) -> str:
@@ -781,11 +800,13 @@ class LocalBackend:
             raise ApiError(ApiErrorCode.INTERNAL, "unsupported CLI state version")
         # C3: verify HMAC integrity tag before trusting the content
         stored_hmac = payload.pop("_hmac", None)
-        if stored_hmac is not None:
-            json_bytes = json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
-            expected_hmac = _compute_state_hmac(json_bytes)
-            if not hmac.compare_digest(stored_hmac, expected_hmac):
-                raise ApiError(ApiErrorCode.INTERNAL, "CLI state file integrity check failed")
+        if stored_hmac is None:
+            # Reject unsigned state files to prevent tampering
+            return _default_state()
+        json_bytes = json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+        expected_hmac = _compute_state_hmac(json_bytes)
+        if not hmac.compare_digest(stored_hmac, expected_hmac):
+            raise ApiError(ApiErrorCode.INTERNAL, "CLI state file integrity check failed")
         return payload
 
     @staticmethod

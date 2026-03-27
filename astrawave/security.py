@@ -255,19 +255,141 @@ def resolve_current_user_sid() -> str | None:
     return resolve_process_user_sid(os.getpid())
 
 
+def _attest_caller_via_handle(caller: CallerIdentity) -> SecurityDecision:
+    """Windows-specific attestation that holds a single process handle.
+
+    By opening the process handle once and using it for both the existence
+    check and the SID resolution, the TOCTOU window between the two
+    lookups is eliminated on Windows.  The handle keeps a reference to
+    the kernel process object, so PID reuse cannot silently substitute a
+    different process between the two checks.
+    """
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+
+    # PROCESS_QUERY_LIMITED_INFORMATION (0x1000) is sufficient for
+    # OpenProcessToken and keeps the required privilege minimal.
+    process_handle = kernel32.OpenProcess(0x1000, False, caller.pid)
+    if not process_handle:
+        # Access denied (error 5) means the process exists but we
+        # cannot open it — treat that as "active but unverifiable SID".
+        if ctypes.get_last_error() == 5:
+            return decision_allowed(
+                "caller PID verified (access denied); OS SID attestation unavailable"
+            )
+        return decision_denied(
+            SecurityDenyReason.UNKNOWN_CALLER,
+            "caller PID is not active on this host",
+        )
+
+    try:
+        # --- resolve SID using the same handle ---
+        token_handle = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(
+            process_handle, 0x0008, ctypes.byref(token_handle)
+        ):
+            # Could not open the token — PID is alive but SID unknown.
+            return decision_allowed(
+                "caller PID verified; OS SID attestation unavailable"
+            )
+        try:
+            required = wintypes.DWORD(0)
+            advapi32.GetTokenInformation(
+                token_handle, 1, None, 0, ctypes.byref(required)
+            )
+            if required.value <= 0:
+                return decision_allowed(
+                    "caller PID verified; OS SID attestation unavailable"
+                )
+
+            buffer = ctypes.create_string_buffer(required.value)
+            if not advapi32.GetTokenInformation(
+                token_handle, 1, buffer, required.value, ctypes.byref(required)
+            ):
+                return decision_allowed(
+                    "caller PID verified; OS SID attestation unavailable"
+                )
+
+            token_user = _TokenUser.from_buffer_copy(buffer)
+            sid_ptr = ctypes.c_void_p(token_user.User.Sid)
+            sid_string = wintypes.LPWSTR()
+            if not sid_ptr.value or not advapi32.ConvertSidToStringSidW(
+                sid_ptr, ctypes.byref(sid_string)
+            ):
+                return decision_allowed(
+                    "caller PID verified; OS SID attestation unavailable"
+                )
+
+            try:
+                resolved_sid = (
+                    str(sid_string.value) if sid_string.value else None
+                )
+            finally:
+                ctypes.windll.kernel32.LocalFree(sid_string)
+
+            if resolved_sid is None:
+                return decision_allowed(
+                    "caller PID verified; OS SID attestation unavailable"
+                )
+
+            if resolved_sid.strip() != caller.user_sid.strip():
+                return decision_denied(
+                    SecurityDenyReason.UNKNOWN_CALLER,
+                    "caller SID does not match the active process owner",
+                )
+
+            return decision_allowed(
+                "caller attested by PID and process owner SID"
+            )
+        finally:
+            kernel32.CloseHandle(token_handle)
+    finally:
+        kernel32.CloseHandle(process_handle)
+
+
 def attest_caller_identity(
     caller: CallerIdentity,
     *,
     pid_lookup: PidLookup | None = None,
     sid_lookup: SidLookup | None = None,
 ) -> SecurityDecision:
-    """Attest the caller against the live process table when possible."""
+    """Attest the caller against the live process table when possible.
+
+    Security note — PID-reuse TOCTOU (FINDING-009)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    On all operating systems, PIDs can be recycled by the kernel once a
+    process exits.  Between the moment this function checks that a PID is
+    alive and the moment it resolves the owning SID, the original process
+    could exit and its PID could be reassigned to an unrelated process.
+
+    On Windows this risk is mitigated: when no custom ``pid_lookup`` /
+    ``sid_lookup`` overrides are supplied, the function delegates to
+    ``_attest_caller_via_handle`` which opens a **single** process handle
+    and reuses it for both checks.  Because a kernel handle holds a
+    reference to the process object, PID reuse cannot substitute a
+    different process for the duration of the call.
+
+    When custom lookup callables *are* supplied (primarily for testing),
+    the two-step PID-then-SID flow is used, which is subject to the
+    TOCTOU window.
+
+    Recommended long-term mitigation: callers should open a process
+    handle at session-creation time, hold it for the session lifetime,
+    and pass it into future attestation calls.  This completely
+    eliminates PID-reuse risk for the session duration.
+    """
 
     if not is_valid_caller_identity(caller) or not is_plausible_user_sid(caller.user_sid):
         return decision_denied(
             SecurityDenyReason.INVALID_CALLER,
             "caller identity is malformed",
         )
+
+    # FINDING-009 improvement: when running on Windows with default
+    # lookups, use the single-handle path to eliminate the TOCTOU window
+    # between the PID existence check and the SID resolution.
+    if os.name == "nt" and pid_lookup is None and sid_lookup is None:
+        return _attest_caller_via_handle(caller)
 
     pid_lookup = pid_lookup or process_exists
     sid_lookup = sid_lookup or resolve_process_user_sid

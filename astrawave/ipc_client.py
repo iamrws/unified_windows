@@ -14,6 +14,7 @@ from ipaddress import ip_address
 from multiprocessing.connection import Client, Connection
 import logging
 import os
+import tempfile
 from threading import Event, RLock, Thread
 from typing import Any, Mapping, Protocol, cast
 from urllib.parse import urlparse
@@ -42,11 +43,36 @@ _NONNEGATIVE_FLOAT_OPTION_KEYS = {"temperature"}
 _OPEN_INTERVAL_FLOAT_OPTION_KEYS = {"top_p", "repeat_penalty"}
 
 
-def _authkey_from_env() -> bytes | None:
+def _authkey_from_env() -> bytes:
     value = os.environ.get("ASTRAWEAVE_IPC_AUTHKEY", "").strip()
-    if not value:
-        return None
-    return value.encode("utf-8")
+    if value:
+        return value.encode("utf-8")
+    # No explicit authkey configured. Try to read the shared key file that the
+    # server writes on startup so both sides use the same key.
+    key_file = os.path.join(tempfile.gettempdir(), "astrawave_ipc.key")
+    if os.path.isfile(key_file):
+        try:
+            with open(key_file, "rb") as fh:
+                existing = fh.read()
+            if len(existing) == 32:
+                _logger.warning(
+                    "ASTRAWEAVE_IPC_AUTHKEY is not set; reading auto-generated "
+                    "key from %s. Set the env var for production use.",
+                    key_file,
+                )
+                return existing
+        except OSError:
+            pass
+    # Key file doesn't exist (server hasn't started yet) or was unreadable.
+    # Generate a random key so the connection attempt is still authenticated
+    # (it will fail the handshake, which is the correct secure default).
+    _logger.warning(
+        "ASTRAWEAVE_IPC_AUTHKEY is not set and no server key file found at %s. "
+        "Using a random authkey; connection will fail until the server starts "
+        "and writes its key. Set the env var for production use.",
+        key_file,
+    )
+    return os.urandom(32)
 
 
 def _is_loopback_host(host: str) -> bool:

@@ -153,24 +153,54 @@ _ALLOWED_POWERSHELL_COMMANDS: frozenset[str] = frozenset({
     "Where-Object",
 })
 
+# FINDING-008 fix: chain operators that are never legitimate in our
+# PowerShell commands.  Pipe ("|") is intentionally excluded because
+# callers such as _collect_ollama_process_memory() use pipelines.
+# Instead, each pipeline segment is validated against the allowlist.
+_CHAIN_OPERATORS: frozenset[str] = frozenset({";", "&&", "||", "`"})
+
+
+def _first_cmdlet_token(segment: str) -> str | None:
+    """Extract the first cmdlet-like token from a pipeline segment.
+
+    Handles bare cmdlets (``Get-Process ...``) and variable assignments
+    (``$p = Get-Process ...``) by looking past the ``=`` when present.
+    """
+    stripped = segment.strip()
+    if not stripped:
+        return None
+    # If the segment contains an assignment, inspect after the '='
+    if "=" in stripped:
+        after_eq = stripped.split("=", 1)[1].strip()
+        if after_eq:
+            return after_eq.split()[0]
+    # Otherwise take the first real token, ignoring a leading '$var'
+    candidate = stripped.lstrip("$")
+    tokens = candidate.split()
+    return tokens[0] if tokens else None
+
 
 def _run_powershell(command: str) -> str:
-    # H26 fix: validate that the command starts with an allowed PowerShell cmdlet
-    # to prevent command-injection via arbitrary strings.
-    stripped = command.lstrip("$")
-    first_token = stripped.split()[0] if stripped.split() else ""
-    # The command may start with a variable assignment like "$p = Get-Process ..."
-    # so also check after the first "=" or after "$var = ".
-    tokens_to_check = [first_token]
-    if "=" in command:
-        after_eq = command.split("=", 1)[1].strip()
-        if after_eq:
-            tokens_to_check.append(after_eq.split()[0])
-    if not any(token in _ALLOWED_POWERSHELL_COMMANDS for token in tokens_to_check):
-        raise ValueError(
-            f"PowerShell command not in allowlist. "
-            f"First tokens: {tokens_to_check!r}, allowed: {sorted(_ALLOWED_POWERSHELL_COMMANDS)}"
-        )
+    # FINDING-008 fix: reject commands containing disallowed chain operators
+    # BEFORE the allowlist check to prevent injection via chaining.
+    for op in _CHAIN_OPERATORS:
+        if op in command:
+            raise ValueError(
+                f"PowerShell command contains disallowed operator '{op}'"
+            )
+
+    # H26 fix (enhanced): validate every pipeline segment starts with an
+    # allowed PowerShell cmdlet to prevent command-injection.
+    segments = command.split("|")
+    for segment in segments:
+        token = _first_cmdlet_token(segment)
+        if token is None:
+            continue
+        if token not in _ALLOWED_POWERSHELL_COMMANDS:
+            raise ValueError(
+                f"PowerShell pipeline segment not in allowlist. "
+                f"Token: {token!r}, allowed: {sorted(_ALLOWED_POWERSHELL_COMMANDS)}"
+            )
     completed = subprocess.run(
         ["powershell", "-NoProfile", "-Command", command],
         capture_output=True,
