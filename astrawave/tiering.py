@@ -50,7 +50,7 @@ class PlacementPolicy:
 
     hot_reuse_score: float = 0.75
     warm_reuse_score: float = 0.35
-    hot_headroom_ratio: float = 0.20
+    hot_headroom_ratio: float = 0.10
 
 
 class PlacementPlanner:
