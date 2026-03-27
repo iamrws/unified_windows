@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Clean install (verify zero-dependency claim)
+        run: |
+          python -m venv .venv-ci
+          .venv-ci\Scripts\activate
+          pip install . --no-deps
+          python -c "import astrawave; print('Import OK')"
+
+      - name: Install dev dependencies
+        run: |
+          .venv-ci\Scripts\activate
+          pip install ".[dev]"
+
+      - name: Run tests
+        run: |
+          .venv-ci\Scripts\activate
+          python -m pytest tests/ -v --tb=short
+
+      - name: Verify no undeclared imports
+        run: |
+          .venv-ci\Scripts\activate
+          python -c "
+          import ast, os, sys
+          stdlib = set(sys.stdlib_module_names)
+          internal = {'astrawave', 'tests', 'scripts'}
+          violations = []
+          for root, dirs, files in os.walk('astrawave'):
+              for f in files:
+                  if not f.endswith('.py'): continue
+                  path = os.path.join(root, f)
+                  tree = ast.parse(open(path).read())
+                  for node in ast.walk(tree):
+                      if isinstance(node, ast.Import):
+                          for alias in node.names:
+                              top = alias.name.split('.')[0]
+                              if top not in stdlib and top not in internal:
+                                  violations.append(f'{path}:{node.lineno}: {alias.name}')
+                      elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                          top = node.module.split('.')[0]
+                          if top not in stdlib and top not in internal:
+                              violations.append(f'{path}:{node.lineno}: {node.module}')
+          if violations:
+              print('UNDECLARED THIRD-PARTY IMPORTS:')
+              for v in violations: print(f'  {v}')
+              sys.exit(1)
+          print('Zero-dependency verification passed')
+          "
