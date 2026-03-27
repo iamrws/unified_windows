@@ -18,6 +18,8 @@ class QuantizationBackend(str, Enum):
     NONE = "none"
     FP8 = "fp8"
     TURBOQUANT = "turboquant"
+    TQ1_0 = "tq1_0"
+    TQ2_0 = "tq2_0"
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,13 +182,105 @@ class NoneProvider:
         )
 
 
+class TQ2_0Provider:
+    """TQ2_0 (2-bit polar) quantization provider.
+
+    Based on the GGML block_tq2_0 structure: 66 bytes per 256 elements,
+    yielding 2.0625 bits per weight and 15.52x compression from FP32.
+    """
+
+    @property
+    def backend_name(self) -> QuantizationBackend:
+        return QuantizationBackend.TQ2_0
+
+    def supported_bit_widths(self) -> tuple[float, ...]:
+        return (2.0625,)
+
+    def estimate_compression_ratio(
+        self,
+        original_bytes: int,
+        *,
+        bit_width: float | None = None,
+    ) -> float:
+        return 32.0 / 2.0625  # 15.515...
+
+    def quantize(
+        self,
+        tensor_id: str,
+        original_bytes: int,
+        *,
+        bit_width: float | None = None,
+    ) -> QuantizationResult:
+        ratio = self.estimate_compression_ratio(original_bytes)
+        compressed = max(1, int(original_bytes / ratio))
+        return QuantizationResult(
+            backend=self.backend_name,
+            original_bytes=original_bytes,
+            compressed_bytes=compressed,
+            compression_ratio=ratio,
+            bit_width=2.0625,
+            metadata={
+                "ggml_type_id": 35,
+                "block_size": 256,
+                "block_bytes": 66,
+                "encoding": "2bit_polar",
+            },
+        )
+
+
+class TQ1_0Provider:
+    """TQ1_0 (ternary base-3) quantization provider.
+
+    Based on the GGML block_tq1_0 structure: 42 bytes per 256 elements,
+    yielding 1.6875 bits per weight and 18.96x compression from FP32.
+    """
+
+    @property
+    def backend_name(self) -> QuantizationBackend:
+        return QuantizationBackend.TQ1_0
+
+    def supported_bit_widths(self) -> tuple[float, ...]:
+        return (1.6875,)
+
+    def estimate_compression_ratio(
+        self,
+        original_bytes: int,
+        *,
+        bit_width: float | None = None,
+    ) -> float:
+        return 32.0 / 1.6875  # 18.962...
+
+    def quantize(
+        self,
+        tensor_id: str,
+        original_bytes: int,
+        *,
+        bit_width: float | None = None,
+    ) -> QuantizationResult:
+        ratio = self.estimate_compression_ratio(original_bytes)
+        compressed = max(1, int(original_bytes / ratio))
+        return QuantizationResult(
+            backend=self.backend_name,
+            original_bytes=original_bytes,
+            compressed_bytes=compressed,
+            compression_ratio=ratio,
+            bit_width=1.6875,
+            metadata={
+                "ggml_type_id": 34,
+                "block_size": 256,
+                "block_bytes": 42,
+                "encoding": "ternary_base3",
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # Tier-aware provider selection
 # ---------------------------------------------------------------------------
 
 _TIER_PROVIDERS: dict[str, type] = {
-    "HOT": SimulatedTurboQuantProvider,
-    "WARM": FP8Provider,
+    "HOT": TQ2_0Provider,
+    "WARM": TQ1_0Provider,
     "COLD": NoneProvider,
 }
 
@@ -194,8 +288,8 @@ _TIER_PROVIDERS: dict[str, type] = {
 def provider_for_tier(tier: str) -> QuantizationProvider:
     """Return the default quantization provider for a memory tier.
 
-    HOT  -> TurboQuant (aggressive compression where VRAM is scarce)
-    WARM -> FP8 (moderate compression, RAM is cheaper)
+    HOT  -> TQ2_0 (15.5x compression, GPU-resident, simple 2-bit kernel)
+    WARM -> TQ1_0 (19x compression, max compression for overflow)
     COLD -> None (pageable RAM, not worth the CPU cost)
     """
 
@@ -210,5 +304,7 @@ __all__ = [
     "QuantizationProvider",
     "QuantizationResult",
     "SimulatedTurboQuantProvider",
+    "TQ1_0Provider",
+    "TQ2_0Provider",
     "provider_for_tier",
 ]

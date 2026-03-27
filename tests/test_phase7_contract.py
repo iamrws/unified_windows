@@ -227,10 +227,10 @@ class Phase7QuantizationProviderTests(unittest.TestCase):
         """provider_for_tier must return the right backend per tier."""
 
         hot = self.quant_mod.provider_for_tier("HOT")
-        self.assertEqual(hot.backend_name, self.quant_mod.QuantizationBackend.TURBOQUANT)
+        self.assertEqual(hot.backend_name, self.quant_mod.QuantizationBackend.TQ2_0)
 
         warm = self.quant_mod.provider_for_tier("WARM")
-        self.assertEqual(warm.backend_name, self.quant_mod.QuantizationBackend.FP8)
+        self.assertEqual(warm.backend_name, self.quant_mod.QuantizationBackend.TQ1_0)
 
         cold = self.quant_mod.provider_for_tier("COLD")
         self.assertEqual(cold.backend_name, self.quant_mod.QuantizationBackend.NONE)
