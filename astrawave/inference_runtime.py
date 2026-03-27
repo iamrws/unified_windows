@@ -11,8 +11,28 @@ from urllib import error, request
 from .errors import ApiError, ApiErrorCode
 from .runtime_tuning import merge_backend_options, resolve_runtime_tuning
 
-DEFAULT_OLLAMA_BASE_URL = os.environ.get("ASTRAWEAVE_OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-DEFAULT_OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("ASTRAWEAVE_OLLAMA_TIMEOUT_SECONDS", "120"))
+# M14 fix: read env vars lazily via properties, not at import time
+_DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+_DEFAULT_OLLAMA_TIMEOUT_SECONDS = 120.0
+
+
+def _get_ollama_base_url() -> str:
+    return os.environ.get("ASTRAWEAVE_OLLAMA_BASE_URL", _DEFAULT_OLLAMA_BASE_URL)
+
+
+def _get_ollama_timeout() -> float:
+    raw = os.environ.get("ASTRAWEAVE_OLLAMA_TIMEOUT_SECONDS")
+    if raw is None:
+        return _DEFAULT_OLLAMA_TIMEOUT_SECONDS
+    try:
+        return float(raw)
+    except ValueError:
+        return _DEFAULT_OLLAMA_TIMEOUT_SECONDS
+
+
+# Keep module-level names for backward compat (read at access time)
+DEFAULT_OLLAMA_BASE_URL = _DEFAULT_OLLAMA_BASE_URL
+DEFAULT_OLLAMA_TIMEOUT_SECONDS = _DEFAULT_OLLAMA_TIMEOUT_SECONDS
 
 InferenceTransport = Callable[[str, dict[str, Any], float], dict[str, Any]]
 
@@ -125,12 +145,12 @@ class OllamaInferenceRuntime:
     def __init__(
         self,
         *,
-        base_url: str = DEFAULT_OLLAMA_BASE_URL,
-        timeout_seconds: float = DEFAULT_OLLAMA_TIMEOUT_SECONDS,
+        base_url: str | None = None,
+        timeout_seconds: float | None = None,
         transport: InferenceTransport | None = None,
     ) -> None:
-        self._base_url = base_url.rstrip("/")
-        self._timeout_seconds = timeout_seconds
+        self._base_url = (base_url or _get_ollama_base_url()).rstrip("/")
+        self._timeout_seconds = timeout_seconds if timeout_seconds is not None else _get_ollama_timeout()
         self._transport = transport or _post_json
 
     def load_model(

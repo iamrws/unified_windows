@@ -36,7 +36,7 @@ def _connect_client(endpoint: str, caller: CallerIdentity) -> AstraWeaveIpcClien
         try:
             client.connect()
             return client
-        except Exception as exc:  # pragma: no cover - only used during startup races
+        except (ConnectionError, OSError) as exc:  # H22 fix: only catch connection errors
             last_error = exc
             time.sleep(0.05)
     if last_error is not None:

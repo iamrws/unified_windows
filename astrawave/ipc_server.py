@@ -391,7 +391,10 @@ class AstraWeaveIpcServer:
                 endpoint = self._pipe_name
                 return listener, "named_pipe", endpoint
             except Exception:
-                pass
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Named pipe creation failed, falling back to TCP"  # H20 fix
+                )
 
         if not _is_loopback_host(self._host):
             raise ApiError(
@@ -710,5 +713,7 @@ class AstraWeaveIpcServer:
                 ),
                 extra_identifiers={"request_id": request_id},
             )
-        except Exception:
+        except Exception:  # H21 fix: log telemetry recording failures
+            import logging
+            logging.getLogger(__name__).debug("Failed to record security telemetry event", exc_info=True)
             return

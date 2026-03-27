@@ -314,9 +314,11 @@ class _ConnectionTransport:
                 self._connection = None
 
     def _require_connection(self) -> Connection:
-        if self._connection is None:
-            raise ApiError(ApiErrorCode.INVALID_STATE, "client is not connected")
-        return self._connection
+        # H12 fix: check connection state inside lock to prevent TOCTOU race
+        with self._lock:
+            if self._connection is None:
+                raise ApiError(ApiErrorCode.INVALID_STATE, "client is not connected")
+            return self._connection
 
     def _roundtrip(self, connection: Connection, payload: dict[str, Any]) -> dict[str, Any]:
         connection.send(payload)
@@ -353,6 +355,7 @@ class AstraWeaveIpcClient:
         self.transport_policy = transport_policy
         self._transport: _Transport | None = None
         self._request_counter = 0
+        self._counter_lock = RLock()  # M16 fix: thread-safe request counter
 
     @property
     def is_connected(self) -> bool:
@@ -559,8 +562,10 @@ class AstraWeaveIpcClient:
         return self._transport
 
     def _next_request_id(self) -> str:
-        self._request_counter += 1
-        return f"req-{self._request_counter:08d}"
+        # M16 fix: use lock for thread-safe counter increment
+        with self._counter_lock:
+            self._request_counter += 1
+            return f"req-{self._request_counter:08d}"
 
 
 __all__ = [

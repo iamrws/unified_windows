@@ -31,6 +31,10 @@ class ApiError(Exception):
     code: ApiErrorCode
     message: str
 
+    def __post_init__(self) -> None:
+        # M11 fix: populate Exception.args so repr() and standard handlers work
+        object.__setattr__(self, "args", (self.code, self.message))
+
     def __str__(self) -> str:
         return f"{self.code.value}: {self.message}"
 

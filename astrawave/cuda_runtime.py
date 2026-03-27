@@ -107,12 +107,13 @@ def run_cuda_transfer(
     device = CUdevice()
     context = CUcontext()
     device_ptr = CUdeviceptr(0)
-    host_src = (ctypes.c_ubyte * size_bytes)()
+    # H10 fix: generate test pattern in bulk instead of byte-by-byte O(n) Python loop
+    pattern_bytes = bytes((i * 131 + 17) % 251 for i in range(min(size_bytes, 4096)))
+    full_pattern = (pattern_bytes * ((size_bytes // len(pattern_bytes)) + 1))[:size_bytes]
+    host_src = (ctypes.c_ubyte * size_bytes).from_buffer_copy(full_pattern)
     host_dst = (ctypes.c_ubyte * size_bytes)()
-    for index in range(size_bytes):
-        host_src[index] = (index * 131 + 17) % 251
 
-    src_crc32 = f"{zlib.crc32(bytes(host_src)) & 0xFFFFFFFF:08x}"
+    src_crc32 = f"{zlib.crc32(full_pattern) & 0xFFFFFFFF:08x}"
     started_ns = perf_counter_ns()
     timings_ms: dict[str, float] = {}
     nvml_before = _capture_nvml_snapshot(device_index)

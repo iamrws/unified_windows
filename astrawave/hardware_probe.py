@@ -469,10 +469,14 @@ class _NvmlApi:
 
 
 class _suppress_exception:
+    """Suppress Exception only; let BaseException (SystemExit, KeyboardInterrupt) propagate."""
+
     def __enter__(self) -> None:
         return None
 
-    def __exit__(self, exc_type, exc, tb) -> bool:
+    def __exit__(self, exc_type, exc, tb) -> bool:  # H14 fix
+        if exc_type is not None and not issubclass(exc_type, Exception):
+            return False
         return True
 
 

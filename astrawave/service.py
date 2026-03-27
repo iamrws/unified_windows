@@ -154,6 +154,8 @@ class AstraWeaveService:
         self._runstep_mode_override = runstep_mode
         self._hardware_executor = hardware_executor or _run_cuda_transfer
         self._inference_runtime_factory = inference_runtime_factory or create_inference_runtime
+        # C1 fix: generate per-instance HMAC key instead of hardcoded constant
+        self._STATE_HMAC_KEY = os.urandom(32)
 
     @property
     def telemetry(self) -> TelemetryPipeline:
@@ -246,9 +248,9 @@ class AstraWeaveService:
                 model_size_label=tuning.model_size_label,
                 backend_options=tuning.backend_options,
             )
-            session.state = SessionState.MODEL_LOADED
             session.state = SessionState.READY
-        self._sign_session(session)
+            # H8 fix: sign session inside lock scope
+            self._sign_session(session)
 
     def RegisterTensor(
         self,
@@ -507,6 +509,7 @@ class AstraWeaveService:
     ) -> None:
         """Close a session. Closing a known session is idempotent."""
 
+        # H7 fix: hold service lock through session state transition to prevent races
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
@@ -516,16 +519,23 @@ class AstraWeaveService:
                 _caller = self._resolve_session_caller(session, caller_identity, "CloseSession")
                 return
 
-        caller = self._resolve_session_caller(session, caller_identity, "CloseSession")
-        was_open = False
+            caller = self._resolve_session_caller(session, caller_identity, "CloseSession")
+            was_open = False
 
-        with session.lock:
-            if not session.closed:
-                was_open = True
-                session.state = SessionState.CLOSED
-                session.closed = True
-                session.active_run = False
-                self._sign_session(session)
+            with session.lock:
+                if not session.closed:
+                    was_open = True
+                    session.state = SessionState.CLOSED
+                    session.closed = True
+                    session.active_run = False
+                    self._sign_session(session)
+
+            if was_open:
+                self._closed_sessions[session_id] = session
+                self._sessions.pop(session_id, None)
+                while len(self._closed_sessions) > MAX_CLOSED_SESSIONS:
+                    oldest_key = next(iter(self._closed_sessions))
+                    self._closed_sessions.pop(oldest_key)
 
         if was_open:
             self._record_lifecycle_event(
@@ -534,14 +544,6 @@ class AstraWeaveService:
                 action="close_session",
                 detail="session_closed",
             )
-
-            with self._lock:
-                self._closed_sessions[session_id] = session
-                self._sessions.pop(session_id, None)
-                # AUD-004 fix: evict oldest closed sessions to cap memory.
-                while len(self._closed_sessions) > MAX_CLOSED_SESSIONS:
-                    oldest_key = next(iter(self._closed_sessions))
-                    self._closed_sessions.pop(oldest_key)
             self._security.release_session(session.owner_identity)
 
     def _resolve_creation_caller(self, caller_identity: CallerIdentity | None) -> CallerIdentity:
@@ -626,7 +628,9 @@ class AstraWeaveService:
     # ------------------------------------------------------------------
     # AUD-008: Session state HMAC integrity
     # ------------------------------------------------------------------
-    _STATE_HMAC_KEY = b"astrawave-state-integrity-v1"
+    # Per-instance HMAC key generated at construction time (C1 fix).
+    # Falls back to class-level default only for legacy compatibility.
+    _STATE_HMAC_KEY: bytes = b""
 
     def _compute_session_hmac(self, session: _Session) -> str:
         payload = json.dumps({
@@ -642,8 +646,9 @@ class AstraWeaveService:
         session.state_hmac = self._compute_session_hmac(session)
 
     def _verify_session(self, session: _Session) -> bool:
+        # C2 fix: reject unsigned sessions (migration period ended)
         if not session.state_hmac:
-            return True  # unsigned sessions allowed during migration
+            return False
         expected = self._compute_session_hmac(session)
         return hmac.compare_digest(session.state_hmac, expected)
 
@@ -765,7 +770,8 @@ class AstraWeaveService:
             session.fallback_stability_mode = True
 
         if not decision.should_advance:
-            session.state = SessionState.DEGRADED if not session.fallback_stability_mode else SessionState.DEGRADED
+            # H6 fix: stability mode should restore READY, not always DEGRADED
+            session.state = SessionState.DEGRADED if not session.fallback_stability_mode else SessionState.READY
             return {
                 "should_advance": False,
                 "next_step": session.fallback_current_step.value if session.fallback_current_step else None,
@@ -1025,7 +1031,7 @@ class AstraWeaveService:
             except Exception as exc:  # pragma: no cover - defensive boundary
                 return self._hardware_failure_result(
                     code=ApiErrorCode.INTERNAL,
-                    message=f"hardware RunStep execution failed unexpectedly: {exc}",
+                    message="hardware RunStep execution failed unexpectedly",
                     session=session,
                     step_name=step_name,
                     size_bytes=size_bytes,
@@ -1195,18 +1201,51 @@ class AstraWeaveService:
         return value
 
     def _compute_pressure_level(self, session: _Session) -> float:
+        """Compute VRAM pressure using effective (post-compression) sizes.
+
+        When quantization is active, tensors in VRAM occupy fewer bytes than
+        their raw size.  Using effective_bytes prevents premature fallback
+        triggers that the audit (Tier 2) flagged as "pressure ignores
+        quantized sizes".
+        """
+
         if session.vram_budget_bytes <= 0:
             return 1.0
-        level = session.vram_used_bytes / session.vram_budget_bytes
+        effective_vram = self._effective_vram_used(session)
+        level = effective_vram / session.vram_budget_bytes
         return max(0.0, min(1.0, level))
 
     @staticmethod
+    def _effective_vram_used(session: _Session) -> int:
+        """Sum effective (post-compression) bytes for VRAM-resident tensors.
+
+        Falls back to the raw accounting counter when no tensor has been
+        quantized, preserving backward compatibility.
+        """
+
+        # M29 fix: single-pass iteration instead of filter + loop
+        total = 0
+        found_vram = False
+        for t in session.tensors.values():
+            if t.residency is not ResidencyState.VRAM:
+                continue
+            found_vram = True
+            if t.effective_bytes > 0 and t.compression_ratio > 1.0:
+                total += t.effective_bytes
+            else:
+                total += t.size_bytes
+        return total if found_vram else session.vram_used_bytes
+
+    @staticmethod
     def _derive_primary_tier(session: _Session) -> MemoryTier:
-        if any(tensor.residency is ResidencyState.VRAM for tensor in session.tensors.values()):
-            return MemoryTier.HOT
-        if any(tensor.residency is ResidencyState.PINNED_RAM for tensor in session.tensors.values()):
-            return MemoryTier.WARM
-        return MemoryTier.COLD
+        # M28 fix: single-pass iteration instead of two any() calls
+        has_pinned = False
+        for tensor in session.tensors.values():
+            if tensor.residency is ResidencyState.VRAM:
+                return MemoryTier.HOT
+            if tensor.residency is ResidencyState.PINNED_RAM:
+                has_pinned = True
+        return MemoryTier.WARM if has_pinned else MemoryTier.COLD
 
     @staticmethod
     def _now_ms() -> int:
@@ -1214,17 +1253,11 @@ class AstraWeaveService:
 
     @staticmethod
     def _is_valid_caller_identity(caller_identity: CallerIdentity | None) -> bool:
+        # M2 fix: delegate to canonical implementation in security module
         if caller_identity is None:
             return False
-        try:
-            return (
-                bool(caller_identity.user_sid.strip())
-                and isinstance(caller_identity.pid, int)
-                and not isinstance(caller_identity.pid, bool)
-                and caller_identity.pid > 0
-            )
-        except AttributeError:
-            return False
+        from .security import is_valid_caller_identity
+        return is_valid_caller_identity(caller_identity)
 
     @staticmethod
     def _call_runtime_method(runtime: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:

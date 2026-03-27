@@ -684,8 +684,12 @@ class LocalBackend:
         key = _caller_key(caller)
         attempts = self.state["create_session_attempts"].setdefault(key, [])
         cutoff = now_ms - 60_000
-        while attempts and attempts[0] < cutoff:
-            attempts.pop(0)
+        # H9 fix: avoid O(n^2) list.pop(0); slice off stale entries in one pass
+        first_valid = 0
+        while first_valid < len(attempts) and attempts[first_valid] < cutoff:
+            first_valid += 1
+        if first_valid:
+            del attempts[:first_valid]
         if len(attempts) > 6:
             raise ApiError(ApiErrorCode.RATE_LIMITED, "CreateSession rate limit exceeded")
 

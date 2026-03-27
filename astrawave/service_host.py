@@ -15,18 +15,8 @@ from typing import Any
 from urllib.parse import urlparse
 import os
 
-from .ipc_server import AstraWeaveIpcServer
+from .ipc_server import AstraWeaveIpcServer, _is_loopback_host
 from .service import AstraWeaveService
-
-
-def _is_loopback_host(host: str) -> bool:
-    normalized = host.strip().lower()
-    if normalized == "localhost":
-        return True
-    try:
-        return ip_address(normalized).is_loopback
-    except ValueError:
-        return False
 
 
 def _require_loopback_host(host: str) -> str:

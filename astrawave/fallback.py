@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, Sequence
+from typing import Sequence
 
 
 class FallbackStep(str, Enum):
@@ -85,7 +85,8 @@ class FallbackController:
         """Return the next ladder step after the current one."""
 
         if current_step is None:
-            return self._ladder[0]
+            # M12 fix: guard against empty ladder
+            return self._ladder[0] if self._ladder else None
 
         try:
             index = self._ladder.index(current_step)

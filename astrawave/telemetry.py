@@ -62,29 +62,21 @@ def _coerce_reason_code(value: str | TelemetryReasonCode) -> TelemetryReasonCode
         ) from exc
 
 
+_SENSITIVE_EXACT = frozenset({
+    "prompt", "completion", "output", "response", "secret",
+    "password", "passphrase", "credential", "authorization",
+    "bearer", "cookie", "api_key", "apikey", "file_contents",
+})
+_SENSITIVE_SUBSTRINGS = ("password", "passphrase", "secret", "credential", "bearer")
+
+
 def _is_sensitive_key(key: str) -> bool:
+    # M19 fix: use exact match set + targeted substrings to avoid false positives
+    # on "token" (matches max_tokens) and "content" (matches content_type)
     lowered = key.lower()
-    return any(
-        token in lowered
-        for token in (
-            "prompt",
-            "completion",
-            "output",
-            "response",
-            "secret",
-            "token",
-            "password",
-            "passphrase",
-            "credential",
-            "authorization",
-            "bearer",
-            "cookie",
-            "api_key",
-            "apikey",
-            "file_contents",
-            "content",
-        )
-    )
+    if lowered in _SENSITIVE_EXACT:
+        return True
+    return any(sub in lowered for sub in _SENSITIVE_SUBSTRINGS)
 
 
 def _is_identifier_key(key: str) -> bool:

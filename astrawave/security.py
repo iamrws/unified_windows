@@ -8,7 +8,6 @@ identity, authorization, rate limits, and concurrent-session caps.
 from __future__ import annotations
 
 from collections import deque
-import ctypes
 import errno
 from dataclasses import dataclass, field
 from enum import Enum
@@ -17,7 +16,13 @@ from threading import RLock
 from time import monotonic
 from typing import Callable, Deque, Dict, FrozenSet, Optional, Tuple
 
-from ctypes import wintypes
+# M27 fix: guard Windows-only imports
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+else:
+    ctypes = None  # type: ignore[assignment]
+    wintypes = None  # type: ignore[assignment]
 
 from .errors import ApiError, ApiErrorCode
 
@@ -204,7 +209,7 @@ def resolve_process_user_sid(pid: int) -> str | None:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 
-    process_handle = wintypes.HANDLE()
+    # M26 fix: removed dead wintypes.HANDLE() allocation
     token_handle = wintypes.HANDLE()
     sid_string = wintypes.LPWSTR()
     process_handle = kernel32.OpenProcess(0x1000, False, pid)
