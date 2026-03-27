@@ -8,6 +8,16 @@ import os
 import unittest
 
 
+class _FakeClock:
+    """Deterministic clock for rate-limit and session-cap tests."""
+
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+
 class SecurityContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -81,14 +91,7 @@ class SecurityContractTests(unittest.TestCase):
         self.assertTrue(decision.allowed)
 
     def test_create_session_rate_limit_and_session_cap_are_enforced(self) -> None:
-        class FakeClock:
-            def __init__(self) -> None:
-                self.value = 0.0
-
-            def __call__(self) -> float:
-                return self.value
-
-        clock = FakeClock()
+        clock = _FakeClock()
         gate = self.SecurityGuard(
             self._make_policy(create_session_limit_per_minute=100),
             clock=clock,
@@ -105,14 +108,7 @@ class SecurityContractTests(unittest.TestCase):
         self.assertEqual(denied.error_code.value, "AW_ERR_RESOURCE_EXHAUSTED")
 
     def test_create_session_rate_limit_is_below_unbounded_spam(self) -> None:
-        class FakeClock:
-            def __init__(self) -> None:
-                self.value = 0.0
-
-            def __call__(self) -> float:
-                return self.value
-
-        gate = self.SecurityGuard(self._make_policy(), clock=FakeClock())
+        gate = self.SecurityGuard(self._make_policy(), clock=_FakeClock())
         caller = self.CallerIdentity(user_sid="S-1-5-21-1000", pid=505)
         for _ in range(6):
             self.assertTrue(gate.admit_create_session(caller).allowed)

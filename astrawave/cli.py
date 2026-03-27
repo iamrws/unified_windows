@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, is_dataclass
 from contextlib import suppress
+import getpass
 import hashlib
+import hmac
 from ipaddress import ip_address
 import json
 import os
@@ -13,7 +15,7 @@ import sys
 import tempfile
 from pathlib import Path
 from time import monotonic, sleep, time_ns
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 from uuid import uuid4
 
 from .errors import ApiError, ApiErrorCode
@@ -21,30 +23,64 @@ from .fallback import FallbackController, FallbackState, FallbackStep
 from .security import CallerIdentity
 from .types import MemoryTier, PolicyProfile, PressureSnapshot, ResidencySnapshot, ResidencyState, SessionState
 
+
+class _Backend(Protocol):
+    """Protocol shared by LocalBackend and RemoteBackend for _dispatch()."""
+
+    def create_session(self, caller: CallerIdentity) -> dict[str, Any]: ...
+    def load_model(
+        self,
+        session_id: str,
+        model_name: str,
+        caller: CallerIdentity,
+        runtime_backend: str | None = ...,
+        runtime_profile: str | None = ...,
+        runtime_backend_options: dict[str, Any] | None = ...,
+    ) -> dict[str, Any]: ...
+    def register_tensor(self, session_id: str, tensor_name: str, size_bytes: int, caller: CallerIdentity) -> dict[str, Any]: ...
+    def set_tier_hint(self, session_id: str, tensor_name: str, tier: MemoryTier, caller: CallerIdentity) -> dict[str, Any]: ...
+    def prefetch_plan(self, session_id: str, caller: CallerIdentity) -> Any: ...
+    def run_step(
+        self,
+        session_id: str,
+        step_name: str,
+        caller: CallerIdentity,
+        prompt: str | None = ...,
+        max_tokens: int | None = ...,
+        temperature: float | None = ...,
+        runtime_profile_override: str | None = ...,
+        runtime_backend_options_override: dict[str, Any] | None = ...,
+    ) -> Any: ...
+    def get_residency(self, session_id: str, caller: CallerIdentity) -> Any: ...
+    def get_pressure(self, session_id: str, caller: CallerIdentity) -> Any: ...
+    def set_policy(self, session_id: str, policy: PolicyProfile, caller: CallerIdentity) -> dict[str, Any]: ...
+    def close_session(self, session_id: str, caller: CallerIdentity) -> dict[str, Any]: ...
+
+
 try:
     from .sdk import AstraWeaveSDK
-except Exception:  # pragma: no cover - optional transport stack
+except ImportError:  # pragma: no cover - optional transport stack
     AstraWeaveSDK = None
 
 try:
     from .ipc_server import AstraWeaveIpcServer
-except Exception:  # pragma: no cover - optional phase-3 transport stack
+except ImportError:  # pragma: no cover - optional phase-3 transport stack
     AstraWeaveIpcServer = None
 
 try:
     from .service_host import AstraWeaveServiceHost, ServiceHostConfig
-except Exception:  # pragma: no cover - optional phase-3 host wrapper
+except ImportError:  # pragma: no cover - optional phase-3 host wrapper
     AstraWeaveServiceHost = None
     ServiceHostConfig = None
 
 try:
     from .hardware_probe import collect_hardware_probe as _collect_hardware_probe_impl
-except Exception:  # pragma: no cover - optional hardware probe module
+except ImportError:  # pragma: no cover - optional hardware probe module
     _collect_hardware_probe_impl = None
 
 try:
     from .service import DEFAULT_SERVICE_OWNER_SID
-except Exception:  # pragma: no cover - future-proof fallback
+except ImportError:  # pragma: no cover - future-proof fallback
     DEFAULT_SERVICE_OWNER_SID = "S-1-5-21-AstraWeave-Owner"
 
 STATE_DIR = Path(tempfile.gettempdir()) / "astrawave_cli_state"
@@ -57,6 +93,18 @@ _POSITIVE_INT_OPTION_KEYS = {"num_ctx", "num_batch", "num_predict", "num_keep", 
 _NONNEGATIVE_INT_OPTION_KEYS = {"gpu_layers", "num_gpu"}
 _NONNEGATIVE_FLOAT_OPTION_KEYS = {"temperature"}
 _OPEN_INTERVAL_FLOAT_OPTION_KEYS = {"top_p", "repeat_penalty"}
+
+
+def _derive_state_hmac_key() -> bytes:
+    """Derive a per-user HMAC key from the username and state directory path."""
+    user = getpass.getuser()
+    material = f"{user}|{STATE_DIR}".encode("utf-8")
+    return hashlib.sha256(material).digest()
+
+
+def _compute_state_hmac(json_bytes: bytes) -> str:
+    """Compute an HMAC-SHA256 hex digest for state file content."""
+    return hmac.new(_derive_state_hmac_key(), json_bytes, hashlib.sha256).hexdigest()
 
 
 def _now_ms() -> int:
@@ -731,14 +779,55 @@ class LocalBackend:
             payload = json.load(f)
         if int(payload.get("version", 0)) != STATE_VERSION:
             raise ApiError(ApiErrorCode.INTERNAL, "unsupported CLI state version")
+        # C3: verify HMAC integrity tag before trusting the content
+        stored_hmac = payload.pop("_hmac", None)
+        if stored_hmac is not None:
+            json_bytes = json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+            expected_hmac = _compute_state_hmac(json_bytes)
+            if not hmac.compare_digest(stored_hmac, expected_hmac):
+                raise ApiError(ApiErrorCode.INTERNAL, "CLI state file integrity check failed")
         return payload
+
+    @staticmethod
+    def _lock_file(f: Any) -> None:
+        """Acquire an exclusive file lock (best-effort on non-Windows)."""
+        try:
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        except (ImportError, OSError):
+            # On non-Windows or if locking fails, proceed without lock.
+            pass
+
+    @staticmethod
+    def _unlock_file(f: Any) -> None:
+        """Release the file lock (best-effort)."""
+        try:
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        except (ImportError, OSError):
+            pass
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(self.state, f, ensure_ascii=True, indent=2, sort_keys=True)
-        tmp.replace(self.path)
+        # M4: use file-based locking to prevent race conditions
+        lock_path = self.path.with_suffix(".lock")
+        lock_fh = None
+        try:
+            lock_fh = lock_path.open("w", encoding="utf-8")
+            self._lock_file(lock_fh)
+            # C3: compute HMAC integrity tag and embed in state JSON
+            payload = dict(self.state)
+            json_bytes = json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+            payload["_hmac"] = _compute_state_hmac(json_bytes)
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=True, indent=2, sort_keys=True)
+            tmp.replace(self.path)
+        finally:
+            if lock_fh is not None:
+                self._unlock_file(lock_fh)
+                lock_fh.close()
 
 
 class RemoteBackend:
@@ -920,7 +1009,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _dispatch(backend: LocalBackend, args: argparse.Namespace, caller: CallerIdentity) -> Any:
+def _dispatch(backend: _Backend, args: argparse.Namespace, caller: CallerIdentity) -> Any:
     if args.command == "create-session":
         return backend.create_session(caller)
     if args.command == "load-model":
@@ -1116,9 +1205,9 @@ def _resolve_backend(endpoint: str, caller: CallerIdentity, mode: str = "auto") 
     if endpoint == "auto" or remote_hint or endpoint == "":
         try:
             return RemoteBackend(endpoint or "auto", caller)
-        except ApiError:
-            if endpoint in {"", "auto", DEFAULT_ENDPOINT}:
-                raise
+        except (ConnectionError, OSError):
+            # M6: only catch connection-related errors so the fallback to
+            # LocalBackend is reachable; let ApiError propagate directly.
             if remote_hint:
                 raise
     return LocalBackend(endpoint or DEFAULT_ENDPOINT)

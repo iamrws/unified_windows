@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,7 +74,7 @@ def _probe_used_bytes(probe: dict[str, Any], *, device_index: int) -> int | None
 
 
 def run_hardware_gate(*, run_id: str, transfer_bytes: int, device_index: int, hold_ms: int) -> dict[str, Any]:
-    owner = CallerIdentity(user_sid=DEFAULT_SERVICE_OWNER_SID, pid=3301)
+    owner = CallerIdentity(user_sid=DEFAULT_SERVICE_OWNER_SID, pid=os.getpid())
     service = AstraWeaveService(runstep_mode="hardware")
 
     before_probe = collect_hardware_probe()
@@ -173,7 +174,7 @@ def run_hardware_gate(*, run_id: str, transfer_bytes: int, device_index: int, ho
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run hardware release-gate checks.")
-    parser.add_argument("--run-id", default=datetime.now().strftime("%Y-%m-%d"))
+    parser.add_argument("--run-id", default=datetime.now(timezone.utc).strftime("%Y-%m-%d"))
     parser.add_argument("--out-dir", default="reports/release_gate")
     parser.add_argument("--transfer-bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--device-index", type=int, default=0)

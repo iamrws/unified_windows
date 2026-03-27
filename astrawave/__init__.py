@@ -1,5 +1,9 @@
 """AstraWeave package surface."""
 
+import logging
+
+logging.getLogger(__name__).addHandler(logging.NullHandler())
+
 from .errors import ApiError, ApiErrorCode
 from .cuda_runtime import run_cuda_transfer
 from .hardware_probe import collect_hardware_probe

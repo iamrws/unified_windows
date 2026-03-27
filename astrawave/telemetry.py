@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 import hashlib
+import hmac
 import json
 import re
 import uuid
@@ -31,15 +32,20 @@ def new_correlation_id(prefix: str = "tel") -> str:
     return f"{prefix}-{uuid.uuid4()}"
 
 
+_TELEMETRY_HMAC_APP_KEY = b"AstraWeave-Telemetry-v1"
+
+
 def hash_identifier(value: object, salt: str = "") -> str:
     """Hash an identifier for persisted telemetry records.
 
-    The output is deterministic for the same input and salt, but the raw value
-    is not preserved in persisted telemetry.
+    Uses HMAC-SHA256 with a fixed application key so that the output is
+    deterministic for the same input and salt, but the raw value is not
+    preserved in persisted telemetry.  (M20: HMAC instead of plain SHA-256.)
     """
 
-    digest = hashlib.sha256(f"{salt}|{value!s}".encode("utf-8")).hexdigest()
-    return f"sha256:{digest}"
+    msg = f"{salt}|{value!s}".encode("utf-8")
+    digest = hmac.new(_TELEMETRY_HMAC_APP_KEY, msg, hashlib.sha256).hexdigest()
+    return f"hmac-sha256:{digest}"
 
 
 def _coerce_datetime(value: datetime | None) -> datetime:
@@ -433,6 +439,13 @@ class TelemetryPipeline:
 
     @property
     def records(self) -> tuple[TelemetryRecord, ...]:
+        """Return a snapshot of all buffered records.
+
+        .. note::
+            This copies the entire ring buffer into a new tuple. Avoid
+            calling it in hot paths (e.g. per-request middleware). For
+            iteration-only use cases prefer ``iter(pipeline._records)``.
+        """
         return tuple(self._records)
 
     def set_export_opt_in(self, enabled: bool) -> None:
@@ -502,16 +515,20 @@ class TelemetryPipeline:
         now: datetime | None = None,
         on_remove: Callable[[TelemetryRecord], None] | None = None,
     ) -> tuple[TelemetryRecord, ...]:
-        """Drop expired records and call the optional cleanup hook."""
+        """Drop expired records and call the optional cleanup hook.
+
+        M21: builds the kept deque directly (no intermediate ``kept`` list)
+        and collects only removed records into a separate container.
+        """
 
         current_time = _coerce_datetime(now)
-        kept: list[TelemetryRecord] = []
-        removed: list[TelemetryRecord] = []
+        new_records: deque[TelemetryRecord] = deque(maxlen=TELEMETRY_RING_BUFFER_SIZE)
+        removed: deque[TelemetryRecord] = deque()
 
         for record in self._records:
             retention = self.policy.retention_seconds_by_class.get(record.record_class)
             if retention is None:
-                kept.append(record)
+                new_records.append(record)
                 continue
             age_seconds = (current_time - record.timestamp).total_seconds()
             if age_seconds > retention:
@@ -519,9 +536,9 @@ class TelemetryPipeline:
                 if on_remove is not None:
                     on_remove(record)
             else:
-                kept.append(record)
+                new_records.append(record)
 
-        self._records = deque(kept, maxlen=TELEMETRY_RING_BUFFER_SIZE)
+        self._records = new_records
         return tuple(removed)
 
     def build_export_bundle(self, *, now: datetime | None = None) -> TelemetryExportBundle:

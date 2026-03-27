@@ -15,17 +15,11 @@ except ImportError:  # pragma: no cover - current repo falls back to the IPC ser
     ServiceHostConfig = None
 
 
+from tests.conftest import endpoint_to_uri
+
+
 def _endpoint_uri(endpoint: object) -> str:
-    if isinstance(endpoint, tuple) and len(endpoint) == 2:
-        host, port = endpoint
-        return f"tcp://{host}:{port}"
-    if isinstance(endpoint, str):
-        if endpoint.startswith("\\\\.\\pipe\\"):
-            return f"pipe://{endpoint}"
-        if endpoint.startswith(("tcp://", "pipe://")):
-            return endpoint
-        return f"tcp://{endpoint}"
-    raise AssertionError(f"Unsupported endpoint shape: {endpoint!r}")
+    return endpoint_to_uri(endpoint)
 
 
 class _RuntimeHarness:
@@ -53,9 +47,7 @@ class _RuntimeHarness:
     def run_for(self, duration_seconds: float) -> None:
         self.start()
         try:
-            deadline = time.monotonic() + duration_seconds
-            while time.monotonic() < deadline:
-                time.sleep(0.01)
+            time.sleep(duration_seconds)
         finally:
             self.stop()
 

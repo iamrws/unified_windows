@@ -12,6 +12,7 @@ from dataclasses import asdict, is_dataclass
 from enum import Enum
 from ipaddress import ip_address
 from multiprocessing.connection import Client, Connection
+import logging
 import os
 from threading import Event, RLock, Thread
 from typing import Any, Mapping, Protocol, cast
@@ -30,6 +31,8 @@ from .ipc_protocol import (
 from .security import CallerIdentity
 from .types import MemoryTier, PolicyProfile, PressureSnapshot, ResidencySnapshot, ResidencyState, SessionState
 
+
+_logger = logging.getLogger(__name__)
 
 DEFAULT_TCP_ENDPOINT = "tcp://127.0.0.1:8765"
 DEFAULT_PIPE_NAME = r"\\.\pipe\astrawave"
@@ -295,6 +298,15 @@ class _ConnectionTransport:
             thread.start()
             if not finished.wait(timeout):
                 self.close()
+                # Give the worker thread a short grace period to finish
+                # after the connection is closed, to avoid leaking it.
+                thread.join(timeout=1.0)
+                if thread.is_alive():
+                    logging.getLogger(__name__).warning(
+                        "IPC worker thread still alive after timeout; "
+                        "thread %s may be leaked",
+                        thread.name,
+                    )
                 raise ApiError(ApiErrorCode.TIMEOUT, "IPC request timed out")
             thread.join()
             if error_box:
@@ -386,6 +398,10 @@ class AstraWeaveIpcClient:
                         ApiErrorCode.INTERNAL,
                         "named pipe transport required by policy but connection failed",
                     ) from exc
+                _logger.warning(
+                    "Named pipe connection failed (%s); falling back to TCP 127.0.0.1:8765",
+                    exc,
+                )
                 fallback = _ConnectionTransport(
                     "AF_INET",
                     ("127.0.0.1", 8765),

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import ctypes
+import os
 import subprocess
 from dataclasses import dataclass
 from ctypes import byref, c_uint, c_void_p, create_string_buffer
@@ -53,8 +54,9 @@ def collect_hardware_probe() -> dict[str, Any]:
 
 
 def _probe_nvidia_smi(warnings: list[str]) -> dict[str, Any]:
+    nvidia_smi_path = os.environ.get("ASTRAWEAVE_NVIDIA_SMI_PATH", "nvidia-smi")
     command = [
-        "nvidia-smi",
+        nvidia_smi_path,
         "--query-gpu=index,name,memory.total,memory.used,memory.free,driver_version",
         "--format=csv,noheader,nounits",
     ]

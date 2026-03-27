@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import hmac
+import functools
 from inspect import Parameter, signature
 import json
+import logging
 import os
 from threading import RLock
 from time import time_ns
@@ -51,7 +53,7 @@ from .types import (
 )
 
 HIGH_PRESSURE_THRESHOLD = 0.75
-MAX_CLOSED_SESSIONS = 256
+MAX_CLOSED_SESSIONS = int(os.environ.get("ASTRAWEAVE_MAX_CLOSED_SESSIONS", "256"))
 DEFAULT_SERVICE_OWNER_SID = resolve_current_user_sid() or "S-1-5-21-AstraWeave-Owner"
 DEFAULT_RUNSTEP_MODE = "auto"
 RUNSTEP_MODE_ENV = "ASTRAWEAVE_RUNSTEP_MODE"
@@ -109,7 +111,7 @@ class _Session:
     fallback_events: list[FallbackEvent] = field(default_factory=list)
     transfer_history: list[TransferEvent] = field(default_factory=list)
     lock: RLock = field(default_factory=RLock)
-    vram_budget_bytes: int = 8 * 1024**3
+    vram_budget_bytes: int = int(os.environ.get("ASTRAWEAVE_VRAM_BUDGET_BYTES", str(8 * 1024**3)))
     vram_used_bytes: int = 0
     pinned_ram_used_bytes: int = 0
     pageable_ram_used_bytes: int = 0
@@ -128,6 +130,13 @@ class AstraWeaveService:
     - `SecurityGuard` for caller admission and ownership checks
     - `TelemetryPipeline` for local-only structured telemetry
     - `FallbackController` for deterministic pressure-driven fallback
+
+    Lock ordering convention
+    ~~~~~~~~~~~~~~~~~~~~~~~~
+    Always acquire ``self._lock`` (the service-level lock) **before**
+    ``session.lock`` (the per-session lock).  Acquiring them in the
+    reverse order risks deadlock when one thread holds a session lock and
+    another holds the service lock while both attempt to acquire the other.
     """
 
     def __init__(
@@ -695,8 +704,8 @@ class AstraWeaveService:
         caller: CallerIdentity | None = None,
     ) -> TransferEvent:
         source = tensor.residency
+        self._apply_residency_bytes(session, tensor.size_bytes, source, destination, tensor=tensor)
         tensor.residency = destination
-        self._apply_residency_bytes(session, tensor.size_bytes, source, destination)
         event = TransferEvent(
             session_id=session.session_id,
             source=source,
@@ -881,7 +890,12 @@ class AstraWeaveService:
             )
 
     def _select_tensor_for_fallback(self, session: _Session) -> _TensorRecord | None:
-        """Select the most memory-intensive tensor deterministically."""
+        """Select the most memory-intensive tensor deterministically.
+
+        Sorts by residency priority (VRAM first), then by size_bytes
+        descending (so evicting one tensor frees the most memory), then
+        by name for deterministic tie-breaking.
+        """
 
         priority = {
             ResidencyState.VRAM: 0,
@@ -891,7 +905,7 @@ class AstraWeaveService:
         }
         candidates = sorted(
             session.tensors.values(),
-            key=lambda tensor: (priority.get(tensor.residency, 99), tensor.name),
+            key=lambda tensor: (priority.get(tensor.residency, 99), -tensor.size_bytes, tensor.name),
         )
         return candidates[0] if candidates else None
 
@@ -959,7 +973,15 @@ class AstraWeaveService:
         size_bytes: int,
         source: ResidencyState,
         destination: ResidencyState,
+        *,
+        tensor: _TensorRecord | None = None,
     ) -> None:
+        # Guard: if a tensor reference is provided, verify its current
+        # residency matches the expected source to avoid double-counting
+        # when a tensor is migrated twice in quick succession.
+        if tensor is not None and tensor.residency != source:
+            return
+
         def decrement(state: ResidencyState) -> None:
             if state is ResidencyState.VRAM:
                 session.vram_used_bytes = max(0, session.vram_used_bytes - size_bytes)
@@ -1259,11 +1281,19 @@ class AstraWeaveService:
         from .security import is_valid_caller_identity
         return is_valid_caller_identity(caller_identity)
 
+    # NOTE: This method is duplicated in ipc_server.py.  It should be
+    # extracted into a shared utility module in a follow-up refactor.
+    @staticmethod
+    @functools.lru_cache(maxsize=256)
+    def _cached_signature(method: Any) -> dict[str, Parameter]:
+        """Return cached parameter mapping for *method*."""
+        return dict(signature(method).parameters)
+
     @staticmethod
     def _call_runtime_method(runtime: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
         method = getattr(runtime, method_name)
         try:
-            params = signature(method).parameters
+            params = AstraWeaveService._cached_signature(method)
         except (TypeError, ValueError):
             return method(*args, **kwargs)
 

@@ -104,7 +104,7 @@ class IpcSuccessEnvelope:
     result: Any = None
 
     def to_dict(self) -> dict[str, Any]:
-        return success_response(self.result, id=self.id).to_dict()
+        return success_response(self.result, request_id=self.id).to_dict()
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,16 +118,16 @@ class IpcResponseEnvelope:
 
     def to_dict(self) -> dict[str, Any]:
         if self.ok:
-            return success_response(self.result, id=self.id).to_dict()
+            return success_response(self.result, request_id=self.id).to_dict()
         if self.error is None:
             err = ApiError(ApiErrorCode.INTERNAL, "internal server error")
-            return error_response(err, id=self.id).to_dict()
+            return error_response(err, request_id=self.id).to_dict()
         try:
             code = ApiErrorCode(self.error.code)
         except ValueError as exc:
             raise IpcProtocolError(ApiErrorCode.INVALID_ARGUMENT, "error code is not a known ApiErrorCode") from exc
         err = ApiError(code, self.error.message)
-        return error_response(err, id=self.id).to_dict()
+        return error_response(err, request_id=self.id).to_dict()
 
 
 def parse_caller(payload: Any) -> CallerIdentity:
@@ -440,11 +440,11 @@ class AstraWeaveIpcServer:
             request_id = envelope.id
             caller = self._resolve_and_authorize_caller(envelope, expected_caller=expected_caller)
             result = self._dispatch(envelope, caller)
-            return success_response(result, id=envelope.id).to_dict(), caller
+            return success_response(result, request_id=envelope.id).to_dict(), caller
         except BaseException as exc:
             err = _error_from_exception(exc)
             self._record_security_deny(error=err, request=request)
-            return error_response(err, id=request_id or "invalid-request").to_dict(), None
+            return error_response(err, request_id=request_id or "invalid-request").to_dict(), None
 
     @staticmethod
     def _extract_request_id(request: IpcRequestEnvelope | RequestEnvelope | Mapping[str, Any]) -> str:

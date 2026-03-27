@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import shutil
+import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
@@ -26,10 +27,7 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
 class ReleaseGateReportContractTests(unittest.TestCase):
     @contextmanager
     def _workspace_tmpdir(self):
-        base = Path("test_runtime")
-        base.mkdir(parents=True, exist_ok=True)
-        path = (base / f"release_gate_{uuid4().hex}").resolve()
-        path.mkdir(parents=True, exist_ok=False)
+        path = Path(tempfile.mkdtemp(prefix="release_gate_"))
         try:
             yield path
         finally:

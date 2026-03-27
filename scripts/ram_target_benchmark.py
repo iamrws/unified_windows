@@ -145,7 +145,32 @@ def _extract_metrics(smoke_result: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+_ALLOWED_POWERSHELL_COMMANDS: frozenset[str] = frozenset({
+    "Get-Process",
+    "Select-Object",
+    "Sort-Object",
+    "ConvertTo-Json",
+    "Where-Object",
+})
+
+
 def _run_powershell(command: str) -> str:
+    # H26 fix: validate that the command starts with an allowed PowerShell cmdlet
+    # to prevent command-injection via arbitrary strings.
+    stripped = command.lstrip("$")
+    first_token = stripped.split()[0] if stripped.split() else ""
+    # The command may start with a variable assignment like "$p = Get-Process ..."
+    # so also check after the first "=" or after "$var = ".
+    tokens_to_check = [first_token]
+    if "=" in command:
+        after_eq = command.split("=", 1)[1].strip()
+        if after_eq:
+            tokens_to_check.append(after_eq.split()[0])
+    if not any(token in _ALLOWED_POWERSHELL_COMMANDS for token in tokens_to_check):
+        raise ValueError(
+            f"PowerShell command not in allowlist. "
+            f"First tokens: {tokens_to_check!r}, allowed: {sorted(_ALLOWED_POWERSHELL_COMMANDS)}"
+        )
     completed = subprocess.run(
         ["powershell", "-NoProfile", "-Command", command],
         capture_output=True,

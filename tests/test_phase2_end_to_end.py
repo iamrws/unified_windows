@@ -58,14 +58,8 @@ class Phase2EndToEndTests(unittest.TestCase):
 
     @staticmethod
     def _endpoint_uri(endpoint: object) -> str:
-        if isinstance(endpoint, tuple) and len(endpoint) == 2:
-            host, port = endpoint
-            return f"tcp://{host}:{port}"
-        if isinstance(endpoint, str):
-            if endpoint.startswith("\\\\.\\pipe\\"):
-                return f"pipe://{endpoint}"
-            return endpoint
-        raise AssertionError(f"Unsupported IPC endpoint format: {endpoint!r}")
+        from tests.conftest import endpoint_to_uri
+        return endpoint_to_uri(endpoint)
 
     def test_owner_flow_emits_telemetry_and_remote_state(self) -> None:
         session_id = self.sdk.CreateSession()

@@ -359,9 +359,8 @@ def run_live_inference_smoke(
     service_runstep_mode: str = DEFAULT_SERVICE_RUNSTEP_MODE,
     ipc_timeout_seconds: float = DEFAULT_IPC_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    if runtime_backend == "ollama":
-        # Service-side Ollama runtime reads this env var while loading backend adapters.
-        os.environ["ASTRAWEAVE_OLLAMA_BASE_URL"] = ollama_base_url.rstrip("/")
+    # H27 fix: instead of mutating os.environ, the base_url is passed directly
+    # to _ProfiledOllamaRuntime via the factory closure below.
 
     from astrawave.ipc_client import AstraWeaveIpcClient
     from astrawave.ipc_server import AstraWeaveIpcServer

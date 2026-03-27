@@ -70,7 +70,7 @@ class IpcProtocolContractTests(unittest.TestCase):
         error_response = self._lookup("error_response")
         api_error = self.ApiError(self.ApiErrorCode.AUTH_DENIED, "not allowed")
 
-        envelope = error_response(api_error, id="req-7")
+        envelope = error_response(api_error, request_id="req-7")
         payload = envelope.to_dict()
 
         self.assertEqual(payload["id"], "req-7")

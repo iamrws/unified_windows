@@ -7,6 +7,7 @@ service-style method names.
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Callable
 
 from .security import CallerIdentity
@@ -100,7 +101,7 @@ class AstraWeaveSDK:
         runtime_profile: str | None = None,
         runtime_backend_options: dict[str, Any] | None = None,
         caller_identity: CallerIdentity | None = None,
-    ) -> Any:
+    ) -> dict[str, Any]:
         return self._invoke(
             "LoadModel",
             session_id,
@@ -118,7 +119,7 @@ class AstraWeaveSDK:
         size_bytes: int,
         *,
         caller_identity: CallerIdentity | None = None,
-    ) -> Any:
+    ) -> dict[str, Any]:
         return self._invoke(
             "RegisterTensor",
             session_id,
@@ -134,7 +135,7 @@ class AstraWeaveSDK:
         tier: MemoryTier,
         *,
         caller_identity: CallerIdentity | None = None,
-    ) -> Any:
+    ) -> dict[str, Any]:
         return self._invoke(
             "SetTierHint",
             session_id,
@@ -148,7 +149,7 @@ class AstraWeaveSDK:
         session_id: str,
         *,
         caller_identity: CallerIdentity | None = None,
-    ) -> Any:
+    ) -> dict[str, Any]:
         return self._invoke("PrefetchPlan", session_id, caller_identity=caller_identity)
 
     def RunStep(
@@ -162,7 +163,7 @@ class AstraWeaveSDK:
         runtime_profile_override: str | None = None,
         runtime_backend_options_override: dict[str, Any] | None = None,
         caller_identity: CallerIdentity | None = None,
-    ) -> Any:
+    ) -> dict[str, Any]:
         return self._invoke(
             "RunStep",
             session_id,
@@ -180,7 +181,7 @@ class AstraWeaveSDK:
         session_id: str,
         *,
         caller_identity: CallerIdentity | None = None,
-    ) -> Any:
+    ) -> dict[str, Any]:
         return self._invoke("GetResidency", session_id, caller_identity=caller_identity)
 
     def GetPressure(
@@ -188,7 +189,7 @@ class AstraWeaveSDK:
         session_id: str,
         *,
         caller_identity: CallerIdentity | None = None,
-    ) -> Any:
+    ) -> dict[str, Any]:
         return self._invoke("GetPressure", session_id, caller_identity=caller_identity)
 
     def SetPolicy(
@@ -197,7 +198,7 @@ class AstraWeaveSDK:
         policy: PolicyProfile,
         *,
         caller_identity: CallerIdentity | None = None,
-    ) -> Any:
+    ) -> dict[str, Any]:
         return self._invoke(
             "SetPolicy",
             session_id,
@@ -210,8 +211,8 @@ class AstraWeaveSDK:
         session_id: str,
         *,
         caller_identity: CallerIdentity | None = None,
-    ) -> Any:
-        return self._invoke("CloseSession", session_id, caller_identity=caller_identity)
+    ) -> None:
+        self._invoke("CloseSession", session_id, caller_identity=caller_identity)
 
     def _invoke(
         self,
@@ -223,13 +224,10 @@ class AstraWeaveSDK:
         caller = self._resolve_caller_identity(caller_identity)
         method = getattr(self._client, method_name, None)
         if callable(method):
-            try:
-                return method(*args, **kwargs, caller_identity=caller)
-            except TypeError:
-                try:
-                    return method(*args, **kwargs, caller=caller)
-                except TypeError:
-                    return method(*args, **kwargs)
+            caller_kwarg = self._detect_caller_param(method)
+            if caller_kwarg is not None:
+                kwargs[caller_kwarg] = caller
+            return method(*args, **kwargs)
 
         call_fn = getattr(self._client, "call", None)
         if callable(call_fn):
@@ -240,6 +238,31 @@ class AstraWeaveSDK:
             f"Wrapped client does not expose method '{method_name}' or a generic call interface."
         )
 
+    @staticmethod
+    def _detect_caller_param(method: Callable[..., Any]) -> str | None:
+        """Inspect *method* to find which caller parameter it accepts.
+
+        Returns ``'caller_identity'``, ``'caller'``, or ``None`` when the
+        method accepts neither.  The result is determined via signature
+        inspection so no trial-and-error calls are needed.
+        """
+        try:
+            sig = inspect.signature(method)
+        except (ValueError, TypeError):
+            # Fallback for built-in / C-extension callables that have no
+            # inspectable signature: prefer caller_identity by convention.
+            return "caller_identity"
+        params = sig.parameters
+        if "caller_identity" in params:
+            return "caller_identity"
+        if "caller" in params:
+            return "caller"
+        # Check for **kwargs – the method may accept arbitrary keywords.
+        for p in params.values():
+            if p.kind == inspect.Parameter.VAR_KEYWORD:
+                return "caller_identity"
+        return None
+
     def _call_transport(
         self,
         call_fn: Callable[..., Any],
@@ -247,97 +270,89 @@ class AstraWeaveSDK:
         params: dict[str, Any],
         caller: CallerIdentity | None,
     ) -> Any:
-        attempts = (
-            (method_name, params, caller),
-            (method_name, params),
-            (method_name,),
+        try:
+            sig = inspect.signature(call_fn)
+        except (ValueError, TypeError):
+            # Uninspectable (C-extension, etc.) -- fall back to the most common
+            # positional convention: call(method_name, params, caller).
+            return call_fn(method_name, params, caller)
+
+        sig_params = sig.parameters
+        param_names = list(sig_params.keys())
+        has_var_positional = any(
+            p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig_params.values()
         )
-        keyword_attempts = (
-            {"caller": caller, "params": params},
-            {"caller_identity": caller, "params": params},
-            {"caller": caller},
-            {"caller_identity": caller},
-            {"params": params},
-            {},
+        has_var_keyword = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()
         )
 
-        for call_args in attempts:
-            try:
-                return call_fn(*call_args)
-            except TypeError:
-                pass
-        for call_kwargs in keyword_attempts:
-            try:
-                return call_fn(method_name, **call_kwargs)
-            except TypeError:
-                pass
-        raise RuntimeError(f"Transport client cannot dispatch method '{method_name}'.")
+        # Determine positional args beyond method_name based on signature.
+        positional_args: list[Any] = [method_name]
+        # The second positional param (after method_name) is typically params.
+        if has_var_positional or len(param_names) >= 2:
+            positional_args.append(params)
+        # Third positional param may be the caller.
+        if has_var_positional or len(param_names) >= 3:
+            positional_args.append(caller)
+
+        # Build keyword args for caller / params when accepted as keywords.
+        kw: dict[str, Any] = {}
+        if "params" in sig_params and "params" not in kw:
+            kw["params"] = params
+        caller_key = (
+            "caller_identity" if "caller_identity" in sig_params
+            else "caller" if "caller" in sig_params
+            else None
+        )
+        if caller_key is not None:
+            kw[caller_key] = caller
+
+        # Prefer keyword style when the signature explicitly names the params.
+        if kw:
+            return call_fn(method_name, **kw)
+
+        # Otherwise fall back to positional.
+        if has_var_positional or has_var_keyword:
+            return call_fn(*positional_args)
+
+        # Minimal call: just method_name.
+        return call_fn(method_name)
+
+    # -- Dispatch table for _build_params (M31) ---------------------------------
+    # Each entry maps a method name to:
+    #   positional_keys  - names assigned to positional args (in order)
+    #   optional_kwargs  - keyword-arg names that are forwarded when not None
+
+    _PARAM_SCHEMA: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+        "CreateSession": ((), ()),
+        "LoadModel": (
+            ("session_id", "model_name"),
+            ("runtime_backend", "runtime_profile", "runtime_backend_options"),
+        ),
+        "RegisterTensor": (("session_id", "tensor_name", "size_bytes"), ()),
+        "SetTierHint": (("session_id", "tensor_name", "tier"), ()),
+        "PrefetchPlan": (("session_id",), ()),
+        "RunStep": (
+            ("session_id", "step_name"),
+            ("prompt", "max_tokens", "temperature", "runtime_profile_override", "runtime_backend_options_override"),
+        ),
+        "GetResidency": (("session_id",), ()),
+        "GetPressure": (("session_id",), ()),
+        "SetPolicy": (("session_id", "policy"), ()),
+        "CloseSession": (("session_id",), ()),
+    }
 
     def _build_params(self, method_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
-        if method_name == "CreateSession":
-            return {}
-        if method_name == "LoadModel":
-            session_id, model_name = args
-            params = {"session_id": session_id, "model_name": model_name}
-            runtime_backend = kwargs.get("runtime_backend")
-            if runtime_backend is not None:
-                params["runtime_backend"] = runtime_backend
-            runtime_profile = kwargs.get("runtime_profile")
-            if runtime_profile is not None:
-                params["runtime_profile"] = runtime_profile
-            runtime_backend_options = kwargs.get("runtime_backend_options")
-            if runtime_backend_options is not None:
-                params["runtime_backend_options"] = runtime_backend_options
-            return params
-        if method_name == "RegisterTensor":
-            session_id, tensor_name, size_bytes = args
-            return {
-                "session_id": session_id,
-                "tensor_name": tensor_name,
-                "size_bytes": size_bytes,
-            }
-        if method_name == "SetTierHint":
-            session_id, tensor_name, tier = args
-            return {
-                "session_id": session_id,
-                "tensor_name": tensor_name,
-                "tier": tier,
-            }
-        if method_name == "PrefetchPlan":
-            (session_id,) = args
-            return {"session_id": session_id}
-        if method_name == "RunStep":
-            session_id, step_name = args
-            params = {"session_id": session_id, "step_name": step_name}
-            prompt = kwargs.get("prompt")
-            max_tokens = kwargs.get("max_tokens")
-            temperature = kwargs.get("temperature")
-            runtime_profile_override = kwargs.get("runtime_profile_override")
-            runtime_backend_options_override = kwargs.get("runtime_backend_options_override")
-            if prompt is not None:
-                params["prompt"] = prompt
-            if max_tokens is not None:
-                params["max_tokens"] = max_tokens
-            if temperature is not None:
-                params["temperature"] = temperature
-            if runtime_profile_override is not None:
-                params["runtime_profile_override"] = runtime_profile_override
-            if runtime_backend_options_override is not None:
-                params["runtime_backend_options_override"] = runtime_backend_options_override
-            return params
-        if method_name == "GetResidency":
-            (session_id,) = args
-            return {"session_id": session_id}
-        if method_name == "GetPressure":
-            (session_id,) = args
-            return {"session_id": session_id}
-        if method_name == "SetPolicy":
-            session_id, policy = args
-            return {"session_id": session_id, "policy": policy}
-        if method_name == "CloseSession":
-            (session_id,) = args
-            return {"session_id": session_id}
-        raise RuntimeError(f"Unsupported SDK method '{method_name}'.")
+        schema = self._PARAM_SCHEMA.get(method_name)
+        if schema is None:
+            raise RuntimeError(f"Unsupported SDK method '{method_name}'.")
+        positional_keys, optional_kwargs = schema
+        params: dict[str, Any] = dict(zip(positional_keys, args))
+        for key in optional_kwargs:
+            value = kwargs.get(key)
+            if value is not None:
+                params[key] = value
+        return params
 
     def _resolve_caller_identity(
         self,

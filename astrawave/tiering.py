@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Sequence
+from typing import Mapping, Sequence
 
 from .types import MemoryTier
 
@@ -172,3 +172,12 @@ class PlacementPlanner:
 
         reserve = int(hot_budget_bytes * self._policy.hot_headroom_ratio)
         return max(hot_budget_bytes - reserve, 0)
+
+
+__all__ = [
+    "PlacementDecision",
+    "PlacementPlan",
+    "PlacementPlanner",
+    "PlacementPolicy",
+    "PlacementRequest",
+]

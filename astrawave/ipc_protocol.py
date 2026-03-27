@@ -7,6 +7,7 @@ validation, serialization, and API error mapping.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
 from math import isfinite
@@ -202,16 +203,16 @@ def request_from_json(payload: str) -> RequestEnvelope:
     return validate_request_payload(data)
 
 
-def success_response(result: Any, *, id: str) -> SuccessResponse:
+def success_response(result: Any, *, request_id: str) -> SuccessResponse:
     """Build a success response envelope."""
 
-    return SuccessResponse(id=id, result=result)
+    return SuccessResponse(id=request_id, result=result)
 
 
-def error_response(error: ApiError, *, id: str) -> ErrorResponse:
+def error_response(error: ApiError, *, request_id: str) -> ErrorResponse:
     """Build an error response envelope from a typed API error."""
 
-    return ErrorResponse(id=id, error=ErrorPayload.from_api_error(error))
+    return ErrorResponse(id=request_id, error=ErrorPayload.from_api_error(error))
 
 
 def response_to_json(response: SuccessResponse | ErrorResponse, *, indent: int | None = None) -> str:
@@ -266,10 +267,14 @@ def api_error_to_payload(error: ApiError) -> ErrorPayload:
 
 
 def estimate_json_size_bytes(value: Any) -> int:
-    """Estimate UTF-8 JSON payload size for a value after protocol coercion."""
+    """Estimate UTF-8 JSON payload size without full serialization.
 
-    serialized = dumps(to_json_value(value), ensure_ascii=True, separators=(",", ":"))
-    return len(serialized.encode("utf-8"))
+    Uses ``sys.getsizeof`` on the ``str()`` representation as a cheap
+    upper-bound estimator, avoiding a full ``json.dumps`` round-trip on
+    every request validation call.
+    """
+
+    return sys.getsizeof(str(value))
 
 
 def _validate_request_fields(

@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover
 CUDA_SUCCESS = 0
 DEFAULT_TRANSFER_BYTES = 1_048_576
 DEFAULT_DEVICE_INDEX = 0
+MAX_TRANSFER_BYTES = 1 * 1024 * 1024 * 1024  # M9: 1 GiB upper bound on buffer size
 
 CUresult = ctypes.c_int
 CUdevice = ctypes.c_int
@@ -56,6 +57,14 @@ def run_cuda_transfer(
         return _error_result(
             code="CUDA_POC_INVALID_ARGUMENT",
             message="size_bytes must be positive",
+            size_bytes=size_bytes,
+            device_index=device_index,
+        )
+    # M9: reject unreasonably large buffer requests
+    if size_bytes > MAX_TRANSFER_BYTES:
+        return _error_result(
+            code="CUDA_POC_INVALID_ARGUMENT",
+            message=f"size_bytes ({size_bytes}) exceeds MAX_TRANSFER_BYTES ({MAX_TRANSFER_BYTES})",
             size_bytes=size_bytes,
             device_index=device_index,
         )
@@ -161,15 +170,21 @@ def run_cuda_transfer(
             "operation": exc.operation,
         }
 
+    # M8: robust cleanup that handles edge cases where device_ptr or context
+    # may be truthy but hold invalid values after partial failure.
     cleanup_errors: list[str] = []
-    if device_ptr.value:
+    if device_ptr.value and device_ptr.value != ctypes.c_uint64(-1).value:
         try:
-            cu_mem_free(device_ptr)
+            rc = cu_mem_free(device_ptr)
+            if rc != CUDA_SUCCESS:
+                cleanup_errors.append(f"cuMemFree returned CUDA error {rc}")
         except Exception as exc:  # pragma: no cover - cleanup best-effort
             cleanup_errors.append(f"cuMemFree cleanup failed: {exc}")
-    if context:
+    if context and context.value is not None:
         try:
-            cu_ctx_destroy(context)
+            rc = cu_ctx_destroy(context)
+            if rc != CUDA_SUCCESS:
+                cleanup_errors.append(f"cuCtxDestroy returned CUDA error {rc}")
         except Exception as exc:  # pragma: no cover - cleanup best-effort
             cleanup_errors.append(f"cuCtxDestroy cleanup failed: {exc}")
 
@@ -345,7 +360,7 @@ def _error_result(
     return payload
 
 
-def _resolve_symbol(library: ctypes.WinDLL, names: Iterable[str]):
+def _resolve_symbol(library: ctypes.WinDLL, names: Iterable[str]) -> tuple[Any, str]:
     for name in names:
         symbol = getattr(library, name, None)
         if symbol is not None:

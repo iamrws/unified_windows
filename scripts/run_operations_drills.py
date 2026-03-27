@@ -292,7 +292,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run v1 operations drills and write reports.")
     parser.add_argument(
         "--run-id",
-        default=datetime.now().strftime("%Y-%m-%d"),
+        default=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         help="Stable run id suffix for generated artifacts.",
     )
     parser.add_argument(

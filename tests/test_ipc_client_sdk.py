@@ -15,13 +15,11 @@ from astrawave.service import AstraWeaveService
 from astrawave.types import MemoryTier, PolicyProfile
 
 
+from tests.conftest import endpoint_to_uri, wait_for_server, default_caller_identity
+
+
 def _endpoint_to_uri(endpoint: object) -> str:
-    if isinstance(endpoint, tuple) and len(endpoint) == 2:
-        host, port = endpoint
-        return f"tcp://{host}:{port}"
-    if isinstance(endpoint, str):
-        return endpoint if endpoint.startswith(("tcp://", "pipe://")) else f"tcp://{endpoint}"
-    raise AssertionError(f"Unsupported endpoint shape: {endpoint!r}")
+    return endpoint_to_uri(endpoint)
 
 
 def _connect_client(endpoint: str, caller: CallerIdentity) -> AstraWeaveIpcClient:

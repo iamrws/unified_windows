@@ -14,7 +14,8 @@ from enum import Enum
 import os
 from threading import RLock
 from time import monotonic
-from typing import Callable, Deque, Dict, FrozenSet, Optional, Tuple
+from collections.abc import Callable
+from typing import Deque
 
 # M27 fix: guard Windows-only imports
 if os.name == "nt":
@@ -26,8 +27,9 @@ else:
 
 from .errors import ApiError, ApiErrorCode
 
-CallerKey = Tuple[str, int]
+CallerKey = tuple[str, int]
 Clock = Callable[[], float]
+
 PidLookup = Callable[[int], bool]
 SidLookup = Callable[[int], str | None]
 
@@ -89,7 +91,7 @@ class SecurityPolicy:
     """Immutable authorization policy for the local service."""
 
     service_owner_sid: str
-    allowed_cross_user_sids: FrozenSet[str] = field(default_factory=frozenset)
+    allowed_cross_user_sids: frozenset[str] = field(default_factory=frozenset)
     create_session_limit_per_minute: int = CREATE_SESSION_LIMIT_PER_MINUTE
     max_concurrent_sessions_per_caller: int = MAX_CONCURRENT_SESSIONS_PER_CALLER
     rate_window_seconds: float = RATE_WINDOW_SECONDS
@@ -115,16 +117,18 @@ class SecurityDecision:
 
     allowed: bool
     error_code: ApiErrorCode = ApiErrorCode.OK
-    reason: Optional[SecurityDenyReason] = None
+    reason: SecurityDenyReason | None = None
     message: str = ""
-    retry_after_seconds: Optional[int] = None
+    retry_after_seconds: int | None = None
 
-    def to_api_error(self) -> Optional[ApiError]:
+    def to_api_error(self) -> ApiError | None:
         """Convert a deny decision into a stable API error object."""
 
         if self.allowed:
             return None
-        return ApiError(self.error_code, self.message or self.error_code.value)
+        result = ApiError(self.error_code, self.message or self.error_code.value)
+        assert result is not None, "deny decision must produce a non-None ApiError"
+        return result
 
 
 def decision_allowed(message: str = "") -> SecurityDecision:
@@ -137,7 +141,7 @@ def decision_denied(
     reason: SecurityDenyReason,
     message: str,
     *,
-    retry_after_seconds: Optional[int] = None,
+    retry_after_seconds: int | None = None,
 ) -> SecurityDecision:
     """Create a deterministic deny decision for a given reason."""
 
@@ -316,8 +320,8 @@ class SecurityGuard:
         self._policy = policy
         self._clock = clock
         self._lock = RLock()
-        self._create_session_attempts: Dict[CallerKey, Deque[float]] = {}
-        self._active_sessions: Dict[CallerKey, int] = {}
+        self._create_session_attempts: dict[CallerKey, Deque[float]] = {}
+        self._active_sessions: dict[CallerKey, int] = {}
 
     @property
     def policy(self) -> SecurityPolicy:
@@ -345,7 +349,7 @@ class SecurityGuard:
             "caller is not authorized for this local service",
         )
 
-    def can_create_session(self, caller: CallerIdentity, *, now: Optional[float] = None) -> SecurityDecision:
+    def can_create_session(self, caller: CallerIdentity, *, now: float | None = None) -> SecurityDecision:
         """Check admission for `CreateSession` without mutating state."""
 
         auth = self.authorize_caller(caller)
@@ -374,7 +378,7 @@ class SecurityGuard:
 
             return decision_allowed("caller admitted for CreateSession")
 
-    def admit_create_session(self, caller: CallerIdentity, *, now: Optional[float] = None) -> SecurityDecision:
+    def admit_create_session(self, caller: CallerIdentity, *, now: float | None = None) -> SecurityDecision:
         """Atomically approve and record a `CreateSession` attempt.
 
         Call this only when the service is ready to create a session. On
@@ -450,7 +454,7 @@ class SecurityGuard:
                 for caller_key in set(self._create_session_attempts) | set(self._active_sessions)
             }
 
-    def _resolve_now(self, now: Optional[float]) -> float:
+    def _resolve_now(self, now: float | None) -> float:
         return self._clock() if now is None else now
 
     def _get_attempt_bucket(self, caller_key: CallerKey) -> Deque[float]:

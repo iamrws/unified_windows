@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
+import ssl
 from typing import Any, Callable, Mapping, Protocol
 from urllib import error, request
 
@@ -293,8 +294,9 @@ def _post_json(url: str, payload: dict[str, Any], timeout_seconds: float) -> dic
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    ssl_context = ssl.create_default_context() if url.startswith("https://") else None
     try:
-        with request.urlopen(req, timeout=timeout_seconds) as response:
+        with request.urlopen(req, timeout=timeout_seconds, context=ssl_context) as response:
             body = response.read().decode("utf-8")
     except error.HTTPError as exc:  # pragma: no cover - network boundary
         detail = exc.read().decode("utf-8", errors="replace")

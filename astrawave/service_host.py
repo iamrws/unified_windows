@@ -8,7 +8,6 @@ runtime deterministically without depending on additional infrastructure.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from ipaddress import ip_address
 from threading import Event, RLock
 from time import monotonic
 from typing import Any

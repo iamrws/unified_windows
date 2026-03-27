@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_RUN_ID = datetime.now().strftime("%Y-%m-%d")
+DEFAULT_RUN_ID = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 DEFAULT_RUNLOG_DIRNAME = "reports/runlogs"
 DEFAULT_RELEASE_GATE_DIRNAME = "reports/release_gate"
 DEFAULT_RELEASE_ARTIFACTS_DIRNAME = "reports/release_artifacts"

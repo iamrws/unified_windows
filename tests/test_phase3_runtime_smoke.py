@@ -13,27 +13,15 @@ from astrawave.security import CallerIdentity, resolve_process_user_sid
 from astrawave.types import MemoryTier
 
 
+from tests.conftest import endpoint_to_uri, wait_for_server
+
+
 def _endpoint_uri(endpoint: object) -> str:
-    if isinstance(endpoint, tuple) and len(endpoint) == 2:
-        host, port = endpoint
-        return f"tcp://{host}:{port}"
-    if isinstance(endpoint, str):
-        if endpoint.startswith("\\\\.\\pipe\\"):
-            return f"pipe://{endpoint}"
-        if endpoint.startswith(("tcp://", "pipe://")):
-            return endpoint
-        return f"tcp://{endpoint}"
-    raise AssertionError(f"Unsupported endpoint shape: {endpoint!r}")
+    return endpoint_to_uri(endpoint)
 
 
 def _wait_for_endpoint(server: AstraWeaveIpcServer) -> str:
-    last_endpoint: object | None = None
-    for _ in range(40):
-        last_endpoint = server.endpoint
-        if last_endpoint:
-            return _endpoint_uri(last_endpoint)
-        time.sleep(0.05)
-    raise AssertionError(f"server did not expose an endpoint; last value={last_endpoint!r}")
+    return wait_for_server(server)
 
 
 class Phase3RuntimeSmokeTests(unittest.TestCase):
