@@ -251,6 +251,106 @@ class OllamaInferenceRuntime:
         }
 
 
+class LlamaCppServerInferenceRuntime:
+    """HTTP adapter for a direct llama-server instance (llama.cpp fork).
+
+    Connects to llama-server's OpenAI-compatible /v1/completions endpoint.
+    Supports TQ-quantized models that Ollama may not handle natively.
+    """
+
+    backend_name = "llama_cpp"
+
+    _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+    _logger = logging.getLogger("astrawave.inference_runtime")
+
+    def __init__(
+        self,
+        *,
+        base_url: str | None = None,
+        timeout_seconds: float | None = None,
+        transport: InferenceTransport | None = None,
+    ) -> None:
+        raw_url = (base_url or "http://127.0.0.1:8080").rstrip("/")
+        parsed = urlparse(raw_url)
+        if parsed.scheme not in ("http", "https"):
+            raise ApiError(
+                ApiErrorCode.INVALID_ARGUMENT,
+                f"llama-server base URL must use http or https scheme, got: {parsed.scheme!r}",
+            )
+        self._base_url = raw_url
+        self._timeout_seconds = timeout_seconds if timeout_seconds is not None else 300.0
+        self._transport = transport or _post_json
+
+    def load_model(
+        self,
+        model_name: str,
+        *,
+        runtime_profile: str | None = None,
+        backend_options: Mapping[str, Any] | None = None,
+    ) -> InferenceModelBinding:
+        tuning = resolve_runtime_tuning(
+            model_name,
+            runtime_profile=runtime_profile,
+            backend_options=backend_options,
+        )
+        return InferenceModelBinding(
+            backend=self.backend_name,
+            requested_model_name=model_name,
+            resolved_model_name=model_name,
+            metadata={
+                "base_url": self._base_url,
+                "supports_prompt_generation": True,
+                "transport": "http",
+                "runtime_profile": tuning.profile_name,
+                "model_size_billion": tuning.model_size_billion,
+                "model_size_label": tuning.model_size_label,
+                "backend_options": tuning.backend_options,
+            },
+        )
+
+    def generate(
+        self,
+        model_name: str,
+        *,
+        prompt: str,
+        step_name: str,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        system_prompt: str | None = None,
+        backend_options: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "stream": False,
+        }
+        if max_tokens is not None:
+            payload["n_predict"] = max_tokens
+        if temperature is not None:
+            payload["temperature"] = temperature
+
+        raw = self._transport(f"{self._base_url}/completion", payload, self._timeout_seconds)
+        output_text = str(raw.get("content", ""))
+        timings = raw.get("timings", {})
+        return {
+            "ok": True,
+            "backend": self.backend_name,
+            "model_name": model_name,
+            "output_text": output_text,
+            "finish_reason": raw.get("stop_type", "stop"),
+            "usage": {
+                "prompt_eval_count": timings.get("prompt_n"),
+                "eval_count": timings.get("predicted_n"),
+                "total_duration": None,
+                "load_duration": None,
+                "eval_duration": None,
+                "predicted_per_second": timings.get("predicted_per_second"),
+                "prompt_per_second": timings.get("prompt_per_second"),
+                "step_name": step_name,
+            },
+            "raw": raw,
+        }
+
+
 def create_inference_runtime(backend_name: str) -> InferenceRuntime:
     """Create a runtime adapter by stable backend name."""
 
@@ -259,6 +359,8 @@ def create_inference_runtime(backend_name: str) -> InferenceRuntime:
         return SimulationInferenceRuntime()
     if normalized in {"ollama", "ollama_local"}:
         return OllamaInferenceRuntime()
+    if normalized in {"llama_cpp", "llama-cpp", "llama_server", "llama-server"}:
+        return LlamaCppServerInferenceRuntime()
     raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported inference backend: {backend_name}")
 
 
@@ -280,7 +382,7 @@ def resolve_backend_and_model_name(
     normalized_model = model_name.strip()
     prefixed_backend: str | None = None
     resolved_model = normalized_model
-    for prefix, backend in (("ollama:", "ollama"), ("simulation:", "simulation")):
+    for prefix, backend in (("ollama:", "ollama"), ("llama_cpp:", "llama_cpp"), ("simulation:", "simulation")):
         if normalized_model.lower().startswith(prefix):
             candidate = normalized_model[len(prefix):].strip()
             if not candidate:
@@ -294,12 +396,14 @@ def resolve_backend_and_model_name(
         backend_override = runtime_backend.strip().lower()
         if backend_override in {"", "auto"}:
             backend_override = None
-        elif backend_override not in {"simulation", "sim", "ollama", "ollama_local"}:
+        elif backend_override not in {"simulation", "sim", "ollama", "ollama_local", "llama_cpp", "llama-cpp", "llama_server", "llama-server"}:
             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported runtime_backend: {runtime_backend}")
 
     if backend_override is not None:
         if backend_override in {"sim", "simulation"}:
             return "simulation", resolved_model
+        if backend_override in {"llama_cpp", "llama-cpp", "llama_server", "llama-server"}:
+            return "llama_cpp", resolved_model
         return "ollama", resolved_model
     if prefixed_backend is not None:
         return prefixed_backend, resolved_model
@@ -341,6 +445,7 @@ __all__ = [
     "InferenceModelBinding",
     "InferenceRuntime",
     "InferenceTransport",
+    "LlamaCppServerInferenceRuntime",
     "OllamaInferenceRuntime",
     "SimulationInferenceRuntime",
     "create_inference_runtime",
