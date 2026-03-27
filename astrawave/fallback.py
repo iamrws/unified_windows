@@ -32,9 +32,9 @@ DEFAULT_FALLBACK_LADDER: tuple[FallbackStep, ...] = (
 class OscillationControls:
     """Thresholds used to prevent fallback thrashing."""
 
-    cooldown_seconds: int = 30
-    minimum_dwell_seconds: int = 15
-    churn_window_seconds: int = 30
+    cooldown_seconds: int = 15
+    minimum_dwell_seconds: int = 10
+    churn_window_seconds: int = 20
     churn_threshold: int = 1
 
 

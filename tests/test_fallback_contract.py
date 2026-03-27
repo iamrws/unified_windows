@@ -36,8 +36,8 @@ class FallbackContractTests(unittest.TestCase):
     def test_anti_oscillation_defaults_are_locked(self) -> None:
         controller = self.FallbackController()
 
-        self.assertEqual(controller.controls.cooldown_seconds, 30)
-        self.assertEqual(controller.controls.minimum_dwell_seconds, 15)
+        self.assertEqual(controller.controls.cooldown_seconds, 15)
+        self.assertEqual(controller.controls.minimum_dwell_seconds, 10)
         self.assertEqual(controller.controls.churn_threshold, 1)
 
     def test_controller_declines_step_changes_inside_cooldown_window(self) -> None:
