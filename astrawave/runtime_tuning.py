@@ -12,6 +12,7 @@ from .errors import ApiError, ApiErrorCode
 DEFAULT_RUNTIME_PROFILE = "default"
 AUTO_RUNTIME_PROFILE = "auto"
 VRAM_CONSTRAINED_RUNTIME_PROFILE = "vram_constrained"
+THROUGHPUT_RUNTIME_PROFILE = "throughput"
 
 _PROFILE_ALIASES = {
     "": AUTO_RUNTIME_PROFILE,
@@ -20,11 +21,14 @@ _PROFILE_ALIASES = {
     "balanced": DEFAULT_RUNTIME_PROFILE,
     "constrained": VRAM_CONSTRAINED_RUNTIME_PROFILE,
     "default": DEFAULT_RUNTIME_PROFILE,
+    "fast": THROUGHPUT_RUNTIME_PROFILE,
+    "high_throughput": THROUGHPUT_RUNTIME_PROFILE,
     "memory_saver": VRAM_CONSTRAINED_RUNTIME_PROFILE,
     "low_vram": VRAM_CONSTRAINED_RUNTIME_PROFILE,
     "offload": VRAM_CONSTRAINED_RUNTIME_PROFILE,
     "ram_offload": VRAM_CONSTRAINED_RUNTIME_PROFILE,
     "standard": DEFAULT_RUNTIME_PROFILE,
+    "throughput": THROUGHPUT_RUNTIME_PROFILE,
     "vram_constrained": VRAM_CONSTRAINED_RUNTIME_PROFILE,
 }
 
@@ -101,6 +105,8 @@ def profile_backend_options(profile_name: str, model_size_billion: float | None)
         profile = default_runtime_profile_for_model(model_size_billion)
     if profile == DEFAULT_RUNTIME_PROFILE:
         return {}
+    if profile == THROUGHPUT_RUNTIME_PROFILE:
+        return _throughput_backend_options(model_size_billion)
     if profile != VRAM_CONSTRAINED_RUNTIME_PROFILE:
         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported runtime profile: {profile_name}")
     return _vram_constrained_backend_options(model_size_billion)
@@ -190,6 +196,32 @@ def _normalize_backend_option_value(value: Any, key_path: str) -> Any:
     )
 
 
+def _throughput_backend_options(model_size_billion: float | None) -> dict[str, Any]:
+    """Backend options optimized for maximum tok/s on 32 GB VRAM systems."""
+
+    if model_size_billion is None or model_size_billion < 14.0:
+        num_ctx = 32768
+        num_batch = 512
+    elif model_size_billion < 34.0:
+        num_ctx = 8192
+        num_batch = 256
+    elif model_size_billion < 70.0:
+        num_ctx = 4096
+        num_batch = 128
+    else:
+        num_ctx = 2048
+        num_batch = 64
+
+    num_keep = max(16, num_ctx // 64)
+    return {
+        "num_batch": num_batch,
+        "num_ctx": num_ctx,
+        "num_gpu": -1,
+        "num_keep": num_keep,
+        "num_thread": 16,
+    }
+
+
 def _vram_constrained_backend_options(model_size_billion: float | None) -> dict[str, Any]:
     if model_size_billion is None or model_size_billion < 14.0:
         num_ctx = 2048
@@ -218,6 +250,7 @@ __all__ = [
     "AUTO_RUNTIME_PROFILE",
     "DEFAULT_RUNTIME_PROFILE",
     "RuntimeTuning",
+    "THROUGHPUT_RUNTIME_PROFILE",
     "VRAM_CONSTRAINED_RUNTIME_PROFILE",
     "default_runtime_profile_for_model",
     "format_model_size_label",
