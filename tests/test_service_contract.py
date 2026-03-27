@@ -374,17 +374,17 @@ class AstraWeaveServiceLifecycleTests(unittest.TestCase):
             inference_runtime_factory=runtime_factory,
         )
         session_id = service.CreateSession()
-        service.LoadModel(session_id, "ollama:qwen2.5:14b")
+        service.LoadModel(session_id, "ollama:llama3:50b")
 
         session = service._get_session(session_id)
         self.assertEqual(session.inference_metadata["runtime_profile"], "vram_constrained")
-        self.assertEqual(session.inference_metadata["model_size_billion"], 14.0)
+        self.assertEqual(session.inference_metadata["model_size_billion"], 50.0)
         self.assertTrue(session.inference_metadata["backend_options"]["low_vram"])
 
         self.assertEqual(calls[0]["phase"], "load_model")
         self.assertEqual(calls[0]["runtime_profile"], "vram_constrained")
         self.assertTrue(calls[0]["backend_options"]["low_vram"])
-        self.assertEqual(calls[0]["backend_options"]["num_ctx"], 2048)
+        self.assertEqual(calls[0]["backend_options"]["num_ctx"], 1536)
 
         result = service.RunStep(
             session_id,
@@ -396,10 +396,10 @@ class AstraWeaveServiceLifecycleTests(unittest.TestCase):
 
         self.assertEqual(result["inference_result"]["backend"], "ollama")
         self.assertEqual(calls[1]["phase"], "generate")
-        self.assertEqual(calls[1]["model_name"], "qwen2.5:14b")
+        self.assertEqual(calls[1]["model_name"], "llama3:50b")
         self.assertEqual(calls[1]["max_tokens"], 24)
         self.assertEqual(calls[1]["backend_options"]["num_ctx"], 3072)
-        self.assertEqual(calls[1]["backend_options"]["num_batch"], 24)
+        self.assertEqual(calls[1]["backend_options"]["num_batch"], 16)
         self.assertTrue(calls[1]["backend_options"]["low_vram"])
         self.assertAlmostEqual(calls[1]["backend_options"]["repeat_penalty"], 1.05)
 

@@ -16,11 +16,11 @@ class RuntimeTuningContractTests(unittest.TestCase):
         self.assertIsNone(infer_model_size_billion("demo-model"))
 
     def test_large_models_default_to_vram_constrained_profile(self) -> None:
-        tuning = resolve_runtime_tuning("qwen2.5:32b")
+        tuning = resolve_runtime_tuning("llama3:50b")
 
         self.assertEqual(tuning.profile_name, "vram_constrained")
-        self.assertEqual(tuning.model_size_billion, 32.0)
-        self.assertEqual(tuning.model_size_label, "32b")
+        self.assertEqual(tuning.model_size_billion, 50.0)
+        self.assertEqual(tuning.model_size_label, "50b")
         self.assertEqual(tuning.backend_options["num_ctx"], 1536)
         self.assertEqual(tuning.backend_options["num_batch"], 16)
         self.assertTrue(tuning.backend_options["low_vram"])
@@ -28,13 +28,13 @@ class RuntimeTuningContractTests(unittest.TestCase):
 
     def test_explicit_backend_options_override_profile_defaults(self) -> None:
         tuning = resolve_runtime_tuning(
-            "qwen2.5:14b",
+            "llama3:50b",
             backend_options={"num_ctx": 4096, "repeat_penalty": 1.1},
         )
 
         self.assertEqual(tuning.profile_name, "vram_constrained")
         self.assertEqual(tuning.backend_options["num_ctx"], 4096)
-        self.assertEqual(tuning.backend_options["num_batch"], 24)
+        self.assertEqual(tuning.backend_options["num_batch"], 16)
         self.assertTrue(tuning.backend_options["low_vram"])
         self.assertAlmostEqual(tuning.backend_options["repeat_penalty"], 1.1)
 
@@ -66,7 +66,7 @@ class RuntimeTuningContractTests(unittest.TestCase):
             }
 
         runtime = OllamaInferenceRuntime(base_url="http://127.0.0.1:11434", timeout_seconds=2.5, transport=fake_transport)
-        binding = runtime.load_model("qwen2.5:14b")
+        binding = runtime.load_model("llama3:50b")
         effective_options = {
             **binding.metadata["backend_options"],
             "num_ctx": 4096,
@@ -82,14 +82,14 @@ class RuntimeTuningContractTests(unittest.TestCase):
         )
 
         self.assertEqual(binding.metadata["runtime_profile"], "vram_constrained")
-        self.assertEqual(binding.metadata["backend_options"]["num_ctx"], 2048)
+        self.assertEqual(binding.metadata["backend_options"]["num_ctx"], 1536)
         self.assertEqual(requests[0]["url"], "http://127.0.0.1:11434/api/generate")
         self.assertEqual(requests[0]["timeout_seconds"], 2.5)
         payload = requests[0]["payload"]
-        self.assertEqual(payload["model"], "qwen2.5:14b")
+        self.assertEqual(payload["model"], "llama3:50b")
         self.assertEqual(payload["prompt"], "Explain the fit.")
         self.assertEqual(payload["options"]["num_ctx"], 4096)
-        self.assertEqual(payload["options"]["num_batch"], 24)
+        self.assertEqual(payload["options"]["num_batch"], 16)
         self.assertTrue(payload["options"]["low_vram"])
         self.assertTrue(payload["options"]["f16_kv"])
         self.assertEqual(payload["options"]["num_predict"], 32)

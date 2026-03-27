@@ -86,9 +86,13 @@ def normalize_runtime_profile_name(profile_name: str | None) -> str:
 
 
 def is_large_model(model_size_billion: float | None) -> bool:
-    """Return whether a model is in the constrained-VRAM class."""
+    """Return whether a model is in the constrained-VRAM class.
 
-    return model_size_billion is not None and model_size_billion >= 14.0
+    Threshold is 34B: on 32 GB VRAM, Q4_K_M models up to ~34B fit
+    fully GPU-resident without requiring constrained-VRAM settings.
+    """
+
+    return model_size_billion is not None and model_size_billion >= 34.0
 
 
 def default_runtime_profile_for_model(model_size_billion: float | None) -> str:
