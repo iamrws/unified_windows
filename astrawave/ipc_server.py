@@ -236,9 +236,20 @@ def _authkey_from_env() -> bytes:
         except OSError:
             pass
     # Generate a new random key and persist it for the client to read.
+    # Reject symlinks to prevent an attacker from redirecting the write.
     key = os.urandom(32)
+    if os.path.islink(key_file):
+        _logger.warning(
+            "IPC key file %s is a symlink; refusing to use. "
+            "Remove it and restart the server.",
+            key_file,
+        )
+        return key  # ephemeral key (client won't match, which is safe)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(key_file, flags, 0o600)
         try:
             os.write(fd, key)
         finally:

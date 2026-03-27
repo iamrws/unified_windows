@@ -157,7 +157,7 @@ _ALLOWED_POWERSHELL_COMMANDS: frozenset[str] = frozenset({
 # PowerShell commands.  Pipe ("|") is intentionally excluded because
 # callers such as _collect_ollama_process_memory() use pipelines.
 # Instead, each pipeline segment is validated against the allowlist.
-_CHAIN_OPERATORS: frozenset[str] = frozenset({";", "&&", "||", "`"})
+_CHAIN_OPERATORS: frozenset[str] = frozenset({";", "&&", "||", "`", "$(", "@("})
 
 
 def _first_cmdlet_token(segment: str) -> str | None:

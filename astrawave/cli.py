@@ -117,7 +117,12 @@ def _derive_state_hmac_key() -> bytes:
         if len(key) == 32:
             return key
     key = os.urandom(32)
-    _HMAC_KEY_FILE.write_bytes(key)
+    # Write with explicit 0o600 permissions to prevent other users from reading
+    fd = os.open(str(_HMAC_KEY_FILE), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, key)
+    finally:
+        os.close(fd)
     return key
 
 
@@ -794,8 +799,13 @@ class LocalBackend:
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
             return _default_state()
-        with self.path.open("r", encoding="utf-8") as f:
-            payload = json.load(f)
+        try:
+            with self.path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            return _default_state()
+        if not isinstance(payload, dict):
+            return _default_state()
         if int(payload.get("version", 0)) != STATE_VERSION:
             raise ApiError(ApiErrorCode.INTERNAL, "unsupported CLI state version")
         # C3: verify HMAC integrity tag before trusting the content
