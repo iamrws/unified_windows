@@ -21,8 +21,8 @@ class RuntimeTuningContractTests(unittest.TestCase):
         self.assertEqual(tuning.profile_name, "vram_constrained")
         self.assertEqual(tuning.model_size_billion, 50.0)
         self.assertEqual(tuning.model_size_label, "50b")
-        self.assertEqual(tuning.backend_options["num_ctx"], 1536)
-        self.assertEqual(tuning.backend_options["num_batch"], 16)
+        self.assertEqual(tuning.backend_options["num_ctx"], 2048)
+        self.assertEqual(tuning.backend_options["num_batch"], 32)
         self.assertTrue(tuning.backend_options["low_vram"])
         self.assertTrue(tuning.backend_options["f16_kv"])
 
@@ -34,7 +34,7 @@ class RuntimeTuningContractTests(unittest.TestCase):
 
         self.assertEqual(tuning.profile_name, "vram_constrained")
         self.assertEqual(tuning.backend_options["num_ctx"], 4096)
-        self.assertEqual(tuning.backend_options["num_batch"], 16)
+        self.assertEqual(tuning.backend_options["num_batch"], 32)
         self.assertTrue(tuning.backend_options["low_vram"])
         self.assertAlmostEqual(tuning.backend_options["repeat_penalty"], 1.1)
 
@@ -82,14 +82,14 @@ class RuntimeTuningContractTests(unittest.TestCase):
         )
 
         self.assertEqual(binding.metadata["runtime_profile"], "vram_constrained")
-        self.assertEqual(binding.metadata["backend_options"]["num_ctx"], 1536)
+        self.assertEqual(binding.metadata["backend_options"]["num_ctx"], 2048)
         self.assertEqual(requests[0]["url"], "http://127.0.0.1:11434/api/generate")
         self.assertEqual(requests[0]["timeout_seconds"], 2.5)
         payload = requests[0]["payload"]
         self.assertEqual(payload["model"], "llama3:50b")
         self.assertEqual(payload["prompt"], "Explain the fit.")
         self.assertEqual(payload["options"]["num_ctx"], 4096)
-        self.assertEqual(payload["options"]["num_batch"], 16)
+        self.assertEqual(payload["options"]["num_batch"], 32)
         self.assertTrue(payload["options"]["low_vram"])
         self.assertTrue(payload["options"]["f16_kv"])
         self.assertEqual(payload["options"]["num_predict"], 32)

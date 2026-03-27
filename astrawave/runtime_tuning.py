@@ -227,18 +227,15 @@ def _throughput_backend_options(model_size_billion: float | None) -> dict[str, A
 
 
 def _vram_constrained_backend_options(model_size_billion: float | None) -> dict[str, Any]:
-    if model_size_billion is None or model_size_billion < 14.0:
+    if model_size_billion is None or model_size_billion < 34.0:
+        num_ctx = 4096
+        num_batch = 64
+    elif model_size_billion < 70.0:
         num_ctx = 2048
         num_batch = 32
-    elif model_size_billion < 30.0:
-        num_ctx = 2048
-        num_batch = 24
-    elif model_size_billion < 70.0:
-        num_ctx = 1536
-        num_batch = 16
     else:
         num_ctx = 1024
-        num_batch = 8
+        num_batch = 16
 
     num_keep = max(16, num_ctx // 64)
     return {

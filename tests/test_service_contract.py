@@ -384,7 +384,7 @@ class AstraWeaveServiceLifecycleTests(unittest.TestCase):
         self.assertEqual(calls[0]["phase"], "load_model")
         self.assertEqual(calls[0]["runtime_profile"], "vram_constrained")
         self.assertTrue(calls[0]["backend_options"]["low_vram"])
-        self.assertEqual(calls[0]["backend_options"]["num_ctx"], 1536)
+        self.assertEqual(calls[0]["backend_options"]["num_ctx"], 2048)
 
         result = service.RunStep(
             session_id,
@@ -399,7 +399,7 @@ class AstraWeaveServiceLifecycleTests(unittest.TestCase):
         self.assertEqual(calls[1]["model_name"], "llama3:50b")
         self.assertEqual(calls[1]["max_tokens"], 24)
         self.assertEqual(calls[1]["backend_options"]["num_ctx"], 3072)
-        self.assertEqual(calls[1]["backend_options"]["num_batch"], 16)
+        self.assertEqual(calls[1]["backend_options"]["num_batch"], 32)
         self.assertTrue(calls[1]["backend_options"]["low_vram"])
         self.assertAlmostEqual(calls[1]["backend_options"]["repeat_penalty"], 1.05)
 
