@@ -34,12 +34,15 @@ PidLookup = Callable[[int], bool]
 SidLookup = Callable[[int], str | None]
 
 
-class _SidAndAttributes(ctypes.Structure):
-    _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+if ctypes is not None:
+    class _SidAndAttributes(ctypes.Structure):
+        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
 
-
-class _TokenUser(ctypes.Structure):
-    _fields_ = [("User", _SidAndAttributes)]
+    class _TokenUser(ctypes.Structure):
+        _fields_ = [("User", _SidAndAttributes)]
+else:
+    _SidAndAttributes = None  # type: ignore[assignment,misc]
+    _TokenUser = None  # type: ignore[assignment,misc]
 
 CREATE_SESSION_LIMIT_PER_MINUTE = 6
 MAX_CONCURRENT_SESSIONS_PER_CALLER = 8

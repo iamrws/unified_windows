@@ -53,6 +53,27 @@ class PlacementPolicy:
     hot_headroom_ratio: float = 0.20
 
 
+def dynamic_headroom_ratio(vram_budget_gb: float | None = None) -> float:
+    """Compute headroom ratio as a function of VRAM budget.
+
+    At  8 GB -> 0.20 (safe, decode spikes need room)
+    At 32 GB -> 0.125
+    At 80 GB -> 0.05
+
+    Formula: max(0.05, min(0.20, 4.0 / vram_budget_gb))
+    """
+
+    if vram_budget_gb is None or vram_budget_gb <= 0:
+        return 0.20
+    return max(0.05, min(0.20, 4.0 / vram_budget_gb))
+
+
+def policy_for_vram_budget(vram_budget_gb: float | None = None) -> PlacementPolicy:
+    """Create a PlacementPolicy with headroom ratio tuned for the VRAM budget."""
+
+    return PlacementPolicy(hot_headroom_ratio=dynamic_headroom_ratio(vram_budget_gb))
+
+
 class PlacementPlanner:
     """Deterministic planner that classifies resources into HOT/WARM/COLD."""
 
@@ -72,13 +93,27 @@ class PlacementPlanner:
         hot_used_bytes: int = 0,
         *,
         hot_compression_ratio: float = 1.0,
+        cuda_kernels_available: bool = True,
     ) -> PlacementDecision:
         """Classify one resource into a residency tier.
 
         When *hot_compression_ratio* > 1.0, the planner treats the
         resource as requiring fewer effective bytes in the HOT tier,
         modelling the effect of KV cache quantization (e.g. TurboQuant).
+
+        When *cuda_kernels_available* is False and compression is requested,
+        the resource is forced to WARM/COLD because CPU fallback in the HOT
+        (VRAM) tier would kill throughput.
         """
+
+        if not cuda_kernels_available and hot_compression_ratio > 1.0:
+            # No CUDA kernels = can't decompress on GPU; force to WARM
+            return PlacementDecision(
+                resource_id=request.resource_id,
+                tier=MemoryTier.WARM,
+                bytes_required=request.bytes_required,
+                reason_code="PLACEMENT_WARM_NO_CUDA_KERNELS",
+            )
 
         effective_bytes = (
             max(1, int(request.bytes_required / hot_compression_ratio))
@@ -116,12 +151,16 @@ class PlacementPlanner:
         hot_budget_bytes: int,
         *,
         hot_compression_ratio: float = 1.0,
+        cuda_kernels_available: bool = True,
     ) -> PlacementPlan:
         """Create a deterministic placement plan for a collection of resources.
 
         When *hot_compression_ratio* > 1.0 the planner accounts for KV
         cache quantization by treating each resource as requiring fewer
         effective bytes in the HOT tier.
+
+        When *cuda_kernels_available* is False the planner will not place
+        compressed resources in the HOT tier.
         """
 
         decisions: list[PlacementDecision] = []
@@ -135,6 +174,7 @@ class PlacementPlanner:
                 hot_budget_bytes=hot_budget_bytes,
                 hot_used_bytes=hot_used_bytes,
                 hot_compression_ratio=hot_compression_ratio,
+                cuda_kernels_available=cuda_kernels_available,
             )
             decisions.append(decision)
 
@@ -180,4 +220,6 @@ __all__ = [
     "PlacementPlanner",
     "PlacementPolicy",
     "PlacementRequest",
+    "dynamic_headroom_ratio",
+    "policy_for_vram_budget",
 ]

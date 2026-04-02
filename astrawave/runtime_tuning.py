@@ -12,6 +12,10 @@ from .errors import ApiError, ApiErrorCode
 DEFAULT_RUNTIME_PROFILE = "default"
 AUTO_RUNTIME_PROFILE = "auto"
 VRAM_CONSTRAINED_RUNTIME_PROFILE = "vram_constrained"
+THROUGHPUT_RUNTIME_PROFILE = "throughput"
+
+# Valid KV cache quantization types (maps to llama.cpp type_k / type_v)
+VALID_KV_TYPES = frozenset({"f16", "f32", "q8_0", "q4_0", "tq1_0", "tq2_0"})
 
 _PROFILE_ALIASES = {
     "": AUTO_RUNTIME_PROFILE,
@@ -20,11 +24,13 @@ _PROFILE_ALIASES = {
     "balanced": DEFAULT_RUNTIME_PROFILE,
     "constrained": VRAM_CONSTRAINED_RUNTIME_PROFILE,
     "default": DEFAULT_RUNTIME_PROFILE,
+    "high_throughput": THROUGHPUT_RUNTIME_PROFILE,
     "memory_saver": VRAM_CONSTRAINED_RUNTIME_PROFILE,
     "low_vram": VRAM_CONSTRAINED_RUNTIME_PROFILE,
     "offload": VRAM_CONSTRAINED_RUNTIME_PROFILE,
     "ram_offload": VRAM_CONSTRAINED_RUNTIME_PROFILE,
     "standard": DEFAULT_RUNTIME_PROFILE,
+    "throughput": THROUGHPUT_RUNTIME_PROFILE,
     "vram_constrained": VRAM_CONSTRAINED_RUNTIME_PROFILE,
 }
 
@@ -81,16 +87,58 @@ def normalize_runtime_profile_name(profile_name: str | None) -> str:
     raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported runtime profile: {profile_name}")
 
 
-def is_large_model(model_size_billion: float | None) -> bool:
+def large_model_threshold(vram_budget_gb: float | None = None) -> float:
+    """Return the model-size threshold (billions) above which VRAM is constrained.
+
+    Scales with available VRAM: 14B at 8 GB, 34B at 32 GB, 70B at 80 GB.
+    Falls back to 14B when *vram_budget_gb* is None (legacy 8 GB default).
+    """
+
+    if vram_budget_gb is None or vram_budget_gb <= 8.0:
+        return 14.0
+    return min(70.0, 14.0 + (vram_budget_gb - 8.0) * (56.0 / 72.0))
+
+
+def is_large_model(
+    model_size_billion: float | None,
+    vram_budget_gb: float | None = None,
+) -> bool:
     """Return whether a model is in the constrained-VRAM class."""
 
-    return model_size_billion is not None and model_size_billion >= 14.0
+    if model_size_billion is None:
+        return False
+    return model_size_billion >= large_model_threshold(vram_budget_gb)
 
 
 def default_runtime_profile_for_model(model_size_billion: float | None) -> str:
     """Select the default runtime profile for a model scale."""
 
     return VRAM_CONSTRAINED_RUNTIME_PROFILE if is_large_model(model_size_billion) else DEFAULT_RUNTIME_PROFILE
+
+
+def validate_kv_cache_options(options: dict[str, Any]) -> None:
+    """Validate KV cache type and flash attention option constraints.
+
+    Raises ApiError if type_k / type_v values are invalid, or if quantized
+    type_v is used without flash_attn enabled (llama.cpp constraint).
+    """
+
+    type_k = options.get("type_k")
+    type_v = options.get("type_v")
+    flash_attn = options.get("flash_attn")
+
+    if type_k is not None and type_k not in VALID_KV_TYPES:
+        raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported type_k: {type_k}")
+    if type_v is not None and type_v not in VALID_KV_TYPES:
+        raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported type_v: {type_v}")
+
+    # Quantized V cache requires flash attention (llama.cpp constraint)
+    quantized_v_types = VALID_KV_TYPES - {"f16", "f32"}
+    if type_v in quantized_v_types and flash_attn is False:
+        raise ApiError(
+            ApiErrorCode.INVALID_ARGUMENT,
+            f"type_v={type_v} requires flash_attn to be enabled",
+        )
 
 
 def profile_backend_options(profile_name: str, model_size_billion: float | None) -> dict[str, Any]:
@@ -101,9 +149,11 @@ def profile_backend_options(profile_name: str, model_size_billion: float | None)
         profile = default_runtime_profile_for_model(model_size_billion)
     if profile == DEFAULT_RUNTIME_PROFILE:
         return {}
-    if profile != VRAM_CONSTRAINED_RUNTIME_PROFILE:
-        raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported runtime profile: {profile_name}")
-    return _vram_constrained_backend_options(model_size_billion)
+    if profile == THROUGHPUT_RUNTIME_PROFILE:
+        return _throughput_backend_options(model_size_billion)
+    if profile == VRAM_CONSTRAINED_RUNTIME_PROFILE:
+        return _vram_constrained_backend_options(model_size_billion)
+    raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported runtime profile: {profile_name}")
 
 
 def resolve_runtime_tuning(
@@ -214,18 +264,59 @@ def _vram_constrained_backend_options(model_size_billion: float | None) -> dict[
     }
 
 
+def _throughput_backend_options(model_size_billion: float | None) -> dict[str, Any]:
+    """Backend options optimized for maximum tok/s on 32 GB+ VRAM systems."""
+
+    if model_size_billion is None or model_size_billion < 14.0:
+        num_ctx = 32768
+        num_batch = 512
+        type_k = "tq2_0"
+        type_v = "f16"
+    elif model_size_billion < 34.0:
+        num_ctx = 8192
+        num_batch = 256
+        type_k = "tq2_0"
+        type_v = "f16"
+    elif model_size_billion < 70.0:
+        num_ctx = 4096
+        num_batch = 128
+        type_k = "tq2_0"
+        type_v = "f16"
+    else:
+        num_ctx = 2048
+        num_batch = 64
+        type_k = "tq1_0"
+        type_v = "f16"
+
+    num_keep = max(16, num_ctx // 64)
+    return {
+        "flash_attn": "auto",
+        "num_batch": num_batch,
+        "num_ctx": num_ctx,
+        "num_gpu": -1,
+        "num_keep": num_keep,
+        "offload_kqv": True,
+        "type_k": type_k,
+        "type_v": type_v,
+    }
+
+
 __all__ = [
     "AUTO_RUNTIME_PROFILE",
     "DEFAULT_RUNTIME_PROFILE",
     "RuntimeTuning",
+    "THROUGHPUT_RUNTIME_PROFILE",
+    "VALID_KV_TYPES",
     "VRAM_CONSTRAINED_RUNTIME_PROFILE",
     "default_runtime_profile_for_model",
     "format_model_size_label",
     "infer_model_size_billion",
     "is_large_model",
+    "large_model_threshold",
     "merge_backend_options",
     "normalize_backend_options",
     "normalize_runtime_profile_name",
     "profile_backend_options",
     "resolve_runtime_tuning",
+    "validate_kv_cache_options",
 ]
