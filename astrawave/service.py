@@ -668,10 +668,20 @@ class AstraWeaveService:
     def _apply_tier_quantization(self, session: _Session, tensor: _TensorRecord) -> None:
         """Apply the appropriate quantization for the tensor's current tier."""
 
-        from .quantization import provider_for_tier
+        from .quantization import provider_for_backend, provider_for_tier
         from .telemetry import CompressionEvent
 
-        provider = provider_for_tier(tensor.tier_hint.value)
+        provider = provider_for_tier(
+            tensor.tier_hint.value,
+            vram_budget_bytes=session.vram_budget_bytes,
+        )
+        current_backend = (tensor.quantization_backend or "none").lower()
+        if current_backend in {"none", "f16"}:
+            provider = provider_for_backend("tq2_0")
+        elif current_backend == "tq2_0":
+            provider = provider_for_backend("tq1_0")
+        elif current_backend == "tq1_0":
+            provider = provider_for_backend("tq1_0")
         result = provider.quantize(tensor.name, tensor.size_bytes)
         tensor.quantization_backend = result.backend.value
         tensor.compression_ratio = result.compression_ratio
@@ -789,6 +799,11 @@ class AstraWeaveService:
             }
 
         next_step = decision.next_step
+        if (
+            next_step is FallbackStep.KV_CONTEXT_REDUCTION
+            and self._session_needs_additional_kv_quantization(session)
+        ):
+            next_step = FallbackStep.KV_QUANTIZATION_UPGRADE
         if next_step is None:
             session.state = SessionState.FAILED
             session.fallback_current_step = None
@@ -848,6 +863,13 @@ class AstraWeaveService:
             "enter_stability_mode": session.fallback_stability_mode,
             "reason_code": decision.reason_code,
         }
+
+    def _session_needs_additional_kv_quantization(self, session: _Session) -> bool:
+        tensor = self._select_tensor_for_fallback(session)
+        if tensor is None:
+            return False
+        backend = (tensor.quantization_backend or "none").lower()
+        return backend in {"none", "f16", "tq2_0"}
 
     def _apply_deterministic_fallback(
         self,

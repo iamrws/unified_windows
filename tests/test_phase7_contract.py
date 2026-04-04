@@ -235,6 +235,20 @@ class Phase7QuantizationProviderTests(unittest.TestCase):
         cold = self.quant_mod.provider_for_tier("COLD")
         self.assertEqual(cold.backend_name, self.quant_mod.QuantizationBackend.NONE)
 
+    def test_provider_for_tier_uses_32gb_mapping_for_cold(self) -> None:
+        cold = self.quant_mod.provider_for_tier(
+            "COLD",
+            vram_budget_bytes=32 * 1024**3,
+        )
+        self.assertEqual(cold.backend_name, self.quant_mod.QuantizationBackend.FP8)
+
+    def test_provider_for_tier_mapping_override_is_supported(self) -> None:
+        cold = self.quant_mod.provider_for_tier(
+            "COLD",
+            mapping_override={"COLD": "fp8"},
+        )
+        self.assertEqual(cold.backend_name, self.quant_mod.QuantizationBackend.FP8)
+
     def test_supported_bit_widths(self) -> None:
         """Each provider must report valid bit widths."""
 
@@ -359,6 +373,24 @@ class Phase7CompressionAwareTieringTests(unittest.TestCase):
         self.assertEqual(plan.decisions[0].tier, self.types_mod.MemoryTier.HOT)
         self.assertEqual(plan.hot_bytes, 250_000)
 
+    def test_dynamic_hot_headroom_ratio_scales_with_vram_budget(self) -> None:
+        ratio_fn = self.tiering_mod.hot_headroom_ratio_for_budget
+        self.assertEqual(ratio_fn(8 * 1024**3), 0.20)
+        self.assertEqual(ratio_fn(16 * 1024**3), 0.10)
+        self.assertEqual(ratio_fn(32 * 1024**3), 0.05)
+
+    def test_hot_kernel_unavailable_gates_hot_placement(self) -> None:
+        planner = self.tiering_mod.PlacementPlanner(hot_kernel_available=False)
+        request = self.tiering_mod.PlacementRequest(
+            resource_id="kv_requires_kernel",
+            bytes_required=128 * 1024**2,
+            is_active=True,
+            requires_hot_kernel=True,
+        )
+        plan = planner.plan([request], hot_budget_bytes=8 * 1024**3)
+        self.assertEqual(plan.decisions[0].tier, self.types_mod.MemoryTier.WARM)
+        self.assertEqual(plan.decisions[0].reason_code, "PLACEMENT_WARM_KERNEL_UNAVAILABLE")
+
 
 class Phase7CompressionTelemetryTests(unittest.TestCase):
     """Tests for Pillar 3: Compression telemetry events."""
@@ -473,6 +505,27 @@ class Phase7IntegrationTests(unittest.TestCase):
         self.assertNotEqual(tensor.quantization_backend, "none")
         self.assertGreater(tensor.compression_ratio, 1.0)
         self.assertLess(tensor.effective_bytes, tensor.size_bytes)
+
+    def test_kv_quantization_upgrade_progression_is_concrete(self) -> None:
+        service = self._make_service()
+        caller = self._make_caller()
+        session_id = service.CreateSession(caller)
+        service.LoadModel(session_id, "demo-model", runtime_backend="simulation", caller_identity=caller)
+        service.RegisterTensor(session_id, "kv", 10_000, caller_identity=caller)
+        service.SetTierHint(session_id, "kv", self.types_mod.MemoryTier.HOT, caller_identity=caller)
+
+        session = service._sessions[session_id]
+        tensor = session.tensors["kv"]
+        self.assertEqual(tensor.quantization_backend, "none")
+
+        service._apply_tier_quantization(session, tensor)
+        self.assertEqual(tensor.quantization_backend, "tq2_0")
+
+        service._apply_tier_quantization(session, tensor)
+        self.assertEqual(tensor.quantization_backend, "tq1_0")
+
+        service._apply_tier_quantization(session, tensor)
+        self.assertEqual(tensor.quantization_backend, "tq1_0")
 
     def test_residency_snapshot_has_quantization_fields(self) -> None:
         """ResidencySnapshot must include quantization metadata."""

@@ -6,7 +6,12 @@ import unittest
 
 from astrawave.errors import ApiError, ApiErrorCode
 from astrawave.inference_runtime import OllamaInferenceRuntime
-from astrawave.runtime_tuning import infer_model_size_billion, resolve_runtime_tuning
+from astrawave.runtime_tuning import (
+    infer_model_size_billion,
+    is_large_model,
+    large_model_threshold_billion,
+    resolve_runtime_tuning,
+)
 
 
 class RuntimeTuningContractTests(unittest.TestCase):
@@ -42,6 +47,37 @@ class RuntimeTuningContractTests(unittest.TestCase):
         with self.assertRaises(ApiError) as cm:
             resolve_runtime_tuning("qwen2.5:14b", backend_options={"num_ctx": object()})
         self.assertEqual(cm.exception.code, ApiErrorCode.INVALID_ARGUMENT)
+
+    def test_kv_quantization_options_are_validated_and_normalized(self) -> None:
+        tuning = resolve_runtime_tuning(
+            "qwen2.5:14b",
+            backend_options={
+                "type_k": "TQ2_0",
+                "type_v": "Q4_0",
+                "flash_attn": "auto",
+            },
+        )
+        self.assertEqual(tuning.backend_options["type_k"], "tq2_0")
+        self.assertEqual(tuning.backend_options["type_v"], "q4_0")
+        self.assertEqual(tuning.backend_options["flash_attn"], "auto")
+
+    def test_quantized_type_v_requires_flash_attention(self) -> None:
+        with self.assertRaises(ApiError) as cm:
+            resolve_runtime_tuning(
+                "qwen2.5:14b",
+                backend_options={
+                    "type_v": "tq2_0",
+                    "flash_attn": False,
+                },
+            )
+        self.assertEqual(cm.exception.code, ApiErrorCode.INVALID_ARGUMENT)
+
+    def test_large_model_threshold_is_vram_budget_aware(self) -> None:
+        self.assertEqual(large_model_threshold_billion(8 * 1024**3), 14.0)
+        self.assertEqual(large_model_threshold_billion(16 * 1024**3), 24.0)
+        self.assertEqual(large_model_threshold_billion(32 * 1024**3), 34.0)
+        self.assertTrue(is_large_model(26.0, vram_budget_bytes=16 * 1024**3))
+        self.assertFalse(is_large_model(26.0, vram_budget_bytes=32 * 1024**3))
 
     def test_ollama_runtime_merges_backend_options_before_transport(self) -> None:
         requests: list[dict[str, object]] = []

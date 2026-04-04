@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 from .types import MemoryTier
@@ -17,6 +17,7 @@ class PlacementRequest:
     is_active: bool = False
     reuse_score: float = 0.0
     preferred_tier: MemoryTier | None = None
+    requires_hot_kernel: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,14 +51,30 @@ class PlacementPolicy:
 
     hot_reuse_score: float = 0.75
     warm_reuse_score: float = 0.35
-    hot_headroom_ratio: float = 0.10
+    hot_headroom_ratio: float | None = None
+
+
+def hot_headroom_ratio_for_budget(vram_budget_bytes: int) -> float:
+    """Return dynamic HOT reserve ratio by VRAM budget class."""
+
+    if vram_budget_bytes >= 32 * 1024**3:
+        return 0.05
+    if vram_budget_bytes >= 16 * 1024**3:
+        return 0.10
+    return 0.20
 
 
 class PlacementPlanner:
     """Deterministic planner that classifies resources into HOT/WARM/COLD."""
 
-    def __init__(self, policy: PlacementPolicy | None = None) -> None:
+    def __init__(
+        self,
+        policy: PlacementPolicy | None = None,
+        *,
+        hot_kernel_available: bool = True,
+    ) -> None:
         self._policy = policy or PlacementPolicy()
+        self._hot_kernel_available = hot_kernel_available
 
     @property
     def policy(self) -> PlacementPolicy:
@@ -72,6 +89,7 @@ class PlacementPlanner:
         hot_used_bytes: int = 0,
         *,
         hot_compression_ratio: float = 1.0,
+        hot_kernel_available: bool | None = None,
     ) -> PlacementDecision:
         """Classify one resource into a residency tier.
 
@@ -86,11 +104,16 @@ class PlacementPlanner:
             else request.bytes_required
         )
 
+        kernel_allowed = self._hot_kernel_available if hot_kernel_available is None else hot_kernel_available
+
         if request.preferred_tier is not None:
             tier = request.preferred_tier
             reason_code = "PLACEMENT_PREFERRED_TIER"
         elif request.is_active or request.reuse_score >= self._policy.hot_reuse_score:
-            if hot_used_bytes + effective_bytes <= self._reserve_limit(hot_budget_bytes):
+            if request.requires_hot_kernel and not kernel_allowed:
+                tier = MemoryTier.WARM
+                reason_code = "PLACEMENT_WARM_KERNEL_UNAVAILABLE"
+            elif hot_used_bytes + effective_bytes <= self._reserve_limit(hot_budget_bytes):
                 tier = MemoryTier.HOT
                 reason_code = "PLACEMENT_HOT_ACTIVE_OR_HIGH_REUSE"
             else:
@@ -116,6 +139,7 @@ class PlacementPlanner:
         hot_budget_bytes: int,
         *,
         hot_compression_ratio: float = 1.0,
+        hot_kernel_available: bool | None = None,
     ) -> PlacementPlan:
         """Create a deterministic placement plan for a collection of resources.
 
@@ -135,6 +159,7 @@ class PlacementPlanner:
                 hot_budget_bytes=hot_budget_bytes,
                 hot_used_bytes=hot_used_bytes,
                 hot_compression_ratio=hot_compression_ratio,
+                hot_kernel_available=hot_kernel_available,
             )
             decisions.append(decision)
 
@@ -170,7 +195,10 @@ class PlacementPlanner:
     def _reserve_limit(self, hot_budget_bytes: int) -> int:
         """Reserve a fraction of HOT budget to avoid decode-time spikes."""
 
-        reserve = int(hot_budget_bytes * self._policy.hot_headroom_ratio)
+        ratio = self._policy.hot_headroom_ratio
+        if ratio is None:
+            ratio = hot_headroom_ratio_for_budget(hot_budget_bytes)
+        reserve = int(hot_budget_bytes * ratio)
         return max(hot_budget_bytes - reserve, 0)
 
 
@@ -180,4 +208,5 @@ __all__ = [
     "PlacementPlanner",
     "PlacementPolicy",
     "PlacementRequest",
+    "hot_headroom_ratio_for_budget",
 ]

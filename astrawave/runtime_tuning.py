@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import isfinite
+import os
 import re
 from typing import Any, Mapping
 
@@ -13,6 +14,11 @@ DEFAULT_RUNTIME_PROFILE = "default"
 AUTO_RUNTIME_PROFILE = "auto"
 VRAM_CONSTRAINED_RUNTIME_PROFILE = "vram_constrained"
 THROUGHPUT_RUNTIME_PROFILE = "throughput"
+
+DEFAULT_VRAM_BUDGET_BYTES = 8 * 1024**3
+_VRAM_BUDGET_ENV = "ASTRAWEAVE_VRAM_BUDGET_BYTES"
+_SUPPORTED_KV_TYPES = frozenset({"f16", "q8_0", "q4_0", "tq2_0", "tq1_0"})
+_QUANTIZED_KV_TYPES = frozenset({"q8_0", "q4_0", "tq2_0", "tq1_0"})
 
 _PROFILE_ALIASES = {
     "": AUTO_RUNTIME_PROFILE,
@@ -85,28 +91,69 @@ def normalize_runtime_profile_name(profile_name: str | None) -> str:
     raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported runtime profile: {profile_name}")
 
 
-def is_large_model(model_size_billion: float | None) -> bool:
-    """Return whether a model is in the constrained-VRAM class.
+def resolve_vram_budget_bytes(vram_budget_bytes: int | None = None) -> int:
+    """Resolve effective VRAM budget bytes from override or environment."""
 
-    Threshold is 34B: on 32 GB VRAM, Q4_K_M models up to ~34B fit
-    fully GPU-resident without requiring constrained-VRAM settings.
-    """
+    if vram_budget_bytes is not None:
+        if not isinstance(vram_budget_bytes, int) or isinstance(vram_budget_bytes, bool) or vram_budget_bytes <= 0:
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "vram_budget_bytes must be a positive integer when provided")
+        return vram_budget_bytes
 
-    return model_size_billion is not None and model_size_billion >= 34.0
+    raw = os.environ.get(_VRAM_BUDGET_ENV)
+    if raw is None:
+        return DEFAULT_VRAM_BUDGET_BYTES
+    try:
+        parsed = int(raw.strip())
+    except ValueError:
+        return DEFAULT_VRAM_BUDGET_BYTES
+    if parsed <= 0:
+        return DEFAULT_VRAM_BUDGET_BYTES
+    return parsed
 
 
-def default_runtime_profile_for_model(model_size_billion: float | None) -> str:
+def large_model_threshold_billion(vram_budget_bytes: int | None = None) -> float:
+    """Return the constrained-VRAM model threshold for the active VRAM budget."""
+
+    budget = resolve_vram_budget_bytes(vram_budget_bytes)
+    if budget >= 32 * 1024**3:
+        return 34.0
+    if budget >= 16 * 1024**3:
+        return 24.0
+    return 14.0
+
+
+def is_large_model(model_size_billion: float | None, vram_budget_bytes: int | None = None) -> bool:
+    """Return whether a model is in the constrained-VRAM class."""
+
+    threshold = large_model_threshold_billion(vram_budget_bytes)
+    return model_size_billion is not None and model_size_billion >= threshold
+
+
+def default_runtime_profile_for_model(
+    model_size_billion: float | None,
+    *,
+    vram_budget_bytes: int | None = None,
+) -> str:
     """Select the default runtime profile for a model scale."""
 
-    return VRAM_CONSTRAINED_RUNTIME_PROFILE if is_large_model(model_size_billion) else DEFAULT_RUNTIME_PROFILE
+    return (
+        VRAM_CONSTRAINED_RUNTIME_PROFILE
+        if is_large_model(model_size_billion, vram_budget_bytes=vram_budget_bytes)
+        else DEFAULT_RUNTIME_PROFILE
+    )
 
 
-def profile_backend_options(profile_name: str, model_size_billion: float | None) -> dict[str, Any]:
+def profile_backend_options(
+    profile_name: str,
+    model_size_billion: float | None,
+    *,
+    vram_budget_bytes: int | None = None,
+) -> dict[str, Any]:
     """Return deterministic backend options for a runtime profile."""
 
     profile = normalize_runtime_profile_name(profile_name)
     if profile == AUTO_RUNTIME_PROFILE:
-        profile = default_runtime_profile_for_model(model_size_billion)
+        profile = default_runtime_profile_for_model(model_size_billion, vram_budget_bytes=vram_budget_bytes)
     if profile == DEFAULT_RUNTIME_PROFILE:
         return {}
     if profile == THROUGHPUT_RUNTIME_PROFILE:
@@ -121,17 +168,22 @@ def resolve_runtime_tuning(
     *,
     runtime_profile: str | None = None,
     backend_options: Mapping[str, Any] | None = None,
+    vram_budget_bytes: int | None = None,
 ) -> RuntimeTuning:
     """Resolve a stable runtime profile and effective backend option payload."""
 
     model_size_billion = infer_model_size_billion(model_name)
     requested_profile = normalize_runtime_profile_name(runtime_profile)
     resolved_profile = (
-        default_runtime_profile_for_model(model_size_billion)
+        default_runtime_profile_for_model(model_size_billion, vram_budget_bytes=vram_budget_bytes)
         if requested_profile == AUTO_RUNTIME_PROFILE
         else requested_profile
     )
-    profile_options = profile_backend_options(resolved_profile, model_size_billion)
+    profile_options = profile_backend_options(
+        resolved_profile,
+        model_size_billion,
+        vram_budget_bytes=vram_budget_bytes,
+    )
     merged_backend_options = merge_backend_options(profile_options, backend_options)
     return RuntimeTuning(
         profile_name=resolved_profile,
@@ -155,6 +207,14 @@ def normalize_backend_options(options: Mapping[str, Any] | None) -> dict[str, An
             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "backend_options keys must be non-empty strings")
         key = raw_key.strip()
         normalized[key] = _normalize_backend_option_value(value, key)
+
+    type_v = normalized.get("type_v")
+    flash_attn = normalized.get("flash_attn")
+    if isinstance(type_v, str) and type_v in _QUANTIZED_KV_TYPES and flash_attn is False:
+        raise ApiError(
+            ApiErrorCode.INVALID_ARGUMENT,
+            "backend option 'flash_attn' must be true or 'auto' when type_v is quantized",
+        )
     return normalized
 
 
@@ -170,6 +230,38 @@ def merge_backend_options(*options: Mapping[str, Any] | None) -> dict[str, Any]:
 
 
 def _normalize_backend_option_value(value: Any, key_path: str) -> Any:
+    leaf_key = key_path.split(".")[-1]
+
+    if leaf_key in {"type_k", "type_v"}:
+        if not isinstance(value, str) or not value.strip():
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"backend option '{key_path}' must be a non-empty string")
+        normalized_kv_type = value.strip().lower()
+        if normalized_kv_type not in _SUPPORTED_KV_TYPES:
+            raise ApiError(
+                ApiErrorCode.INVALID_ARGUMENT,
+                f"backend option '{key_path}' must be one of {sorted(_SUPPORTED_KV_TYPES)}",
+            )
+        return normalized_kv_type
+
+    if leaf_key == "flash_attn":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized_flash_attn = value.strip().lower()
+            if normalized_flash_attn == "auto":
+                return "auto"
+            if normalized_flash_attn in {"true", "false"}:
+                return normalized_flash_attn == "true"
+        raise ApiError(
+            ApiErrorCode.INVALID_ARGUMENT,
+            f"backend option '{key_path}' must be true, false, or 'auto'",
+        )
+
+    if leaf_key == "offload_kqv":
+        if not isinstance(value, bool):
+            raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"backend option '{key_path}' must be a boolean")
+        return value
+
     if value is None:
         raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"backend option '{key_path}' cannot be null")
     if isinstance(value, bool):
@@ -218,11 +310,15 @@ def _throughput_backend_options(model_size_billion: float | None) -> dict[str, A
 
     num_keep = max(16, num_ctx // 64)
     return {
+        "flash_attn": "auto",
         "num_batch": num_batch,
         "num_ctx": num_ctx,
         "num_gpu": -1,
         "num_keep": num_keep,
         "num_thread": 16,
+        "offload_kqv": True,
+        "type_k": "tq2_0",
+        "type_v": "tq2_0",
     }
 
 
@@ -239,11 +335,15 @@ def _vram_constrained_backend_options(model_size_billion: float | None) -> dict[
 
     num_keep = max(16, num_ctx // 64)
     return {
+        "flash_attn": False,
         "f16_kv": True,
         "low_vram": True,
         "num_batch": num_batch,
         "num_ctx": num_ctx,
         "num_keep": num_keep,
+        "offload_kqv": False,
+        "type_k": "f16",
+        "type_v": "f16",
     }
 
 
@@ -257,9 +357,11 @@ __all__ = [
     "format_model_size_label",
     "infer_model_size_billion",
     "is_large_model",
+    "large_model_threshold_billion",
     "merge_backend_options",
     "normalize_backend_options",
     "normalize_runtime_profile_name",
     "profile_backend_options",
+    "resolve_vram_budget_bytes",
     "resolve_runtime_tuning",
 ]
