@@ -60,13 +60,7 @@ class QuantizationProvider(Protocol):
 
 
 class SimulatedTurboQuantProvider:
-    """Simulated TurboQuant provider for orchestration planning.
-
-    Models the theoretical compression ratios from the TurboQuant paper
-    (ICLR 2026) without requiring real CUDA kernels. Uses the ratio
-    32 / bit_width where bit_width defaults to 3.5 (matching full-cache
-    quality at 4.6x compression).
-    """
+    """Simulated TurboQuant provider for orchestration planning."""
 
     @property
     def backend_name(self) -> QuantizationBackend:
@@ -108,12 +102,7 @@ class SimulatedTurboQuantProvider:
 
 
 class FP8Provider:
-    """FP8 (E4M3/E5M2) quantization provider.
-
-    FP8 compresses from FP32 (4 bytes) to 1 byte per element: 4x compression.
-    From FP16 (2 bytes) to 1 byte: 2x compression.
-    This provider assumes FP32 baseline (4x).
-    """
+    """FP8 (E4M3/E5M2) quantization provider."""
 
     @property
     def backend_name(self) -> QuantizationBackend:
@@ -128,7 +117,7 @@ class FP8Provider:
         *,
         bit_width: float | None = None,
     ) -> float:
-        return 4.0  # 32-bit -> 8-bit
+        return 4.0
 
     def quantize(
         self,
@@ -183,58 +172,8 @@ class NoneProvider:
         )
 
 
-class TQ2_0Provider:
-    """TQ2_0 (2-bit polar) quantization provider.
-
-    Based on the GGML block_tq2_0 structure: 66 bytes per 256 elements,
-    yielding 2.0625 bits per weight and 15.52x compression from FP32.
-    """
-
-    @property
-    def backend_name(self) -> QuantizationBackend:
-        return QuantizationBackend.TQ2_0
-
-    def supported_bit_widths(self) -> tuple[float, ...]:
-        return (2.0625,)
-
-    def estimate_compression_ratio(
-        self,
-        original_bytes: int,
-        *,
-        bit_width: float | None = None,
-    ) -> float:
-        return 32.0 / 2.0625  # 15.515...
-
-    def quantize(
-        self,
-        tensor_id: str,
-        original_bytes: int,
-        *,
-        bit_width: float | None = None,
-    ) -> QuantizationResult:
-        ratio = self.estimate_compression_ratio(original_bytes)
-        compressed = max(1, int(original_bytes / ratio))
-        return QuantizationResult(
-            backend=self.backend_name,
-            original_bytes=original_bytes,
-            compressed_bytes=compressed,
-            compression_ratio=ratio,
-            bit_width=2.0625,
-            metadata={
-                "ggml_type_id": 35,
-                "block_size": 256,
-                "block_bytes": 66,
-                "encoding": "2bit_polar",
-            },
-        )
-
-
 class TQ1_0Provider:
-    """TQ1_0 (ternary base-3) quantization provider.
-
-    Based on the GGML block_tq1_0 structure: 42 bytes per 256 elements,
-    yielding 1.6875 bits per weight and 18.96x compression from FP32.
-    """
+    """TQ1_0 (ternary base-3) quantization provider."""
 
     @property
     def backend_name(self) -> QuantizationBackend:
@@ -249,7 +188,7 @@ class TQ1_0Provider:
         *,
         bit_width: float | None = None,
     ) -> float:
-        return 32.0 / 1.6875  # 18.962...
+        return 32.0 / 1.6875
 
     def quantize(
         self,
@@ -275,9 +214,70 @@ class TQ1_0Provider:
         )
 
 
+class TQ2_0Provider:
+    """TQ2_0 (2-bit polar) quantization provider."""
+
+    @property
+    def backend_name(self) -> QuantizationBackend:
+        return QuantizationBackend.TQ2_0
+
+    def supported_bit_widths(self) -> tuple[float, ...]:
+        return (2.0625,)
+
+    def estimate_compression_ratio(
+        self,
+        original_bytes: int,
+        *,
+        bit_width: float | None = None,
+    ) -> float:
+        return 32.0 / 2.0625
+
+    def quantize(
+        self,
+        tensor_id: str,
+        original_bytes: int,
+        *,
+        bit_width: float | None = None,
+    ) -> QuantizationResult:
+        ratio = self.estimate_compression_ratio(original_bytes)
+        compressed = max(1, int(original_bytes / ratio))
+        return QuantizationResult(
+            backend=self.backend_name,
+            original_bytes=original_bytes,
+            compressed_bytes=compressed,
+            compression_ratio=ratio,
+            bit_width=2.0625,
+            metadata={
+                "ggml_type_id": 35,
+                "block_size": 256,
+                "block_bytes": 66,
+                "encoding": "2bit_polar",
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # Tier-aware provider selection
 # ---------------------------------------------------------------------------
+
+# Default mapping (8 GB VRAM class)
+_TIER_PROVIDERS_8GB: dict[str, type] = {
+    "HOT": SimulatedTurboQuantProvider,
+    "WARM": FP8Provider,
+    "COLD": NoneProvider,
+}
+
+# High-VRAM mapping (32 GB+ VRAM with real TQ CUDA kernels)
+_TIER_PROVIDERS_32GB: dict[str, type] = {
+    "HOT": TQ2_0Provider,
+    "WARM": TQ1_0Provider,
+    "COLD": FP8Provider,
+}
+
+_TIER_PROVIDER_PROFILES: dict[str, dict[str, type]] = {
+    "default": _TIER_PROVIDERS_8GB,
+    "high_vram": _TIER_PROVIDERS_32GB,
+}
 
 _PROVIDER_BY_BACKEND: dict[str, type] = {
     QuantizationBackend.NONE.value: NoneProvider,
@@ -285,18 +285,6 @@ _PROVIDER_BY_BACKEND: dict[str, type] = {
     QuantizationBackend.TURBOQUANT.value: SimulatedTurboQuantProvider,
     QuantizationBackend.TQ1_0.value: TQ1_0Provider,
     QuantizationBackend.TQ2_0.value: TQ2_0Provider,
-}
-
-_DEFAULT_TIER_MAPPING: dict[str, str] = {
-    "HOT": QuantizationBackend.TQ2_0.value,
-    "WARM": QuantizationBackend.TQ1_0.value,
-    "COLD": QuantizationBackend.NONE.value,
-}
-
-_32GB_TIER_MAPPING: dict[str, str] = {
-    "HOT": QuantizationBackend.TQ2_0.value,
-    "WARM": QuantizationBackend.TQ1_0.value,
-    "COLD": QuantizationBackend.FP8.value,
 }
 
 _TIER_PROVIDER_MAP_ENV = "ASTRAWEAVE_TIER_PROVIDER_MAP"
@@ -338,29 +326,33 @@ def _parse_mapping_override(raw_mapping: str | None) -> dict[str, str]:
     return parsed
 
 
-def default_tier_provider_mapping(vram_budget_bytes: int | None = None) -> dict[str, str]:
+def default_tier_provider_mapping(
+    vram_budget_bytes: int | None = None,
+    *,
+    profile: str = "default",
+) -> dict[str, str]:
     """Return default tier->backend mapping for the active VRAM class."""
 
-    effective_budget = _effective_vram_budget_bytes(vram_budget_bytes)
-    if effective_budget is not None and effective_budget >= _32GB_BYTES:
-        return dict(_32GB_TIER_MAPPING)
-    return dict(_DEFAULT_TIER_MAPPING)
+    if profile == "high_vram":
+        mapping = _TIER_PROVIDERS_32GB
+    else:
+        effective_budget = _effective_vram_budget_bytes(vram_budget_bytes)
+        mapping = _TIER_PROVIDERS_32GB if effective_budget is not None and effective_budget >= _32GB_BYTES else _TIER_PROVIDERS_8GB
+    return {
+        tier: cls().backend_name.value
+        for tier, cls in mapping.items()
+    }
 
 
 def resolve_tier_provider_mapping(
     *,
     vram_budget_bytes: int | None = None,
     mapping_override: Mapping[str, str] | None = None,
+    profile: str = "default",
 ) -> dict[str, str]:
-    """Resolve the active tier->backend mapping.
+    """Resolve the active tier->backend mapping."""
 
-    Priority order (lowest to highest):
-    1. budget-aware defaults
-    2. env override (`ASTRAWEAVE_TIER_PROVIDER_MAP`)
-    3. explicit `mapping_override`
-    """
-
-    resolved = default_tier_provider_mapping(vram_budget_bytes=vram_budget_bytes)
+    resolved = default_tier_provider_mapping(vram_budget_bytes=vram_budget_bytes, profile=profile)
     resolved.update(_parse_mapping_override(os.environ.get(_TIER_PROVIDER_MAP_ENV)))
 
     if mapping_override:
@@ -386,17 +378,36 @@ def provider_for_backend(backend_name: str) -> QuantizationProvider:
 def provider_for_tier(
     tier: str,
     *,
+    profile: str = "default",
+    custom_mapping: Mapping[str, type] | None = None,
     vram_budget_bytes: int | None = None,
     mapping_override: Mapping[str, str] | None = None,
 ) -> QuantizationProvider:
-    """Return the default quantization provider for a memory tier."""
+    """Return the quantization provider for a memory tier."""
 
-    mapping = resolve_tier_provider_mapping(
-        vram_budget_bytes=vram_budget_bytes,
-        mapping_override=mapping_override,
-    )
-    backend_name = mapping.get(tier.upper(), QuantizationBackend.NONE.value)
-    return provider_for_backend(backend_name)
+    tier_key = tier.upper()
+
+    if custom_mapping is not None:
+        cls = custom_mapping.get(tier_key, NoneProvider)
+        return cls()
+
+    if mapping_override is not None or os.environ.get(_TIER_PROVIDER_MAP_ENV) is not None:
+        backend_name = resolve_tier_provider_mapping(
+            vram_budget_bytes=vram_budget_bytes,
+            mapping_override=mapping_override,
+            profile=profile,
+        ).get(tier_key, QuantizationBackend.NONE.value)
+        return provider_for_backend(backend_name)
+
+    if profile not in _TIER_PROVIDER_PROFILES:
+        profile = "default"
+
+    if profile == "default" and vram_budget_bytes is not None and vram_budget_bytes >= _32GB_BYTES:
+        profile = "high_vram"
+
+    mapping = _TIER_PROVIDER_PROFILES.get(profile, _TIER_PROVIDERS_8GB)
+    cls = mapping.get(tier_key, NoneProvider)
+    return cls()
 
 
 __all__ = [

@@ -51,17 +51,27 @@ class PlacementPolicy:
 
     hot_reuse_score: float = 0.75
     warm_reuse_score: float = 0.35
-    hot_headroom_ratio: float | None = None
+    hot_headroom_ratio: float = 0.20
+
+
+def dynamic_headroom_ratio(vram_budget_gb: float | None = None) -> float:
+    """Compute headroom ratio as a function of VRAM budget."""
+
+    if vram_budget_gb is None or vram_budget_gb <= 0:
+        return 0.20
+    return max(0.05, min(0.20, 4.0 / vram_budget_gb))
+
+
+def policy_for_vram_budget(vram_budget_gb: float | None = None) -> PlacementPolicy:
+    """Create a PlacementPolicy tuned for the supplied VRAM budget."""
+
+    return PlacementPolicy(hot_headroom_ratio=dynamic_headroom_ratio(vram_budget_gb))
 
 
 def hot_headroom_ratio_for_budget(vram_budget_bytes: int) -> float:
-    """Return dynamic HOT reserve ratio by VRAM budget class."""
+    """Byte-oriented compatibility helper for headroom ratio calculation."""
 
-    if vram_budget_bytes >= 32 * 1024**3:
-        return 0.05
-    if vram_budget_bytes >= 16 * 1024**3:
-        return 0.10
-    return 0.20
+    return dynamic_headroom_ratio(vram_budget_bytes / float(1024**3))
 
 
 class PlacementPlanner:
@@ -89,14 +99,26 @@ class PlacementPlanner:
         hot_used_bytes: int = 0,
         *,
         hot_compression_ratio: float = 1.0,
+        cuda_kernels_available: bool | None = None,
         hot_kernel_available: bool | None = None,
     ) -> PlacementDecision:
-        """Classify one resource into a residency tier.
+        """Classify one resource into a residency tier."""
 
-        When *hot_compression_ratio* > 1.0, the planner treats the
-        resource as requiring fewer effective bytes in the HOT tier,
-        modelling the effect of KV cache quantization (e.g. TurboQuant).
-        """
+        kernels_available = self._hot_kernel_available
+        if cuda_kernels_available is not None:
+            kernels_available = cuda_kernels_available
+        if hot_kernel_available is not None:
+            kernels_available = hot_kernel_available
+
+        if (not kernels_available and hot_compression_ratio > 1.0) or (
+            request.requires_hot_kernel and not kernels_available
+        ):
+            return PlacementDecision(
+                resource_id=request.resource_id,
+                tier=MemoryTier.WARM,
+                bytes_required=request.bytes_required,
+                reason_code="PLACEMENT_WARM_NO_CUDA_KERNELS",
+            )
 
         effective_bytes = (
             max(1, int(request.bytes_required / hot_compression_ratio))
@@ -104,16 +126,11 @@ class PlacementPlanner:
             else request.bytes_required
         )
 
-        kernel_allowed = self._hot_kernel_available if hot_kernel_available is None else hot_kernel_available
-
         if request.preferred_tier is not None:
             tier = request.preferred_tier
             reason_code = "PLACEMENT_PREFERRED_TIER"
         elif request.is_active or request.reuse_score >= self._policy.hot_reuse_score:
-            if request.requires_hot_kernel and not kernel_allowed:
-                tier = MemoryTier.WARM
-                reason_code = "PLACEMENT_WARM_KERNEL_UNAVAILABLE"
-            elif hot_used_bytes + effective_bytes <= self._reserve_limit(hot_budget_bytes):
+            if hot_used_bytes + effective_bytes <= self._reserve_limit(hot_budget_bytes):
                 tier = MemoryTier.HOT
                 reason_code = "PLACEMENT_HOT_ACTIVE_OR_HIGH_REUSE"
             else:
@@ -139,14 +156,10 @@ class PlacementPlanner:
         hot_budget_bytes: int,
         *,
         hot_compression_ratio: float = 1.0,
+        cuda_kernels_available: bool | None = None,
         hot_kernel_available: bool | None = None,
     ) -> PlacementPlan:
-        """Create a deterministic placement plan for a collection of resources.
-
-        When *hot_compression_ratio* > 1.0 the planner accounts for KV
-        cache quantization by treating each resource as requiring fewer
-        effective bytes in the HOT tier.
-        """
+        """Create a deterministic placement plan for a collection of resources."""
 
         decisions: list[PlacementDecision] = []
         hot_used_bytes = 0
@@ -159,6 +172,7 @@ class PlacementPlanner:
                 hot_budget_bytes=hot_budget_bytes,
                 hot_used_bytes=hot_used_bytes,
                 hot_compression_ratio=hot_compression_ratio,
+                cuda_kernels_available=cuda_kernels_available,
                 hot_kernel_available=hot_kernel_available,
             )
             decisions.append(decision)
@@ -195,10 +209,7 @@ class PlacementPlanner:
     def _reserve_limit(self, hot_budget_bytes: int) -> int:
         """Reserve a fraction of HOT budget to avoid decode-time spikes."""
 
-        ratio = self._policy.hot_headroom_ratio
-        if ratio is None:
-            ratio = hot_headroom_ratio_for_budget(hot_budget_bytes)
-        reserve = int(hot_budget_bytes * ratio)
+        reserve = int(hot_budget_bytes * self._policy.hot_headroom_ratio)
         return max(hot_budget_bytes - reserve, 0)
 
 
@@ -208,5 +219,7 @@ __all__ = [
     "PlacementPlanner",
     "PlacementPolicy",
     "PlacementRequest",
+    "dynamic_headroom_ratio",
     "hot_headroom_ratio_for_budget",
+    "policy_for_vram_budget",
 ]

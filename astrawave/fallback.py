@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Sequence
+from typing import Any, Sequence
 
 
 class FallbackStep(str, Enum):
@@ -28,6 +28,57 @@ DEFAULT_FALLBACK_LADDER: tuple[FallbackStep, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# KV Quantization Upgrade Progression (F-032)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class KVQuantizationLevel:
+    """One step in the KV quantization upgrade progression."""
+
+    type_k: str
+    type_v: str
+    label: str
+    estimated_compression: float
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+# Concrete progression: F16 -> TQ2_0 -> TQ1_0
+KV_QUANTIZATION_PROGRESSION: tuple[KVQuantizationLevel, ...] = (
+    KVQuantizationLevel(
+        type_k="f16", type_v="f16", label="baseline",
+        estimated_compression=1.0,
+    ),
+    KVQuantizationLevel(
+        type_k="tq2_0", type_v="f16", label="tq2_0_keys",
+        estimated_compression=15.52,
+        metadata={"ggml_type_id": 35, "encoding": "2bit_polar"},
+    ),
+    KVQuantizationLevel(
+        type_k="tq1_0", type_v="f16", label="tq1_0_keys",
+        estimated_compression=18.96,
+        metadata={"ggml_type_id": 34, "encoding": "ternary_base3"},
+    ),
+)
+
+
+def next_kv_quantization_level(
+    current_type_k: str = "f16",
+) -> KVQuantizationLevel | None:
+    """Return the next KV quantization level after the current type_k.
+
+    Returns None when the progression is exhausted (caller should
+    advance to the next fallback ladder step).
+    """
+
+    for i, level in enumerate(KV_QUANTIZATION_PROGRESSION):
+        if level.type_k == current_type_k:
+            if i + 1 < len(KV_QUANTIZATION_PROGRESSION):
+                return KV_QUANTIZATION_PROGRESSION[i + 1]
+            return None
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class OscillationControls:
     """Thresholds used to prevent fallback thrashing."""
@@ -36,6 +87,23 @@ class OscillationControls:
     minimum_dwell_seconds: int = 5
     churn_window_seconds: int = 20
     churn_threshold: int = 1
+
+
+# Throughput-optimized timings: faster recovery on high-VRAM systems
+THROUGHPUT_OSCILLATION_CONTROLS = OscillationControls(
+    cooldown_seconds=10,
+    minimum_dwell_seconds=5,
+    churn_window_seconds=15,
+    churn_threshold=1,
+)
+
+# Default stability timings (unchanged from v1)
+STABILITY_OSCILLATION_CONTROLS = OscillationControls(
+    cooldown_seconds=30,
+    minimum_dwell_seconds=15,
+    churn_window_seconds=30,
+    churn_threshold=1,
+)
 
 
 @dataclass(frozen=True, slots=True)

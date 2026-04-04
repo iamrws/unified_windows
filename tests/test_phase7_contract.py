@@ -375,9 +375,9 @@ class Phase7CompressionAwareTieringTests(unittest.TestCase):
 
     def test_dynamic_hot_headroom_ratio_scales_with_vram_budget(self) -> None:
         ratio_fn = self.tiering_mod.hot_headroom_ratio_for_budget
-        self.assertEqual(ratio_fn(8 * 1024**3), 0.20)
-        self.assertEqual(ratio_fn(16 * 1024**3), 0.10)
-        self.assertEqual(ratio_fn(32 * 1024**3), 0.05)
+        self.assertAlmostEqual(ratio_fn(8 * 1024**3), 0.20)
+        self.assertAlmostEqual(ratio_fn(16 * 1024**3), 0.20)
+        self.assertAlmostEqual(ratio_fn(32 * 1024**3), 0.125)
 
     def test_hot_kernel_unavailable_gates_hot_placement(self) -> None:
         planner = self.tiering_mod.PlacementPlanner(hot_kernel_available=False)
@@ -389,7 +389,7 @@ class Phase7CompressionAwareTieringTests(unittest.TestCase):
         )
         plan = planner.plan([request], hot_budget_bytes=8 * 1024**3)
         self.assertEqual(plan.decisions[0].tier, self.types_mod.MemoryTier.WARM)
-        self.assertEqual(plan.decisions[0].reason_code, "PLACEMENT_WARM_KERNEL_UNAVAILABLE")
+        self.assertEqual(plan.decisions[0].reason_code, "PLACEMENT_WARM_NO_CUDA_KERNELS")
 
 
 class Phase7CompressionTelemetryTests(unittest.TestCase):

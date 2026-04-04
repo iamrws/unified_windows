@@ -17,8 +17,10 @@ THROUGHPUT_RUNTIME_PROFILE = "throughput"
 
 DEFAULT_VRAM_BUDGET_BYTES = 8 * 1024**3
 _VRAM_BUDGET_ENV = "ASTRAWEAVE_VRAM_BUDGET_BYTES"
-_SUPPORTED_KV_TYPES = frozenset({"f16", "q8_0", "q4_0", "tq2_0", "tq1_0"})
-_QUANTIZED_KV_TYPES = frozenset({"q8_0", "q4_0", "tq2_0", "tq1_0"})
+
+# Valid KV cache quantization types (maps to llama.cpp type_k / type_v)
+VALID_KV_TYPES = frozenset({"f16", "f32", "q8_0", "q4_0", "tq1_0", "tq2_0"})
+_QUANTIZED_KV_TYPES = VALID_KV_TYPES - {"f16", "f32"}
 
 _PROFILE_ALIASES = {
     "": AUTO_RUNTIME_PROFILE,
@@ -111,22 +113,42 @@ def resolve_vram_budget_bytes(vram_budget_bytes: int | None = None) -> int:
     return parsed
 
 
-def large_model_threshold_billion(vram_budget_bytes: int | None = None) -> float:
-    """Return the constrained-VRAM model threshold for the active VRAM budget."""
+def large_model_threshold(vram_budget_gb: float | None = None) -> float:
+    """Return the model-size threshold (billions) above which VRAM is constrained.
 
-    budget = resolve_vram_budget_bytes(vram_budget_bytes)
-    if budget >= 32 * 1024**3:
+    Scales with available VRAM: 14B at 8 GB, 34B at 32 GB, 70B at 80 GB.
+    Falls back to 14B when *vram_budget_gb* is None (legacy 8 GB default).
+    """
+
+    if vram_budget_gb is None or vram_budget_gb <= 8.0:
+        return 14.0
+    return min(70.0, 14.0 + (vram_budget_gb - 8.0) * (56.0 / 72.0))
+
+
+def large_model_threshold_billion(vram_budget_bytes: int | None = None) -> float:
+    """Byte-oriented companion to ``large_model_threshold`` for compatibility."""
+
+    budget_bytes = resolve_vram_budget_bytes(vram_budget_bytes)
+    if budget_bytes >= 32 * 1024**3:
         return 34.0
-    if budget >= 16 * 1024**3:
+    if budget_bytes >= 16 * 1024**3:
         return 24.0
     return 14.0
 
 
-def is_large_model(model_size_billion: float | None, vram_budget_bytes: int | None = None) -> bool:
+def is_large_model(
+    model_size_billion: float | None,
+    vram_budget_gb: float | None = None,
+    *,
+    vram_budget_bytes: int | None = None,
+) -> bool:
     """Return whether a model is in the constrained-VRAM class."""
 
-    threshold = large_model_threshold_billion(vram_budget_bytes)
-    return model_size_billion is not None and model_size_billion >= threshold
+    if model_size_billion is None:
+        return False
+    if vram_budget_bytes is not None:
+        return model_size_billion >= large_model_threshold_billion(vram_budget_bytes)
+    return model_size_billion >= large_model_threshold(vram_budget_gb)
 
 
 def default_runtime_profile_for_model(
@@ -141,6 +163,38 @@ def default_runtime_profile_for_model(
         if is_large_model(model_size_billion, vram_budget_bytes=vram_budget_bytes)
         else DEFAULT_RUNTIME_PROFILE
     )
+
+
+def _normalize_flash_attn_value(value: Any) -> bool | str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "auto":
+            return "auto"
+        if normalized in {"true", "false"}:
+            return normalized == "true"
+    raise ApiError(ApiErrorCode.INVALID_ARGUMENT, "backend option 'flash_attn' must be true, false, or 'auto'")
+
+
+def validate_kv_cache_options(options: Mapping[str, Any]) -> None:
+    """Validate KV cache type and flash attention option constraints."""
+
+    type_k = options.get("type_k")
+    type_v = options.get("type_v")
+    flash_attn = _normalize_flash_attn_value(options.get("flash_attn"))
+
+    if type_k is not None and type_k not in VALID_KV_TYPES:
+        raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported type_k: {type_k}")
+    if type_v is not None and type_v not in VALID_KV_TYPES:
+        raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported type_v: {type_v}")
+    if type_v in _QUANTIZED_KV_TYPES and flash_attn is False:
+        raise ApiError(
+            ApiErrorCode.INVALID_ARGUMENT,
+            f"type_v={type_v} requires flash_attn to be enabled",
+        )
 
 
 def profile_backend_options(
@@ -158,9 +212,9 @@ def profile_backend_options(
         return {}
     if profile == THROUGHPUT_RUNTIME_PROFILE:
         return _throughput_backend_options(model_size_billion)
-    if profile != VRAM_CONSTRAINED_RUNTIME_PROFILE:
-        raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported runtime profile: {profile_name}")
-    return _vram_constrained_backend_options(model_size_billion)
+    if profile == VRAM_CONSTRAINED_RUNTIME_PROFILE:
+        return _vram_constrained_backend_options(model_size_billion)
+    raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"unsupported runtime profile: {profile_name}")
 
 
 def resolve_runtime_tuning(
@@ -208,13 +262,7 @@ def normalize_backend_options(options: Mapping[str, Any] | None) -> dict[str, An
         key = raw_key.strip()
         normalized[key] = _normalize_backend_option_value(value, key)
 
-    type_v = normalized.get("type_v")
-    flash_attn = normalized.get("flash_attn")
-    if isinstance(type_v, str) and type_v in _QUANTIZED_KV_TYPES and flash_attn is False:
-        raise ApiError(
-            ApiErrorCode.INVALID_ARGUMENT,
-            "backend option 'flash_attn' must be true or 'auto' when type_v is quantized",
-        )
+    validate_kv_cache_options(normalized)
     return normalized
 
 
@@ -236,26 +284,15 @@ def _normalize_backend_option_value(value: Any, key_path: str) -> Any:
         if not isinstance(value, str) or not value.strip():
             raise ApiError(ApiErrorCode.INVALID_ARGUMENT, f"backend option '{key_path}' must be a non-empty string")
         normalized_kv_type = value.strip().lower()
-        if normalized_kv_type not in _SUPPORTED_KV_TYPES:
+        if normalized_kv_type not in VALID_KV_TYPES:
             raise ApiError(
                 ApiErrorCode.INVALID_ARGUMENT,
-                f"backend option '{key_path}' must be one of {sorted(_SUPPORTED_KV_TYPES)}",
+                f"backend option '{key_path}' must be one of {sorted(VALID_KV_TYPES)}",
             )
         return normalized_kv_type
 
     if leaf_key == "flash_attn":
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            normalized_flash_attn = value.strip().lower()
-            if normalized_flash_attn == "auto":
-                return "auto"
-            if normalized_flash_attn in {"true", "false"}:
-                return normalized_flash_attn == "true"
-        raise ApiError(
-            ApiErrorCode.INVALID_ARGUMENT,
-            f"backend option '{key_path}' must be true, false, or 'auto'",
-        )
+        return _normalize_flash_attn_value(value)
 
     if leaf_key == "offload_kqv":
         if not isinstance(value, bool):
@@ -293,20 +330,28 @@ def _normalize_backend_option_value(value: Any, key_path: str) -> Any:
 
 
 def _throughput_backend_options(model_size_billion: float | None) -> dict[str, Any]:
-    """Backend options optimized for maximum tok/s on 32 GB VRAM systems."""
+    """Backend options optimized for maximum tok/s on 32 GB+ VRAM systems."""
 
     if model_size_billion is None or model_size_billion < 14.0:
         num_ctx = 32768
         num_batch = 512
+        type_k = "tq2_0"
+        type_v = "f16"
     elif model_size_billion < 34.0:
         num_ctx = 8192
         num_batch = 256
+        type_k = "tq2_0"
+        type_v = "f16"
     elif model_size_billion < 70.0:
         num_ctx = 4096
         num_batch = 128
+        type_k = "tq2_0"
+        type_v = "f16"
     else:
         num_ctx = 2048
         num_batch = 64
+        type_k = "tq1_0"
+        type_v = "f16"
 
     num_keep = max(16, num_ctx // 64)
     return {
@@ -317,16 +362,13 @@ def _throughput_backend_options(model_size_billion: float | None) -> dict[str, A
         "num_keep": num_keep,
         "num_thread": 16,
         "offload_kqv": True,
-        "type_k": "tq2_0",
-        "type_v": "tq2_0",
+        "type_k": type_k,
+        "type_v": type_v,
     }
 
 
 def _vram_constrained_backend_options(model_size_billion: float | None) -> dict[str, Any]:
-    if model_size_billion is None or model_size_billion < 34.0:
-        num_ctx = 4096
-        num_batch = 64
-    elif model_size_billion < 70.0:
+    if model_size_billion is None or model_size_billion < 70.0:
         num_ctx = 2048
         num_batch = 32
     else:
@@ -352,11 +394,13 @@ __all__ = [
     "DEFAULT_RUNTIME_PROFILE",
     "RuntimeTuning",
     "THROUGHPUT_RUNTIME_PROFILE",
+    "VALID_KV_TYPES",
     "VRAM_CONSTRAINED_RUNTIME_PROFILE",
     "default_runtime_profile_for_model",
     "format_model_size_label",
     "infer_model_size_billion",
     "is_large_model",
+    "large_model_threshold",
     "large_model_threshold_billion",
     "merge_backend_options",
     "normalize_backend_options",
@@ -364,4 +408,5 @@ __all__ = [
     "profile_backend_options",
     "resolve_vram_budget_bytes",
     "resolve_runtime_tuning",
+    "validate_kv_cache_options",
 ]
